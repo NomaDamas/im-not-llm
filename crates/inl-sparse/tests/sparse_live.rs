@@ -4,12 +4,9 @@
 //!
 //! Needs the model in the Hugging Face cache (or network): run with
 //! `cargo test --release --test sparse_live -- --ignored --nocapture`.
-//! `MINSYNC_TEST_DEVICE=cpu|metal` picks the device (default cpu).
+//! `INL_TEST_DEVICE=cpu|metal|cuda|auto` picks the device (default cpu).
 
-use minsync::config::SparseConfig;
-use minsync::sparse::native::NativeSparseEncoder;
-use minsync::sparse::served::create_sparse_encoder;
-use minsync::sparse::{SparseEncoder, SparseVector};
+use inl_sparse::{SparseEncoder, SparseOptions, SparseVector};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -32,11 +29,11 @@ fn golden() -> Golden {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn settings() -> SparseConfig {
-    SparseConfig {
-        device: Some(std::env::var("MINSYNC_TEST_DEVICE").unwrap_or_else(|_| "cpu".into())),
+fn options() -> SparseOptions {
+    SparseOptions {
+        device: Some(std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into())),
         dtype: Some("f32".to_string()),
-        ..SparseConfig::default()
+        ..SparseOptions::default()
     }
 }
 
@@ -82,7 +79,7 @@ fn to_vector(raw: &Raw) -> SparseVector {
 #[ignore = "live: loads the real nlpai-lab/KURE-Sparse-nano checkpoint"]
 async fn native_encoder_matches_sentence_transformers_on_the_real_model() {
     let golden = golden();
-    let encoder = NativeSparseEncoder::from_config(&settings()).unwrap();
+    let encoder = SparseEncoder::new(options()).unwrap();
     let identity = encoder.identity().await.unwrap();
     println!("identity: {identity:?}");
     assert_eq!(identity.dimension, 36282);
@@ -128,7 +125,7 @@ async fn native_encoder_matches_sentence_transformers_on_the_real_model() {
 #[ignore = "live: loads the real nlpai-lab/KURE-Sparse-nano checkpoint"]
 async fn batching_and_long_inputs_do_not_change_real_model_vectors() {
     let golden = golden();
-    let encoder = NativeSparseEncoder::from_config(&settings()).unwrap();
+    let encoder = SparseEncoder::new(options()).unwrap();
     let alone: Vec<SparseVector> = {
         let mut out = Vec::new();
         for doc in &golden.docs {
@@ -162,68 +159,13 @@ async fn batching_and_long_inputs_do_not_change_real_model_vectors() {
 }
 
 #[tokio::test]
-#[ignore = "live: loads the real nlpai-lab/KURE-Sparse-nano checkpoint"]
-async fn a_running_serve_sparse_gives_the_same_vectors_as_in_process() {
-    use std::process::{Command, Stdio};
-    let golden = golden();
-    let state = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_minsync");
-    let mut child = Command::new(bin)
-        .current_dir(workspace.path())
-        .args([
-            "--format",
-            "json",
-            "serve",
-            "--sparse",
-            "--port",
-            "0",
-            "--idle-timeout",
-            "0",
-            "--state-dir",
-        ])
-        .arg(state.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn minsync serve --sparse");
-    let stdout = child.stdout.take().unwrap();
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line).unwrap();
-    let health: serde_json::Value = serde_json::from_str(&line).expect("serving event");
-    println!("server: {health}");
-    assert_eq!(health["event"], "serving");
-    assert_eq!(health["kind"], "sparse");
-    let url = health["url"].as_str().unwrap().to_string();
-
-    // Speak TEI to it, exactly as a `tei:` client would.
-    let remote = create_sparse_encoder(&SparseConfig {
-        id: "tei:nlpai-lab/KURE-Sparse-nano".to_string(),
-        base_url: Some(url),
-        max_length: Some(2048),
-        ..SparseConfig::default()
-    })
-    .unwrap();
-    let query = remote.encode_query(&golden.query).await.unwrap();
-    let docs = remote.encode(&golden.docs).await.unwrap();
-    let (diff, _) = compare(&query, &golden.q);
-    assert!(diff < 2e-3, "served query diverges by {diff}");
-    for (index, (served, reference)) in docs.iter().zip(&golden.d).enumerate() {
-        let (diff, _) = compare(served, reference);
-        assert!(diff < 2e-3, "served doc {index} diverges by {diff}");
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test]
 #[ignore = "live: loads the real checkpoint on the default device (Metal on macOS)"]
 async fn half_precision_on_the_default_device_keeps_scores_and_ranking() {
     let golden = golden();
-    let on_default = |dtype: &str| SparseConfig {
+    let on_default = |dtype: &str| SparseOptions {
         device: Some("auto".to_string()),
         dtype: Some(dtype.to_string()),
-        ..SparseConfig::default()
+        ..SparseOptions::default()
     };
     let reference: Vec<f32> = golden
         .d
@@ -231,7 +173,7 @@ async fn half_precision_on_the_default_device_keeps_scores_and_ranking() {
         .map(|d| to_vector(&golden.q).dot(&to_vector(d)))
         .collect();
     for dtype in ["f16", "f32"] {
-        let encoder = NativeSparseEncoder::from_config(&on_default(dtype)).unwrap();
+        let encoder = SparseEncoder::new(on_default(dtype)).unwrap();
         let identity = encoder.identity().await.unwrap();
         let query = encoder.encode_query(&golden.query).await.unwrap();
         let docs = encoder.encode(&golden.docs).await.unwrap();
@@ -262,12 +204,12 @@ async fn throughput_by_device_and_dtype() {
         .map(|i| format!("{i} {}", unit.repeat(5 + i % 3)))
         .collect();
     for (device, dtype) in [("cpu", "f32"), ("metal", "f32"), ("metal", "f16")] {
-        let settings = SparseConfig {
+        let options = SparseOptions {
             device: Some(device.to_string()),
             dtype: Some(dtype.to_string()),
-            ..SparseConfig::default()
+            ..SparseOptions::default()
         };
-        let Ok(encoder) = NativeSparseEncoder::from_config(&settings) else {
+        let Ok(encoder) = SparseEncoder::new(options) else {
             continue;
         };
         if encoder.identity().await.is_err() {

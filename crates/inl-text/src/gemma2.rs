@@ -23,10 +23,11 @@
 //!
 //! The checkpoint overflows float16, so only f32 and bf16 are accepted.
 
-use crate::embedder::hub::ModelSource;
-use crate::embedder::qwen3::{AttentionBackend, AttentionRequest, LoadOptions};
-use crate::error::{MinSyncError, Result as MinSyncResult};
+use crate::qwen3::{AttentionBackend, AttentionRequest, LoadOptions};
 use candle_core::{DType, Device, Result, Tensor, D};
+use inl_core::hub::ModelSource;
+use inl_core::{InlError, Result as InlResult};
+
 use candle_nn::{linear_no_bias, Activation, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -114,14 +115,14 @@ struct LayerShape {
 
 impl Config {
     /// Parse a checkpoint's `config.json`.
-    pub fn parse(bytes: &[u8]) -> MinSyncResult<Self> {
+    pub fn parse(bytes: &[u8]) -> InlResult<Self> {
         let checkpoint: CheckpointConfig = serde_json::from_slice(bytes).map_err(|error| {
-            MinSyncError::Embedding(format!(
+            InlError::Inference(format!(
                 "native model config is not an EmbeddingGemma 2 config: {error}"
             ))
         })?;
         if checkpoint.model_type != MODEL_TYPE {
-            return Err(MinSyncError::Embedding(format!(
+            return Err(InlError::Inference(format!(
                 "native model config has model_type {:?}, expected {MODEL_TYPE:?}",
                 checkpoint.model_type
             )));
@@ -131,9 +132,9 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> MinSyncResult<()> {
+    fn validate(&self) -> InlResult<()> {
         let invalid = |what: String| {
-            Err(MinSyncError::Embedding(format!(
+            Err(InlError::Inference(format!(
                 "unsupported EmbeddingGemma 2 config: {what}"
             )))
         };
@@ -646,14 +647,14 @@ pub struct Gemma2Embedder {
 }
 
 impl Gemma2Embedder {
-    pub fn from_hf(options: &LoadOptions<'_>) -> MinSyncResult<Self> {
+    pub fn from_hf(options: &LoadOptions<'_>) -> InlResult<Self> {
         let load_error = |what: &str, error: &dyn std::fmt::Display| {
-            MinSyncError::Embedding(format!("native model {what}: {error}"))
+            InlError::Inference(format!("native model {what}: {error}"))
         };
         match options.dtype {
             DType::F32 | DType::BF16 => {}
             other => {
-                return Err(MinSyncError::Embedding(format!(
+                return Err(InlError::Inference(format!(
                     "EmbeddingGemma 2 overflows float16 and returns NaN: use dtype f32 or bf16, \
                      not {}",
                     other.as_str()
@@ -661,7 +662,7 @@ impl Gemma2Embedder {
             }
         }
         if options.dtype == DType::BF16 && options.device.is_cpu() {
-            return Err(MinSyncError::Embedding(
+            return Err(InlError::Inference(
                 "EmbeddingGemma 2 in bf16 needs a GPU: the CPU matmul has no bf16 kernel; \
                  use dtype f32 on the CPU"
                     .to_string(),
@@ -671,7 +672,7 @@ impl Gemma2Embedder {
             options.attention,
             AttentionRequest::Auto | AttentionRequest::Eager
         ) {
-            return Err(MinSyncError::Embedding(
+            return Err(InlError::Inference(
                 "EmbeddingGemma 2 supports only attention = \"auto\" or \"eager\"".to_string(),
             ));
         }
@@ -690,7 +691,7 @@ impl Gemma2Embedder {
         Self::new(model, tokenizer, options.max_length)
     }
 
-    fn new(model: Gemma2Model, mut tokenizer: Tokenizer, max_length: usize) -> MinSyncResult<Self> {
+    fn new(model: Gemma2Model, mut tokenizer: Tokenizer, max_length: usize) -> InlResult<Self> {
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             direction: PaddingDirection::Right,
@@ -701,9 +702,7 @@ impl Gemma2Embedder {
                 max_length,
                 ..Default::default()
             }))
-            .map_err(|e| {
-                MinSyncError::Embedding(format!("native tokenizer truncation failed: {e}"))
-            })?;
+            .map_err(|e| InlError::Inference(format!("native tokenizer truncation failed: {e}")))?;
         Ok(Self { model, tokenizer })
     }
 
@@ -746,6 +745,67 @@ impl Gemma2Embedder {
             .forward_pooled(&input_ids, &lens)?
             .to_vec2::<f32>()
     }
+}
+
+/// EmbeddingGemma 2 prompt templates, from the model card. The prompts are
+/// caller-controlled: [`crate::TextEmbedder`] never applies one silently. Use
+/// [`Gemma2Task::apply`] to build the prefixed text, or configure the matching
+/// `query_prefix` / `passage_prefix` on [`crate::TextOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma2Task {
+    /// A search query: `task: search result | query: {text}`.
+    SearchQuery,
+    /// A plain query: `task: query | query: {text}`.
+    Query,
+    /// `task: question answering | query: {text}`.
+    QuestionAnswering,
+    /// `task: fact checking | query: {text}`.
+    FactChecking,
+    /// `task: classification | query: {text}`.
+    Classification,
+    /// `task: clustering | query: {text}`.
+    Clustering,
+    /// `task: code retrieval | query: {text}`.
+    CodeRetrieval,
+    /// A document without a title: `title: none | text: {text}`.
+    Document,
+}
+
+impl Gemma2Task {
+    pub fn template(self) -> &'static str {
+        match self {
+            Self::SearchQuery => "task: search result | query: {text}",
+            Self::Query => "task: query | query: {text}",
+            Self::QuestionAnswering => "task: question answering | query: {text}",
+            Self::FactChecking => "task: fact checking | query: {text}",
+            Self::Classification => "task: classification | query: {text}",
+            Self::Clustering => "task: clustering | query: {text}",
+            Self::CodeRetrieval => "task: code retrieval | query: {text}",
+            Self::Document => "title: none | text: {text}",
+        }
+    }
+
+    /// The constant prefix the template puts before `{text}`.
+    pub fn prefix(self) -> &'static str {
+        self.template()
+            .strip_suffix("{text}")
+            .expect("every template ends in {text}")
+    }
+
+    /// `text` with this task's prefix applied.
+    pub fn apply(self, text: &str) -> String {
+        format!("{}{text}", self.prefix())
+    }
+
+    /// True for the query-side tasks (everything but [`Gemma2Task::Document`]).
+    pub fn is_query(self) -> bool {
+        !matches!(self, Self::Document)
+    }
+}
+
+/// `title: {title} | text: {text}` for a titled document.
+pub fn gemma2_document(title: &str, text: &str) -> String {
+    format!("title: {title} | text: {text}")
 }
 
 #[cfg(test)]
@@ -947,5 +1007,39 @@ mod tests {
             .unwrap()
             .replace(MODEL_TYPE, "qwen3");
         assert!(Config::parse(wrong.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn task_prefixes_match_the_model_card() {
+        assert_eq!(
+            Gemma2Task::SearchQuery.prefix(),
+            "task: search result | query: "
+        );
+        assert_eq!(
+            Gemma2Task::SearchQuery.apply("what causes the northern lights?"),
+            "task: search result | query: what causes the northern lights?"
+        );
+        assert_eq!(Gemma2Task::Document.prefix(), "title: none | text: ");
+        assert_eq!(
+            Gemma2Task::Document.apply("a passage"),
+            "title: none | text: a passage"
+        );
+        assert_eq!(
+            gemma2_document("Guide", "a passage"),
+            "title: Guide | text: a passage"
+        );
+        assert!(Gemma2Task::SearchQuery.is_query());
+        assert!(!Gemma2Task::Document.is_query());
+        for task in [
+            Gemma2Task::Query,
+            Gemma2Task::QuestionAnswering,
+            Gemma2Task::FactChecking,
+            Gemma2Task::Classification,
+            Gemma2Task::Clustering,
+            Gemma2Task::CodeRetrieval,
+        ] {
+            assert!(task.prefix().starts_with("task: "), "{task:?}");
+            assert!(task.is_query(), "{task:?}");
+        }
     }
 }

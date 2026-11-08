@@ -3,13 +3,11 @@
 //!
 //! It adds the lifecycle a one-shot CLI run never needs: explicit unload,
 //! idle unload, and a disposed state. Inference itself is
-//! [`NativeEmbedder`], so batching, the padded-token cap, the prefixes and the
-//! per-batch deadline are exactly those `minsync sync` and `minsync query` use.
+//! [`TextEmbedder`], so batching, the padded-token cap, the prefixes and the
+//! per-batch deadline are exactly those the embedder uses.
 
-use crate::config::EmbedderConfig;
-use crate::embedder::native::{NativeEmbedder, NativeIdentity};
-use crate::embedder::Embedder;
-use crate::error::{MinSyncError, Result};
+use crate::native::{TextEmbedder, TextIdentity, TextOptions};
+use inl_core::{InlError, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -91,24 +89,24 @@ fn lock(state: &Mutex<IdleState>) -> std::sync::MutexGuard<'_, IdleState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub struct NativeSession {
-    embedder: Arc<NativeEmbedder>,
+pub struct TextSession {
+    embedder: Arc<TextEmbedder>,
     idle: Option<IdleTimer>,
     disposed: AtomicBool,
 }
 
-impl NativeSession {
-    /// Build a session from `[embedder]` settings. The model is not loaded
-    /// until the first call that needs it. `idle_unload` releases the model
-    /// after that long without an embed call; `None` keeps it resident until
+impl TextSession {
+    /// Build a session from [`TextOptions`]. The model is not loaded until the
+    /// first call that needs it. `idle_unload` releases the model after that
+    /// long without an embed call; `None` keeps it resident until
     /// [`unload`](Self::unload) or [`dispose`](Self::dispose).
-    pub fn new(settings: &EmbedderConfig, idle_unload: Option<Duration>) -> Result<Self> {
+    pub fn new(options: TextOptions, idle_unload: Option<Duration>) -> Result<Self> {
         if idle_unload == Some(Duration::ZERO) {
-            return Err(MinSyncError::Config(
+            return Err(InlError::Config(
                 "idle unload must be greater than 0".to_string(),
             ));
         }
-        let embedder = Arc::new(NativeEmbedder::from_config(settings)?);
+        let embedder = Arc::new(TextEmbedder::new(options)?);
         let idle = idle_unload.map(|idle| {
             let embedder = Arc::clone(&embedder);
             IdleTimer::new(
@@ -130,14 +128,14 @@ impl NativeSession {
 
     fn activity(&self) -> Result<Option<Activity>> {
         if self.disposed.load(Ordering::Acquire) {
-            return Err(MinSyncError::Other(
+            return Err(InlError::Other(
                 "native embedder has been disposed".to_string(),
             ));
         }
         Ok(self.idle.as_ref().map(IdleTimer::begin))
     }
 
-    pub async fn identity(&self) -> Result<NativeIdentity> {
+    pub async fn identity(&self) -> Result<TextIdentity> {
         let _activity = self.activity()?;
         self.embedder.identity().await
     }
@@ -243,19 +241,22 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
-    fn settings() -> EmbedderConfig {
-        crate::config::Config::default_for("s").embedder
+    fn settings() -> TextOptions {
+        TextOptions {
+            id: "s".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn zero_idle_unload_is_rejected() {
-        let result = NativeSession::new(&settings(), Some(Duration::ZERO));
-        assert!(matches!(result, Err(MinSyncError::Config(_))));
+        let result = TextSession::new(settings(), Some(Duration::ZERO));
+        assert!(matches!(result, Err(InlError::Config(_))));
     }
 
     #[tokio::test]
     async fn disposed_session_rejects_every_call_without_loading() {
-        let session = NativeSession::new(&settings(), None).unwrap();
+        let session = TextSession::new(settings(), None).unwrap();
         assert!(!session.is_loaded());
         session.dispose().await;
 

@@ -1,24 +1,35 @@
 //! In-process native embedder (Qwen3 and EmbeddingGemma 2 on candle). The
-//! models live in [`super::qwen3`] and [`super::gemma2`]; this module owns
+//! models live in [`crate::qwen3`] and [`crate::gemma2`]; this module owns
 //! device/dtype selection, batching and the per-batch deadline.
 
-use crate::config::EmbedderConfig;
-use crate::embedder::deadline::BatchDeadline;
-use crate::embedder::gemma2::{self, Gemma2Embedder};
-use crate::embedder::hub::ModelSource;
-use crate::embedder::qwen3::{AttentionBackend, AttentionRequest, LoadOptions, Qwen3Embedder};
-use crate::embedder::Embedder;
-use crate::error::{MinSyncError, Result};
+use crate::gemma2::{self, Gemma2Embedder};
+use crate::qwen3::{AttentionBackend, AttentionRequest, LoadOptions, Qwen3Embedder};
 use async_trait::async_trait;
 use candle_core::{DType, Device};
-use hf_hub::api::sync::ApiBuilder;
+use inl_core::deadline::BatchDeadline;
+use inl_core::device::{
+    device_kind, device_label, dtype_name, effective_batch_timeout, model_cache_dir,
+    resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
+};
+use inl_core::engine::{DenseEngine, EngineInfo, Modality};
+use inl_core::hub::ModelSource;
+use inl_core::{InlError, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
-use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use tokio::sync::OnceCell;
 
 pub(crate) const DEFAULT_MAX_LENGTH: usize = 2048;
+
+/// Default number of inputs in one forward pass.
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 64;
+
+/// Default cap on padded tokens (`inputs x longest input`) per forward pass.
+pub(crate) const DEFAULT_MAX_BATCH_TOKENS: usize = 4096;
+
+/// Default deadline for one forward pass, in seconds.
+pub(crate) const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 #[cfg(test)]
 #[test]
@@ -43,38 +54,13 @@ fn tokenized_length_short_control_stays_below_limit() {
 /// no throughput because attention is already compute-bound there.
 const ATTENTION_BYTES_BUDGET: usize = 1 << 30;
 
-/// Default cap on padded tokens (`inputs x longest input`) per forward pass.
-///
-/// The attention budget alone still lets 64 inputs of ~500 tokens (32k padded
-/// tokens) share one pass, which on a CPU or a contended GPU can outlast the
-/// per-batch deadline even though nothing is stuck. Passes of at most this
-/// many tokens finish in seconds, so the deadline only fires on a real hang.
-/// Splitting costs little throughput: a pass this size already saturates the
-/// device.
-const MAX_BATCH_TOKENS: usize = 4096;
-
 /// Qwen3 uses byte-level BPE, so a text never tokenizes to more tokens than
 /// its UTF-8 byte length. This slack covers template/special tokens.
 const SPECIAL_TOKEN_SLACK: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeDevice {
-    Auto,
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeDtype {
-    F32,
-    F16,
-    Bf16,
-}
-
 /// The model family behind a native model id, read from its `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Architecture {
+pub enum Architecture {
     Qwen3,
     Gemma2,
 }
@@ -84,15 +70,20 @@ impl Architecture {
     /// that is not an EmbeddingGemma 2 checkpoint loads as Qwen3, as before.
     fn detect(model: &str, cache_dir: PathBuf) -> Result<Self> {
         let path = ModelSource::resolve(model, cache_dir)?.fetch("config.json")?;
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
-                MinSyncError::Embedding(format!("native model config.json is invalid: {error}"))
-            })?;
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         Ok(if config["model_type"] == gemma2::MODEL_TYPE {
             Self::Gemma2
         } else {
             Self::Qwen3
         })
+    }
+
+    /// Matryoshka output dimensions EmbeddingGemma 2 supports.
+    fn matryoshka_dims(self) -> Option<&'static [usize]> {
+        match self {
+            Self::Gemma2 => Some(&[128, 256, 512, 768]),
+            Self::Qwen3 => None,
+        }
     }
 }
 
@@ -125,7 +116,7 @@ impl NativeModel {
         }
     }
 
-    /// Output vector length.
+    /// Output vector length, before any Matryoshka truncation.
     fn dimension(&self) -> usize {
         match self {
             Self::Qwen3(model) => model.config().hidden_size,
@@ -147,7 +138,7 @@ struct LoadedModel {
     /// Serializes forward passes ahead of the deadline; see [`embed_in_batches`].
     gate: Arc<tokio::sync::Mutex<()>>,
     attention_heads: usize,
-    /// Output vector length (`hidden_size`).
+    /// Output vector length (after [`resolve_output_dim`]).
     dimension: usize,
     /// `cpu`, `metal:N` or `cuda:N`.
     device: String,
@@ -155,57 +146,15 @@ struct LoadedModel {
     backend: AttentionBackend,
     /// Deadline for one forward pass on the device the model loaded onto.
     batch_timeout: Duration,
-}
-
-/// A lazily loaded value that can be dropped again and reloaded on demand.
-///
-/// Concurrent callers share one load; a failed load is not cached.
-pub(crate) struct LoadSlot<T> {
-    value: AsyncMutex<Option<T>>,
-}
-
-impl<T: Clone> LoadSlot<T> {
-    pub(crate) fn new() -> Self {
-        Self {
-            value: AsyncMutex::new(None),
-        }
-    }
-
-    pub(crate) async fn get_or_load<F, Fut>(&self, load: F) -> Result<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        let mut slot = self.value.lock().await;
-        if let Some(value) = slot.as_ref() {
-            return Ok(value.clone());
-        }
-        let value = load().await?;
-        *slot = Some(value.clone());
-        Ok(value)
-    }
-
-    /// Drop the held value; true when one was resident. Waits for an
-    /// in-progress load first, so the load's value is dropped too.
-    pub(crate) async fn unload(&self) -> bool {
-        self.value.lock().await.take().is_some()
-    }
-
-    /// True when a value is resident. A load or unload in progress reports
-    /// false.
-    pub(crate) fn is_loaded(&self) -> bool {
-        self.value
-            .try_lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
-    }
+    /// Matryoshka truncation length, validated at load; `None` keeps the model
+    /// dimension.
+    output_dim: Option<usize>,
 }
 
 /// What a host needs to record which embedding space the vectors belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeIdentity {
-    /// The embedder id as written in `config.toml`, e.g.
-    /// `native:Qwen/Qwen3-Embedding-0.6B`.
+pub struct TextIdentity {
+    /// The model id as configured: a hub repo id or local directory.
     pub id: String,
     pub dimension: usize,
     /// Resolved precision: `f32`, `f16` or `bf16`.
@@ -215,49 +164,176 @@ pub struct NativeIdentity {
     pub max_length: usize,
 }
 
-pub struct NativeEmbedder {
+/// Settings for a [`TextEmbedder`], with builder-style setters. Build one with
+/// [`TextOptions::default`] and `with_*`; only `id` has no usable default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextOptions {
+    /// A Hugging Face repo id or a local model directory.
+    pub id: String,
+    /// Compute device; `Auto` is Metal on macOS, else CUDA if built, else CPU.
+    pub device: DeviceSpec,
+    /// Weight precision; `None` picks the device default (see [`default_dtype`]).
+    pub dtype: Option<DtypeSpec>,
+    pub attention: AttentionRequest,
+    /// Model context length in tokens.
+    pub max_length: usize,
+    /// Inputs per forward pass.
+    pub batch_size: usize,
+    /// Cap on padded tokens (`inputs x longest input`) per forward pass.
+    pub max_batch_tokens: usize,
+    /// Deadline for one forward pass, used when `per_batch_timeout_seconds` is unset.
+    pub timeout_seconds: u64,
+    /// Deadline for one forward pass, overriding `timeout_seconds`. At least
+    /// [`inl_core::device::CPU_BATCH_TIMEOUT`] on CPU unless set explicitly.
+    pub per_batch_timeout_seconds: Option<u64>,
+    /// Directory for cached model files; `None` uses the shared cache.
+    pub cache_dir: Option<PathBuf>,
+    /// Prefix prepended by [`TextEmbedder::embed_query`].
+    pub query_prefix: Option<String>,
+    /// Prefix prepended by [`TextEmbedder::embed`].
+    pub passage_prefix: Option<String>,
+    /// Matryoshka output dimension (EmbeddingGemma 2 only): one of the model's
+    /// supported sizes. `None` keeps the full dimension.
+    pub output_dim: Option<usize>,
+}
+
+impl Default for TextOptions {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            device: DeviceSpec::Auto,
+            dtype: None,
+            attention: AttentionRequest::Auto,
+            max_length: DEFAULT_MAX_LENGTH,
+            batch_size: DEFAULT_BATCH_SIZE,
+            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            per_batch_timeout_seconds: None,
+            cache_dir: None,
+            query_prefix: None,
+            passage_prefix: None,
+            output_dim: None,
+        }
+    }
+}
+
+impl TextOptions {
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    pub fn with_device(mut self, device: DeviceSpec) -> Self {
+        self.device = device;
+        self
+    }
+
+    pub fn with_dtype(mut self, dtype: Option<DtypeSpec>) -> Self {
+        self.dtype = dtype;
+        self
+    }
+
+    pub fn with_attention(mut self, attention: AttentionRequest) -> Self {
+        self.attention = attention;
+        self
+    }
+
+    pub fn with_max_length(mut self, max_length: usize) -> Self {
+        self.max_length = max_length;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    pub fn with_max_batch_tokens(mut self, max_batch_tokens: usize) -> Self {
+        self.max_batch_tokens = max_batch_tokens;
+        self
+    }
+
+    pub fn with_timeout_seconds(mut self, timeout_seconds: u64) -> Self {
+        self.timeout_seconds = timeout_seconds;
+        self
+    }
+
+    pub fn with_per_batch_timeout_seconds(mut self, seconds: Option<u64>) -> Self {
+        self.per_batch_timeout_seconds = seconds;
+        self
+    }
+
+    pub fn with_cache_dir(mut self, cache_dir: Option<PathBuf>) -> Self {
+        self.cache_dir = cache_dir;
+        self
+    }
+
+    pub fn with_query_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.query_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn with_passage_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.passage_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn with_output_dim(mut self, output_dim: Option<usize>) -> Self {
+        self.output_dim = output_dim;
+        self
+    }
+}
+
+pub struct TextEmbedder {
     model_id: String,
-    device: NativeDevice,
+    device: DeviceSpec,
     /// `None` picks the device's default (see [`default_dtype`]).
-    dtype: Option<NativeDtype>,
+    dtype: Option<DtypeSpec>,
     attention: AttentionRequest,
     max_length: usize,
     batch_size: usize,
     max_batch_tokens: usize,
-    /// Deadline from the config (`per_batch_timeout_seconds`, else
+    /// Deadline from the options (`per_batch_timeout_seconds`, else
     /// `timeout_seconds`); see [`effective_batch_timeout`] for the CPU default.
     batch_timeout: Duration,
     batch_timeout_explicit: bool,
     cache_dir: Option<PathBuf>,
     query_prefix: Option<String>,
     passage_prefix: Option<String>,
+    /// Requested Matryoshka dimension, validated against the model at load.
+    output_dim: Option<usize>,
     inner: LoadSlot<LoadedModel>,
     tokenizer: OnceCell<Tokenizer>,
     deadline: &'static BatchDeadline,
 }
 
 /// Process-wide: a timed-out native forward pass strands a thread (and the
-/// model it holds) until exit, so every `NativeEmbedder` in the process —
-/// including ones rebuilt per call by `DeferredEmbedder` — must fail fast
-/// instead of loading another model.
+/// model it holds) until exit, so every [`TextEmbedder`] in the process must
+/// fail fast instead of loading another model.
 pub(crate) static NATIVE_DEADLINE: BatchDeadline = BatchDeadline::new();
 
-impl NativeEmbedder {
-    pub fn from_config(settings: &EmbedderConfig) -> Result<Self> {
-        let model_id = parse_native_model_id(&settings.id)?.to_string();
+impl TextEmbedder {
+    pub fn new(options: TextOptions) -> Result<Self> {
+        if options.id.is_empty() {
+            return Err(InlError::Config(
+                "text embedder id is missing a model name".to_string(),
+            ));
+        }
+        let batch_timeout = batch_timeout(&options)?;
         Ok(Self {
-            model_id,
-            device: parse_device(settings.device.as_deref())?,
-            dtype: parse_dtype(settings.dtype.as_deref())?,
-            attention: AttentionRequest::parse(settings.attention.as_deref())?,
-            max_length: settings.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
-            batch_size: settings.batch_size,
-            max_batch_tokens: settings.max_batch_tokens.unwrap_or(MAX_BATCH_TOKENS),
-            batch_timeout: batch_timeout(settings)?,
-            batch_timeout_explicit: settings.per_batch_timeout_seconds.is_some(),
-            cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
-            query_prefix: settings.query_prefix.clone(),
-            passage_prefix: settings.passage_prefix.clone(),
+            model_id: options.id,
+            device: options.device,
+            dtype: options.dtype,
+            attention: options.attention,
+            max_length: options.max_length,
+            batch_size: options.batch_size,
+            max_batch_tokens: options.max_batch_tokens,
+            batch_timeout,
+            batch_timeout_explicit: options.per_batch_timeout_seconds.is_some(),
+            cache_dir: options.cache_dir,
+            query_prefix: options.query_prefix,
+            passage_prefix: options.passage_prefix,
+            output_dim: options.output_dim,
             inner: LoadSlot::new(),
             tokenizer: OnceCell::new(),
             deadline: &NATIVE_DEADLINE,
@@ -270,24 +346,11 @@ impl NativeEmbedder {
                 let repo = self.model_id.clone();
                 let cache_dir = self.cache_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    apply_cache_dir(cache_dir.as_deref());
-                    let api = if std::env::var_os("HF_HOME").is_some() {
-                        ApiBuilder::from_env()
-                    } else {
-                        ApiBuilder::new().with_cache_dir(PathBuf::from(model_cache_dir()))
-                    }
-                    .with_progress(false)
-                    .build()
-                    .map_err(|error| {
-                        MinSyncError::Embedding(format!(
-                            "native tokenizer API initialization failed: {error}"
-                        ))
-                    })?;
-                    let path = api.model(repo).get("tokenizer.json").map_err(|error| {
-                        MinSyncError::Embedding(format!("native tokenizer load failed: {error}"))
-                    })?;
+                    let source =
+                        ModelSource::resolve(&repo, model_cache_dir(cache_dir.as_deref()))?;
+                    let path = source.fetch("tokenizer.json")?;
                     let mut tokenizer = Tokenizer::from_file(path).map_err(|error| {
-                        MinSyncError::Embedding(format!("native tokenizer parse failed: {error}"))
+                        InlError::Inference(format!("native tokenizer parse failed: {error}"))
                     })?;
                     let _ = tokenizer.with_padding(Some(PaddingParams {
                         strategy: PaddingStrategy::BatchLongest,
@@ -298,13 +361,15 @@ impl NativeEmbedder {
                 })
                 .await
                 .map_err(|error| {
-                    MinSyncError::Embedding(format!("native tokenizer join failed: {error}"))
+                    InlError::Inference(format!("native tokenizer join failed: {error}"))
                 })?
             })
             .await
     }
 
-    async fn count_truncated_texts(&self, texts: &[String]) -> Result<usize> {
+    /// How many of `texts` (passage prefix applied) reach `max_length` tokens
+    /// and are therefore truncated by the model.
+    pub async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
         let texts: Vec<String> = texts
             .iter()
             .map(|text| match &self.passage_prefix {
@@ -330,7 +395,7 @@ impl NativeEmbedder {
                     .encode(text.as_str(), true)
                     .map(|encoding| usize::from(encoding.len() >= self.max_length))
                     .map_err(|error| {
-                        MinSyncError::Embedding(format!("native tokenizer encode failed: {error}"))
+                        InlError::Inference(format!("native tokenizer encode failed: {error}"))
                     })
             })
             .sum()
@@ -340,21 +405,21 @@ impl NativeEmbedder {
         self.inner
             .get_or_load(|| async {
                 let repo = self.model_id.clone();
-                let device = self.device;
-                let dtype = self.dtype;
+                let device_spec = self.device;
+                let dtype_spec = self.dtype;
                 let attention = self.attention;
                 let max_length = self.max_length;
                 let cache_dir = self.cache_dir.clone();
                 let batch_timeout = self.batch_timeout;
                 let batch_timeout_explicit = self.batch_timeout_explicit;
+                let requested_output_dim = self.output_dim;
                 tokio::task::spawn_blocking(move || {
-                    apply_cache_dir(cache_dir.as_deref());
-                    let device = resolve_device(device)?;
-                    let cache = PathBuf::from(model_cache_dir());
+                    let device = resolve_device(device_spec)?;
+                    let cache = model_cache_dir(cache_dir.as_deref());
                     let architecture = Architecture::detect(&repo, cache.clone())?;
-                    let dtype = dtype.map_or_else(
+                    let dtype = dtype_spec.map_or_else(
                         || default_dtype(&device, architecture),
-                        NativeDtype::to_candle,
+                        DtypeSpec::to_candle,
                     );
                     let model = NativeModel::load(
                         architecture,
@@ -367,6 +432,9 @@ impl NativeEmbedder {
                             attention,
                         },
                     )?;
+                    let output_dim =
+                        resolve_output_dim(architecture, model.dimension(), requested_output_dim)?;
+                    let dimension = output_dim.unwrap_or_else(|| model.dimension());
                     let batch_timeout = effective_batch_timeout(
                         batch_timeout,
                         batch_timeout_explicit,
@@ -381,18 +449,19 @@ impl NativeEmbedder {
                     );
                     Ok(LoadedModel {
                         attention_heads: model.attention_heads().max(1),
-                        dimension: model.dimension(),
+                        dimension,
                         device: device_label(&device),
                         dtype,
                         backend: model.backend(),
                         batch_timeout,
+                        output_dim,
                         model: Arc::new(Mutex::new(model)),
                         gate: Arc::new(tokio::sync::Mutex::new(())),
                     })
                 })
                 .await
                 .map_err(|error| {
-                    MinSyncError::Embedding(format!("native model load join failed: {error}"))
+                    InlError::Inference(format!("native model load join failed: {error}"))
                 })?
             })
             .await
@@ -401,10 +470,10 @@ impl NativeEmbedder {
     /// The embedding space this embedder produces. Loads the model if it is
     /// not resident, because the device, dtype and dimension are only known
     /// once it is.
-    pub async fn identity(&self) -> Result<NativeIdentity> {
+    pub async fn identity(&self) -> Result<TextIdentity> {
         let loaded = self.model().await?;
-        Ok(NativeIdentity {
-            id: format!("native:{}", self.model_id),
+        Ok(TextIdentity {
+            id: self.model_id.clone(),
             dimension: loaded.dimension,
             dtype: dtype_name(loaded.dtype),
             device: device_kind(&loaded.device),
@@ -425,6 +494,10 @@ impl NativeEmbedder {
     }
 
     /// Tokens per text as the model sees it before truncation.
+    pub async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.token_counts_of(texts).await
+    }
+
     async fn token_counts_of(&self, texts: &[String]) -> Result<Vec<usize>> {
         let tokenizer = self.tokenizer().await?;
         texts
@@ -434,18 +507,44 @@ impl NativeEmbedder {
                     .encode(text.as_str(), true)
                     .map(|encoding| encoding.len())
                     .map_err(|error| {
-                        MinSyncError::Embedding(format!("native tokenizer encode failed: {error}"))
+                        InlError::Inference(format!("native tokenizer encode failed: {error}"))
                     })
             })
             .collect()
     }
 
+    /// Embed passages: the passage prefix is applied.
+    pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let inputs = texts
+            .iter()
+            .map(|text| match &self.passage_prefix {
+                Some(prefix) => format!("{prefix}{text}"),
+                None => text.clone(),
+            })
+            .collect();
+        self.embed_texts(inputs).await
+    }
+
+    /// Embed a search query: the query prefix is applied.
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let input = match &self.query_prefix {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text.to_string(),
+        };
+        self.embed_texts(vec![input])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| InlError::Inference("empty response".to_string()))
+    }
+
+    /// Embed `texts` exactly as given (no prefixes applied).
     async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         if self.batch_size == 0 {
-            return Err(MinSyncError::Embedding(
+            return Err(InlError::Inference(
                 "batch_size must be greater than 0".to_string(),
             ));
         }
@@ -454,6 +553,7 @@ impl NativeEmbedder {
         let per_row_attention_bytes = loaded.attention_heads * loaded.dtype.size_in_bytes();
         let backend = loaded.backend;
         let batch_timeout = loaded.batch_timeout;
+        let output_dim = loaded.output_dim;
         let model = loaded.model;
         let gate = loaded.gate;
         let batches = plan_batches(
@@ -473,20 +573,70 @@ impl NativeEmbedder {
             batches,
             move |chunk: &[String]| {
                 let model = model.lock().map_err(|error| {
-                    MinSyncError::Embedding(format!("native model lock poisoned: {error}"))
+                    InlError::Inference(format!("native model lock poisoned: {error}"))
                 })?;
-                model.embed(chunk).map_err(|error| {
-                    MinSyncError::Embedding(format!("native embedding failed: {error}"))
-                })
+                let mut vectors = model.embed(chunk).map_err(|error| {
+                    InlError::Inference(format!("native embedding failed: {error}"))
+                })?;
+                if let Some(dim) = output_dim {
+                    for vector in &mut vectors {
+                        truncate_and_normalize(vector, dim);
+                    }
+                }
+                Ok(vectors)
             },
         )
         .await
     }
 }
 
+#[async_trait]
+impl DenseEngine for TextEmbedder {
+    async fn load(&self) -> Result<EngineInfo> {
+        self.deadline.ensure_healthy("native embedding")?;
+        let loaded = self.model().await?;
+        // The tokenizer guards the context per request; load it up front too.
+        self.tokenizer().await?;
+        Ok(EngineInfo {
+            model_id: self.model_id.clone(),
+            dimension: loaded.dimension,
+            dtype: dtype_name(loaded.dtype).to_string(),
+            device: loaded.device,
+            attention: backend_name(loaded.backend).to_string(),
+            max_length: self.max_length,
+            modalities: vec![Modality::Text],
+        })
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.token_counts_of(texts).await
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_texts(texts).await
+    }
+
+    async fn unload(&self) -> bool {
+        self.inner.unload().await
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.inner.is_loaded()
+    }
+}
+
+/// One of `eager`, `tiled` or `fused`, the vocabulary [`EngineInfo`] uses.
+fn backend_name(backend: AttentionBackend) -> &'static str {
+    match backend {
+        AttentionBackend::Eager => "eager",
+        AttentionBackend::Tiled => "tiled",
+        AttentionBackend::MetalSdpa | AttentionBackend::CpuFlash => "fused",
+    }
+}
+
 /// Run `embed_batch` over each planned batch on the blocking pool, each
 /// forward pass under its own `batch_timeout` so a stuck kernel surfaces as
-/// [`MinSyncError::Timeout`] instead of hanging the caller.
+/// [`InlError::Timeout`] instead of hanging the caller.
 ///
 /// `gate` admits one forward pass at a time. Callers queue on it *before*
 /// the deadline starts, so a pass only times out on its own runtime, not
@@ -516,7 +666,7 @@ where
             })
             .await?;
         if vectors.len() != expected {
-            return Err(MinSyncError::Embedding(format!(
+            return Err(InlError::Inference(format!(
                 "native embedder returned {} embeddings for {expected} inputs",
                 vectors.len(),
             )));
@@ -524,76 +674,6 @@ where
         all.extend(vectors);
     }
     Ok(all)
-}
-
-#[async_trait]
-impl Embedder for NativeEmbedder {
-    fn id(&self) -> &str {
-        &self.model_id
-    }
-
-    async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
-        self.count_truncated_texts(texts).await
-    }
-
-    fn max_length(&self) -> Option<usize> {
-        Some(self.max_length)
-    }
-
-    fn is_deterministic(&self) -> bool {
-        true
-    }
-
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let inputs = texts
-            .iter()
-            .map(|text| match &self.passage_prefix {
-                Some(prefix) => format!("{prefix}{text}"),
-                None => text.clone(),
-            })
-            .collect();
-        self.embed_texts(inputs).await
-    }
-
-    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let input = match &self.query_prefix {
-            Some(prefix) => format!("{prefix}{text}"),
-            None => text.to_string(),
-        };
-        self.embed_texts(vec![input])
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| MinSyncError::Embedding("empty response".to_string()))
-    }
-}
-
-/// `minsync serve` runs the same engine, batch planner and deadline as
-/// `sync`; only the prefixes move to the caller.
-#[async_trait]
-impl crate::serve::ServeEngine for NativeEmbedder {
-    async fn load(&self) -> Result<crate::serve::EngineInfo> {
-        self.deadline.ensure_healthy("native embedding")?;
-        let loaded = self.model().await?;
-        // The tokenizer guards the context per request; load it up front too.
-        self.tokenizer().await?;
-        Ok(crate::serve::EngineInfo {
-            model_id: self.model_id.clone(),
-            dimension: loaded.dimension,
-            dtype: loaded.dtype.as_str().to_string(),
-            device: loaded.device,
-            attention: format!("{:?}", loaded.backend).to_ascii_lowercase(),
-            max_length: self.max_length,
-        })
-    }
-
-    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
-        self.token_counts_of(texts).await
-    }
-
-    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.embed_texts(texts).await
-    }
 }
 
 /// Split `texts` into consecutive batches of at most `batch_size` inputs whose
@@ -648,50 +728,60 @@ fn plan_batches(
     batches
 }
 
-/// Deadline for one forward pass in the config: `per_batch_timeout_seconds`,
-/// else `timeout_seconds`.
-pub(crate) fn batch_timeout(settings: &EmbedderConfig) -> Result<Duration> {
-    let seconds = settings
+/// Deadline for one forward pass: `per_batch_timeout_seconds`, else
+/// `timeout_seconds`.
+fn batch_timeout(options: &TextOptions) -> Result<Duration> {
+    let seconds = options
         .per_batch_timeout_seconds
-        .unwrap_or(settings.timeout_seconds);
+        .unwrap_or(options.timeout_seconds);
     if seconds == 0 {
-        return Err(MinSyncError::Config(
-            "embedder.timeout_seconds / per_batch_timeout_seconds must be greater than 0 for the native embedder".to_string(),
+        return Err(InlError::Config(
+            "timeout_seconds / per_batch_timeout_seconds must be greater than 0 for the native embedder".to_string(),
         ));
     }
     Ok(Duration::from_secs(seconds))
 }
 
-/// Per-pass deadline on CPU when `per_batch_timeout_seconds` is not set. A CPU
-/// pass is slow but does not hang: a 2-chunk pass of long inputs needs minutes
-/// on a mid-range desktop CPU, which the 60 s default meant for a stuck GPU
-/// kernel would abort as a timeout.
-pub(crate) const CPU_BATCH_TIMEOUT: Duration = Duration::from_secs(900);
-
-/// The deadline a loaded model runs under. An explicit
-/// `per_batch_timeout_seconds` always wins; otherwise CPU gets at least
-/// [`CPU_BATCH_TIMEOUT`] (a larger `timeout_seconds` is kept) and GPUs keep the
-/// configured value.
-pub(crate) fn effective_batch_timeout(
-    configured: Duration,
-    explicit: bool,
-    on_cpu: bool,
-) -> Duration {
-    if on_cpu && !explicit {
-        configured.max(CPU_BATCH_TIMEOUT)
-    } else {
-        configured
+/// Validate a requested Matryoshka output dimension against the loaded model.
+/// Only EmbeddingGemma 2 supports it, only at its trained sizes, and never
+/// wider than what the model actually produces.
+fn resolve_output_dim(
+    architecture: Architecture,
+    model_dim: usize,
+    requested: Option<usize>,
+) -> Result<Option<usize>> {
+    let Some(dim) = requested else {
+        return Ok(None);
+    };
+    let Some(supported) = architecture.matryoshka_dims() else {
+        return Err(InlError::Config(
+            "output_dim is only supported for EmbeddingGemma 2 models".to_string(),
+        ));
+    };
+    if !supported.contains(&dim) {
+        return Err(InlError::Config(format!(
+            "output_dim {dim} is not supported by EmbeddingGemma 2: use one of {supported:?}"
+        )));
     }
+    if dim > model_dim {
+        return Err(InlError::Config(format!(
+            "output_dim {dim} exceeds the model's {model_dim}-dimensional embeddings"
+        )));
+    }
+    Ok(Some(dim))
 }
 
-fn parse_native_model_id(id: &str) -> Result<&str> {
-    let model = id.strip_prefix("native:").unwrap_or(id);
-    if model.is_empty() {
-        return Err(MinSyncError::Config(
-            "native embedder id is missing a model name".to_string(),
-        ));
+/// Truncate a unit-length vector to `dim` and re-normalize it to unit length,
+/// the Matryoshka operator: the leading dimensions of a normalized embedding
+/// approximate a lower-dimensional embedding once re-normalized.
+fn truncate_and_normalize(vector: &mut Vec<f32>, dim: usize) {
+    vector.truncate(dim);
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in vector.iter_mut() {
+            *value /= norm;
+        }
     }
-    Ok(model)
 }
 
 #[cfg(test)]
@@ -724,36 +814,12 @@ fn test_tokenizer() -> Tokenizer {
     .expect("build test tokenizer")
 }
 
-pub(crate) fn parse_device(value: Option<&str>) -> Result<NativeDevice> {
-    match value {
-        None | Some("auto") => Ok(NativeDevice::Auto),
-        Some("cpu") => Ok(NativeDevice::Cpu),
-        Some("metal") => Ok(NativeDevice::Metal),
-        Some("cuda") => Ok(NativeDevice::Cuda),
-        Some(other) => Err(MinSyncError::Config(format!(
-            "invalid native device '{other}': expected auto, cpu, metal, or cuda"
-        ))),
-    }
-}
-
-pub(crate) fn parse_dtype(value: Option<&str>) -> Result<Option<NativeDtype>> {
-    match value {
-        None | Some("auto") => Ok(None),
-        Some("f32") => Ok(Some(NativeDtype::F32)),
-        Some("f16") => Ok(Some(NativeDtype::F16)),
-        Some("bf16") => Ok(Some(NativeDtype::Bf16)),
-        Some(other) => Err(MinSyncError::Config(format!(
-            "invalid native dtype '{other}': expected auto, f32, f16, or bf16"
-        ))),
-    }
-}
-
-/// Weight/activation precision when the config does not name one: half
+/// Weight/activation precision when the options do not name one: half
 /// precision on Metal for Qwen3, where it cuts the model's footprint by a
 /// third at no measurable retrieval cost; f32 elsewhere, where half-precision
 /// kernels are either slow (CPU, pre-Volta CUDA) or not worth the precision.
 /// EmbeddingGemma 2 overflows float16, so it runs in f32 everywhere.
-pub(crate) fn default_dtype(device: &Device, architecture: Architecture) -> DType {
+fn default_dtype(device: &Device, architecture: Architecture) -> DType {
     if device.is_metal() && architecture == Architecture::Qwen3 {
         DType::F16
     } else {
@@ -761,121 +827,11 @@ pub(crate) fn default_dtype(device: &Device, architecture: Architecture) -> DTyp
     }
 }
 
-impl NativeDtype {
-    pub(crate) fn to_candle(self) -> DType {
-        match self {
-            Self::F32 => DType::F32,
-            Self::F16 => DType::F16,
-            Self::Bf16 => DType::BF16,
-        }
-    }
-}
-
-pub(crate) fn dtype_name(dtype: DType) -> &'static str {
-    match dtype {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        other => other.as_str(),
-    }
-}
-
-/// `cpu`, `metal` or `cuda`, from a [`device_label`] such as `metal:0`.
-pub(crate) fn device_kind(label: &str) -> &'static str {
-    match label.split(':').next() {
-        Some("metal") => "metal",
-        Some("cuda") => "cuda",
-        _ => "cpu",
-    }
-}
-
-pub(crate) fn resolve_device(spec: NativeDevice) -> Result<Device> {
-    match spec {
-        NativeDevice::Cpu => Ok(Device::Cpu),
-        NativeDevice::Auto => Ok(auto_device()),
-        NativeDevice::Metal => metal_device(),
-        NativeDevice::Cuda => Err(MinSyncError::Config(
-            "device cuda requires a CUDA build of minsync".to_string(),
-        )),
-    }
-}
-
-fn auto_device() -> Device {
-    #[cfg(target_os = "macos")]
-    {
-        Device::new_metal(0).unwrap_or(Device::Cpu)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Device::Cpu
-    }
-}
-
-fn metal_device() -> Result<Device> {
-    #[cfg(target_os = "macos")]
-    {
-        Device::new_metal(0)
-            .map_err(|error| MinSyncError::Config(format!("failed to open metal device: {error}")))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(MinSyncError::Config(
-            "device metal is only available on macOS".to_string(),
-        ))
-    }
-}
-
-/// Cache directory for model files. `FASTEMBED_CACHE_DIR` is the name earlier
-/// releases used (and documented), so it stays the override.
-pub(crate) fn model_cache_dir() -> String {
-    std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".to_string())
-}
-
-pub(crate) fn apply_cache_dir(configured: Option<&std::path::Path>) {
-    if let Some(dir) = configured {
-        let _ = std::fs::create_dir_all(dir);
-        std::env::set_var("FASTEMBED_CACHE_DIR", dir);
-        return;
-    }
-    if std::env::var_os("HF_HOME").is_some() || std::env::var_os("FASTEMBED_CACHE_DIR").is_some() {
-        return;
-    }
-    let dir = default_model_cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    std::env::set_var("FASTEMBED_CACHE_DIR", &dir);
-}
-
-fn default_model_cache_dir() -> PathBuf {
-    minsync_cache_root().join("models")
-}
-
-/// `~/.cache/minsync` (`%LOCALAPPDATA%\minsync` on Windows).
-pub(crate) fn minsync_cache_root() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let root = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root).join("minsync")
-    }
-    #[cfg(not(windows))]
-    {
-        let root = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(root).join(".cache").join("minsync")
-    }
-}
-
-pub(crate) fn device_label(device: &Device) -> String {
-    // Metal's `gpu_id` is an IORegistry id, not an ordinal; candle always
-    // opens device 0, so the label carries no index.
-    match device.location() {
-        candle_core::DeviceLocation::Cpu => "cpu".to_string(),
-        candle_core::DeviceLocation::Metal { .. } => "metal".to_string(),
-        candle_core::DeviceLocation::Cuda { gpu_id } => format!("cuda:{gpu_id}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inl_core::attention::AttentionBackend;
+    use std::path::{Path, PathBuf};
 
     // Qwen3-Embedding-0.6B: 16 heads, f32.
     const QWEN3_F32_ROW: usize = 16 * 4;
@@ -908,7 +864,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         assert_eq!(batches, vec![0..64, 64..128, 128..130]);
@@ -925,7 +881,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         assert!(max_attention_bytes(&inputs, &batches) <= ATTENTION_BYTES_BUDGET);
@@ -942,7 +898,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         let mut next = 0;
@@ -964,7 +920,7 @@ mod tests {
             32_768,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         assert_eq!(batches, vec![0..1, 1..2]);
@@ -978,7 +934,7 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         assert!(batches.is_empty());
@@ -1010,11 +966,11 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
         assert!(
-            max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS,
+            max_padded_tokens(&inputs, &batches) <= DEFAULT_MAX_BATCH_TOKENS,
             "{batches:?}"
         );
         assert!(batches.iter().all(|range| range.len() <= 8), "{batches:?}");
@@ -1034,10 +990,10 @@ mod tests {
             DEFAULT_MAX_LENGTH,
             QWEN3_F32_ROW,
             ATTENTION_BYTES_BUDGET,
-            MAX_BATCH_TOKENS,
+            DEFAULT_MAX_BATCH_TOKENS,
             AttentionBackend::Eager,
         );
-        assert!(max_padded_tokens(&inputs, &batches) <= MAX_BATCH_TOKENS);
+        assert!(max_padded_tokens(&inputs, &batches) <= DEFAULT_MAX_BATCH_TOKENS);
     }
 
     #[test]
@@ -1100,10 +1056,15 @@ mod tests {
 
     #[test]
     fn dtype_and_attention_settings_are_validated() {
-        assert_eq!(parse_dtype(None).unwrap(), None);
-        assert_eq!(parse_dtype(Some("auto")).unwrap(), None);
-        assert_eq!(parse_dtype(Some("f16")).unwrap(), Some(NativeDtype::F16));
-        assert!(parse_dtype(Some("int8")).is_err());
+        assert_eq!(DtypeSpec::parse(None).unwrap(), None);
+        assert_eq!(DtypeSpec::parse(Some("auto")).unwrap(), None);
+        assert_eq!(DtypeSpec::parse(Some("f16")).unwrap(), Some(DtypeSpec::F16));
+        assert!(DtypeSpec::parse(Some("int8")).is_err());
+        assert_eq!(
+            AttentionRequest::parse(Some("eager")).unwrap(),
+            AttentionRequest::Eager
+        );
+        assert!(AttentionRequest::parse(Some("flash")).is_err());
     }
 
     #[test]
@@ -1120,7 +1081,7 @@ mod tests {
 
     #[test]
     fn architecture_follows_the_model_type_of_the_config() {
-        let dir = std::env::temp_dir().join("minsync-arch-detect");
+        let dir = std::env::temp_dir().join("inl-arch-detect");
         std::fs::create_dir_all(&dir).unwrap();
         let detect = |config: &str| {
             std::fs::write(dir.join("config.json"), config).unwrap();
@@ -1133,6 +1094,107 @@ mod tests {
         assert_eq!(detect(r#"{"model_type":"qwen3"}"#), Architecture::Qwen3);
         assert_eq!(detect("{}"), Architecture::Qwen3);
     }
+
+    fn fixture_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_embeddinggemma2")
+    }
+
+    fn tiny_embedder(output_dim: Option<usize>) -> TextEmbedder {
+        TextEmbedder::new(
+            TextOptions::default()
+                .with_id(fixture_dir().to_str().unwrap())
+                .with_device(DeviceSpec::Cpu)
+                .with_output_dim(output_dim),
+        )
+        .expect("tiny embedder builds")
+    }
+
+    #[tokio::test]
+    async fn without_output_dim_the_full_dimension_is_produced() {
+        let embedder = tiny_embedder(None);
+        let identity = embedder.identity().await.unwrap();
+        assert_eq!(identity.dimension, 24);
+        let vector = embedder.embed(&["w0 w1 w2".to_string()]).await.unwrap();
+        assert_eq!(vector[0].len(), 24);
+    }
+
+    #[tokio::test]
+    async fn output_dim_is_validated_against_the_model() {
+        // 128 is an allowed EmbeddingGemma 2 size, but the tiny checkpoint only
+        // produces 24 dimensions; asking for more must be a config error.
+        let error = tiny_embedder(Some(128))
+            .identity()
+            .await
+            .expect_err("128 exceeds the tiny model")
+            .to_string();
+        assert!(error.contains("output_dim 128"), "{error}");
+        assert!(error.contains("exceeds"), "{error}");
+
+        // Not one of EmbeddingGemma 2's trained sizes.
+        let error = tiny_embedder(Some(96))
+            .identity()
+            .await
+            .expect_err("96 is not a supported size")
+            .to_string();
+        assert!(error.contains("output_dim 96"), "{error}");
+    }
+
+    #[test]
+    fn output_dim_is_refused_for_qwen3_and_validated_generically() {
+        let qwen3 = Architecture::Qwen3;
+        let error = resolve_output_dim(qwen3, 1024, Some(256))
+            .expect_err("Qwen3 has no Matryoshka support")
+            .to_string();
+        assert!(
+            error.contains("only supported for EmbeddingGemma 2"),
+            "{error}"
+        );
+
+        let gemma2 = Architecture::Gemma2;
+        assert_eq!(resolve_output_dim(gemma2, 768, None).unwrap(), None);
+        assert_eq!(
+            resolve_output_dim(gemma2, 768, Some(256)).unwrap(),
+            Some(256)
+        );
+        assert!(resolve_output_dim(gemma2, 768, Some(100)).is_err());
+        assert!(resolve_output_dim(gemma2, 128, Some(256)).is_err());
+    }
+
+    #[test]
+    fn truncation_renormalizes_to_unit_length() {
+        // [3, 4, 12] -> keep [3, 4] -> [0.6, 0.8].
+        let mut vector = vec![3.0, 4.0, 12.0];
+        truncate_and_normalize(&mut vector, 2);
+        assert_eq!(vector.len(), 2);
+        assert!((vector[0] - 0.6).abs() < 1e-6, "{vector:?}");
+        assert!((vector[1] - 0.8).abs() < 1e-6, "{vector:?}");
+    }
+
+    #[tokio::test]
+    async fn prefixes_are_applied_by_embed_and_embed_query() {
+        let embedder = TextEmbedder::new(
+            TextOptions::default()
+                .with_id(fixture_dir().to_str().unwrap())
+                .with_device(DeviceSpec::Cpu)
+                .with_query_prefix("task: search result | query: ")
+                .with_passage_prefix("title: none | text: "),
+        )
+        .unwrap();
+
+        let query = embedder.embed_query("w0 w1").await.unwrap();
+        let explicit = embedder
+            .embed_texts(vec!["task: search result | query: w0 w1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(query, explicit[0]);
+
+        let passage = embedder.embed(&["w2 w3".to_string()]).await.unwrap();
+        let explicit_passage = embedder
+            .embed_texts(vec!["title: none | text: w2 w3".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(passage[0], explicit_passage[0]);
+    }
 }
 
 #[cfg(test)]
@@ -1140,11 +1202,13 @@ mod deadline_tests {
     use super::*;
     use std::time::Instant;
 
-    fn settings(timeout: u64, per_batch: Option<u64>) -> EmbedderConfig {
-        let mut config = crate::config::Config::default_for("s").embedder;
-        config.timeout_seconds = timeout;
-        config.per_batch_timeout_seconds = per_batch;
-        config
+    fn settings(timeout: u64, per_batch: Option<u64>) -> TextOptions {
+        TextOptions {
+            id: "s".to_string(),
+            timeout_seconds: timeout,
+            per_batch_timeout_seconds: per_batch,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1167,11 +1231,11 @@ mod deadline_tests {
     fn zero_timeout_is_rejected() {
         assert!(matches!(
             batch_timeout(&settings(0, None)),
-            Err(MinSyncError::Config(_))
+            Err(InlError::Config(_))
         ));
         assert!(matches!(
             batch_timeout(&settings(42, Some(0))),
-            Err(MinSyncError::Config(_))
+            Err(InlError::Config(_))
         ));
     }
 
@@ -1225,10 +1289,7 @@ mod deadline_tests {
         )
         .await;
 
-        assert!(
-            matches!(outcome, Err(MinSyncError::Timeout(_))),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, Err(InlError::Timeout(_))), "{outcome:?}");
         assert!(started.elapsed() < Duration::from_millis(600));
     }
 
@@ -1274,7 +1335,7 @@ mod deadline_tests {
         )
         .await;
 
-        assert!(matches!(outcome, Err(MinSyncError::Embedding(_))));
+        assert!(matches!(outcome, Err(InlError::Inference(_))));
     }
 
     /// A server runs several requests at once against one model. Waiting
@@ -1368,9 +1429,9 @@ mod lifecycle_tests {
         let slot: LoadSlot<u32> = LoadSlot::new();
 
         let failed = slot
-            .get_or_load(|| async { Err(MinSyncError::Embedding("no weights".to_string())) })
+            .get_or_load(|| async { Err(InlError::Inference("no weights".to_string())) })
             .await;
-        assert!(matches!(failed, Err(MinSyncError::Embedding(_))));
+        assert!(matches!(failed, Err(InlError::Inference(_))));
         assert!(!slot.is_loaded());
 
         assert_eq!(slot.get_or_load(|| async { Ok(5) }).await.unwrap(), 5);

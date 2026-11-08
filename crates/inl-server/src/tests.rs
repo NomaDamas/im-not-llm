@@ -1,8 +1,10 @@
-//! Behavior of `minsync serve` against a fake engine on a real loopback
-//! socket: protocol shapes, prefixes, limits, idle exit, adoption, files.
+//! Behavior of `inl serve` against fake engines on a real loopback socket:
+//! protocol shapes, prefixes, limits, idle exit, adoption, files, the
+//! programmatic lifecycle and the multimodal routes.
 
 use super::*;
-use crate::error::{MinSyncError, Result};
+use inl_core::{DenseEngine, EngineInfo, InlError, Modality, MultimodalEngine, MultimodalInput};
+use inl_sparse::{SparseEngine, SparseVector};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -14,10 +16,20 @@ struct FakeEngine {
     seen: StdMutex<Vec<Vec<String>>>,
     delay: Option<Duration>,
     timeout: AtomicBool,
+    loaded: AtomicBool,
+}
+
+impl FakeEngine {
+    fn loaded() -> Self {
+        Self {
+            loaded: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl ServeEngine for FakeEngine {
+impl DenseEngine for FakeEngine {
     async fn load(&self) -> Result<EngineInfo> {
         Ok(EngineInfo {
             model_id: "Fake/Model-1".to_string(),
@@ -26,6 +38,7 @@ impl ServeEngine for FakeEngine {
             device: "cpu".to_string(),
             attention: "eager".to_string(),
             max_length: 4,
+            modalities: vec![Modality::Text],
         })
     }
 
@@ -35,7 +48,7 @@ impl ServeEngine for FakeEngine {
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if self.timeout.load(Ordering::SeqCst) {
-            return Err(MinSyncError::Timeout("native embedding batch stuck".into()));
+            return Err(InlError::Timeout("native embedding batch stuck".into()));
         }
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
@@ -51,6 +64,14 @@ impl ServeEngine for FakeEngine {
                 ]
             })
             .collect())
+    }
+
+    async fn unload(&self) -> bool {
+        self.loaded.swap(false, Ordering::SeqCst)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
     }
 }
 
@@ -200,7 +221,7 @@ async fn openai_base64_encoding_decodes_to_the_float_vector() {
 #[tokio::test]
 async fn openai_model_must_name_the_served_model() {
     let h = spawn().await;
-    for model in ["Fake/Model-1", "native:Fake/Model-1", "fake/model-1"] {
+    for model in ["Fake/Model-1", "fake/model-1"] {
         let (status, body) = post(
             &format!("{}/v1/embeddings", h.url),
             json!({"model": model, "input": "a"}),
@@ -324,8 +345,8 @@ async fn malformed_requests_get_errors_and_the_server_keeps_serving() {
 }
 
 #[tokio::test]
-async fn health_reports_the_loaded_model() {
-    let h = spawn().await;
+async fn health_reports_the_loaded_model_and_build() {
+    let h = spawn_with(FakeEngine::loaded(), |_| {}).await;
     let body: Value = reqwest::get(format!("{}/health", h.url))
         .await
         .unwrap()
@@ -333,12 +354,50 @@ async fn health_reports_the_loaded_model() {
         .await
         .unwrap();
     assert_eq!(body["status"], "ok");
+    assert_eq!(body["kind"], "dense");
     assert_eq!(body["model_id"], "Fake/Model-1");
     assert_eq!(body["dimension"], 3);
     assert_eq!(body["dtype"], "f32");
     assert_eq!(body["device"], "cpu");
     assert_eq!(body["instance"], "test-instance");
     assert_eq!(body["pid"], std::process::id());
+    assert_eq!(body["modalities"], json!(["text"]));
+    assert_eq!(body["loaded"], true);
+    assert_eq!(body["requests_total"], 0);
+    assert!(body["uptime_seconds"].as_u64().is_some());
+    assert_eq!(body["build"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["build"]["features"].is_array());
+
+    // An embedding request bumps the counter in `/health`.
+    post(&format!("{}/embed", h.url), json!({"inputs": ["a"]})).await;
+    let body: Value = reqwest::get(format!("{}/health", h.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["requests_total"], 1);
+}
+
+#[tokio::test]
+async fn admin_unload_releases_the_model_and_admin_shutdown_stops_the_server() {
+    let engine = FakeEngine::loaded();
+    let h = spawn_with(engine, |_| {}).await;
+    let url = format!("{}/admin/unload", h.url);
+    let (status, body) = post(&url, json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["unloaded"], true);
+    assert_eq!(body["loaded"], false);
+
+    let (status, body) = post(&format!("{}/admin/shutdown", h.url), json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "stopping");
+    let reason = tokio::time::timeout(Duration::from_secs(5), h.stopped)
+        .await
+        .expect("admin shutdown stops the server")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reason, StopReason::Signal);
 }
 
 #[tokio::test]
@@ -420,7 +479,7 @@ async fn pid_and_port_files_exist_while_serving_and_are_removed_on_stop() {
 async fn a_second_start_adopts_the_running_server_without_loading() {
     struct NeverLoad;
     #[async_trait::async_trait]
-    impl ServeEngine for NeverLoad {
+    impl DenseEngine for NeverLoad {
         async fn load(&self) -> Result<EngineInfo> {
             panic!("an adopting process must not load a model");
         }
@@ -429,6 +488,12 @@ async fn a_second_start_adopts_the_running_server_without_loading() {
         }
         async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>> {
             unreachable!()
+        }
+        async fn unload(&self) -> bool {
+            unreachable!()
+        }
+        fn is_loaded(&self) -> bool {
+            false
         }
     }
     let h = spawn().await;
@@ -465,52 +530,142 @@ fn only_loopback_hosts_are_accepted() {
     }
     for bad in ["0.0.0.0", "::", "192.168.1.10", "example.com", ""] {
         let error = parse_loopback_host(bad).unwrap_err();
-        assert!(matches!(error, MinSyncError::Config(_)), "{bad}: {error}");
+        assert!(matches!(error, InlError::Config(_)), "{bad}: {error}");
     }
 }
 
 #[test]
 fn instance_key_follows_what_changes_the_vectors() {
-    let base = crate::config::Config::default_for("s").embedder;
+    let base = InstanceKey {
+        model: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+        ..InstanceKey::default()
+    };
     let key = instance_key(&base).unwrap();
+    assert!(key.starts_with("Qwen-Qwen3-Embedding-0.6B-"), "{key}");
+
     let mut prefixed = base.clone();
-    prefixed.query_prefix = Some("q: ".into());
-    prefixed.batch_size = 7;
-    prefixed.timeout_seconds = 5;
+    prefixed.device = Some("auto".into());
+    prefixed.dtype = Some("auto".into());
     assert_eq!(instance_key(&prefixed).unwrap(), key);
-    let mut explicit_auto = base.clone();
-    explicit_auto.dtype = Some("auto".into());
-    explicit_auto.device = Some("auto".into());
-    assert_eq!(instance_key(&explicit_auto).unwrap(), key);
     for change in [
-        |c: &mut crate::config::EmbedderConfig| c.dtype = Some("f32".into()),
-        |c: &mut crate::config::EmbedderConfig| c.device = Some("cpu".into()),
-        |c: &mut crate::config::EmbedderConfig| c.max_length = Some(512),
-        |c: &mut crate::config::EmbedderConfig| c.attention = Some("eager".into()),
-        |c: &mut crate::config::EmbedderConfig| c.id = "native:Other/Model".into(),
+        |k: &mut InstanceKey| k.dtype = Some("f32".into()),
+        |k: &mut InstanceKey| k.device = Some("cpu".into()),
+        |k: &mut InstanceKey| k.max_length = Some(512),
+        |k: &mut InstanceKey| k.attention = Some("eager".into()),
+        |k: &mut InstanceKey| k.model = "Other/Model".into(),
     ] {
         let mut other = base.clone();
         change(&mut other);
         assert_ne!(instance_key(&other).unwrap(), key);
     }
-    let mut tei = base;
-    tei.id = "tei:foo".into();
-    assert!(instance_key(&tei).is_err());
+    let mut empty = base;
+    empty.model = String::new();
+    assert!(instance_key(&empty).is_err());
+}
+
+// ---- programmatic lifecycle --------------------------------------------------
+
+#[tokio::test]
+async fn daemon_spawn_serves_then_stops_and_removes_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let engine = Arc::new(FakeEngine::loaded());
+    let daemon = Daemon::spawn(Engine::dense(engine.clone()), opts)
+        .await
+        .unwrap();
+    assert!(matches!(daemon, Daemon::Serving(_)));
+    let url = daemon.url();
+    let health = daemon.health();
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.url, url);
+    assert_eq!(health.instance, "test-instance");
+
+    let (status, _) = post(&format!("{url}/embed"), json!({"inputs": ["a"]})).await;
+    assert_eq!(status, 200);
+
+    let reason = daemon.stop().await.unwrap();
+    assert_eq!(reason, StopReason::Signal);
+    assert!(!dir.path().join("port").exists());
+    assert!(!dir.path().join("lock").is_file() || dir.path().join("lock").exists());
+}
+
+#[tokio::test]
+async fn daemon_client_discover_probe_wait_unload_and_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let daemon = Daemon::spawn(Engine::dense(Arc::new(FakeEngine::loaded())), opts)
+        .await
+        .unwrap();
+
+    let client = DaemonClient::discover(dir.path(), "test-instance").expect("discovery files");
+    let ready = client.wait_ready(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(ready.status, "ok");
+    assert!(client.probe().await.is_some());
+    // The wrong instance is not adopted.
+    assert!(DaemonClient::discover(dir.path(), "other")
+        .unwrap()
+        .probe()
+        .await
+        .is_none());
+
+    assert!(client.unload().await.unwrap());
+    assert_eq!(client.probe().await.unwrap().loaded, false);
+
+    client.stop().await.unwrap();
+    assert_eq!(daemon.wait().await.unwrap(), StopReason::Signal);
+    assert!(probe(dir.path(), "test-instance").await.is_none());
+}
+
+#[tokio::test]
+async fn daemon_spawn_adopts_an_already_serving_instance() {
+    struct NeverLoad;
+    #[async_trait::async_trait]
+    impl DenseEngine for NeverLoad {
+        async fn load(&self) -> Result<EngineInfo> {
+            panic!("adoption must not load");
+        }
+        async fn token_counts(&self, _: &[String]) -> Result<Vec<usize>> {
+            unreachable!()
+        }
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            unreachable!()
+        }
+        async fn unload(&self) -> bool {
+            false
+        }
+        fn is_loaded(&self) -> bool {
+            false
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let serving = Daemon::spawn(Engine::dense(Arc::new(FakeEngine::default())), opts.clone())
+        .await
+        .unwrap();
+    let adopted = Daemon::spawn(Engine::dense(Arc::new(NeverLoad)), opts)
+        .await
+        .unwrap();
+    assert!(matches!(adopted, Daemon::Adopted { .. }));
+    assert_eq!(adopted.url(), serving.url());
+    assert_eq!(adopted.health().model_id, "Fake/Model-1");
+
+    // Stopping the adopted handle shuts the owner down over HTTP.
+    adopted.stop().await.unwrap();
+    assert_eq!(serving.wait().await.unwrap(), StopReason::Signal);
 }
 
 // ---- sparse (SPLADE) engine: POST /embed_sparse ------------------------------
-
-use crate::sparse::SparseVector;
 
 /// Encodes a text as one term per distinct byte: `{byte: 1 + position-in-text-order}`.
 #[derive(Default)]
 struct FakeSparse {
     seen: StdMutex<Vec<Vec<String>>>,
     timeout: AtomicBool,
+    loaded: AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl SparseServeEngine for FakeSparse {
+impl SparseEngine for FakeSparse {
     async fn load(&self) -> Result<EngineInfo> {
         Ok(EngineInfo {
             model_id: "Fake/Sparse-1".to_string(),
@@ -519,6 +674,7 @@ impl SparseServeEngine for FakeSparse {
             device: "cpu".to_string(),
             attention: "tiled".to_string(),
             max_length: 4,
+            modalities: vec![Modality::Text],
         })
     }
 
@@ -528,7 +684,7 @@ impl SparseServeEngine for FakeSparse {
 
     async fn encode(&self, texts: Vec<String>) -> Result<Vec<SparseVector>> {
         if self.timeout.load(Ordering::SeqCst) {
-            return Err(MinSyncError::Timeout("native sparse batch stuck".into()));
+            return Err(InlError::Timeout("native sparse batch stuck".into()));
         }
         self.seen.lock().unwrap().push(texts.clone());
         Ok(texts
@@ -541,6 +697,14 @@ impl SparseServeEngine for FakeSparse {
                 )
             })
             .collect())
+    }
+
+    async fn unload(&self) -> bool {
+        self.loaded.swap(false, Ordering::SeqCst)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
     }
 }
 
@@ -675,7 +839,7 @@ async fn a_sparse_server_does_not_serve_dense_routes_and_reports_its_kind() {
     assert_eq!(health["status"], "ok");
     assert_eq!(health["kind"], "sparse");
     assert_eq!(health["model_id"], "Fake/Sparse-1");
-    for route in ["/embed", "/v1/embeddings"] {
+    for route in ["/embed", "/v1/embeddings", "/embed_multimodal"] {
         let response = client
             .post(format!("{}{route}", h.url))
             .json(&json!({"inputs": ["a"], "input": ["a"]}))
@@ -697,13 +861,15 @@ async fn a_dense_server_reports_kind_dense_and_has_no_embed_sparse() {
         .unwrap();
     assert_eq!(health["kind"], "dense");
     // axum's default 404 has an empty body, so check the status directly.
-    let response = reqwest::Client::new()
-        .post(format!("{}/embed_sparse", h.url))
-        .json(&json!({"inputs": ["a"]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status().as_u16(), 404);
+    for route in ["/embed_sparse", "/embed_multimodal"] {
+        let response = reqwest::Client::new()
+            .post(format!("{}{route}", h.url))
+            .json(&json!({"inputs": ["a"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404, "{route}");
+    }
 }
 
 #[tokio::test]
@@ -724,20 +890,244 @@ async fn a_wedged_sparse_pass_shuts_the_server_down_with_the_timeout_exit_code()
 
 #[test]
 fn sparse_instance_key_differs_from_a_dense_one_and_tracks_vector_inputs() {
-    let sparse = crate::config::SparseConfig::default();
-    let key = sparse_instance_key(&sparse).unwrap();
+    let sparse = InstanceKey {
+        model: "nlpai-lab/KURE-Sparse-nano".to_string(),
+        kind: EngineKind::Sparse,
+        ..InstanceKey::default()
+    };
+    let key = instance_key(&sparse).unwrap();
     assert!(
         key.starts_with("nlpai-lab-KURE-Sparse-nano-sparse-"),
         "{key}"
     );
+    let dense = InstanceKey {
+        model: "nlpai-lab/KURE-Sparse-nano".to_string(),
+        ..InstanceKey::default()
+    };
+    assert_ne!(key, instance_key(&dense).unwrap());
+
     let mut other = sparse.clone();
     other.max_length = Some(512);
-    assert_ne!(key, sparse_instance_key(&other).unwrap());
+    assert_ne!(key, instance_key(&other).unwrap());
     // Batching knobs and prefixes do not change the vectors.
-    other = sparse.clone();
-    other.batch_size = 3;
-    other.query_prefix = None;
-    assert_eq!(key, sparse_instance_key(&other).unwrap());
-    other.id = "tei:foo/bar".to_string();
-    assert!(sparse_instance_key(&other).is_err());
+    let mut multimodal = sparse.clone();
+    multimodal.kind = EngineKind::Multimodal;
+    assert!(instance_key(&multimodal).unwrap().contains("-multimodal-"));
+}
+
+// ---- multimodal engine: POST /embed_multimodal -------------------------------
+
+/// Embeds each input as `[text len, image count, 1]`; records what it saw.
+#[derive(Default)]
+struct FakeMultimodal {
+    seen: StdMutex<Vec<Vec<MultimodalInput>>>,
+    modalities: Vec<Modality>,
+    timeout: AtomicBool,
+}
+
+impl FakeMultimodal {
+    fn text_and_image() -> Self {
+        Self {
+            modalities: vec![Modality::Text, Modality::Image],
+            ..Self::default()
+        }
+    }
+
+    fn text_only() -> Self {
+        Self {
+            modalities: vec![Modality::Text],
+            ..Self::default()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MultimodalEngine for FakeMultimodal {
+    async fn load(&self) -> Result<EngineInfo> {
+        Ok(EngineInfo {
+            model_id: "Fake/Multimodal-1".to_string(),
+            dimension: 3,
+            dtype: "f32".to_string(),
+            device: "cpu".to_string(),
+            attention: "eager".to_string(),
+            max_length: 512,
+            modalities: self.modalities.clone(),
+        })
+    }
+
+    async fn embed(&self, inputs: Vec<MultimodalInput>) -> Result<Vec<Vec<f32>>> {
+        if self.timeout.load(Ordering::SeqCst) {
+            return Err(InlError::Timeout("native multimodal batch stuck".into()));
+        }
+        self.seen.lock().unwrap().push(inputs.clone());
+        Ok(inputs
+            .iter()
+            .map(|input| {
+                vec![
+                    input.text.as_deref().map(str::len).unwrap_or(0) as f32,
+                    input.images.len() as f32,
+                    1.0,
+                ]
+            })
+            .collect())
+    }
+
+    async fn unload(&self) -> bool {
+        false
+    }
+
+    fn is_loaded(&self) -> bool {
+        true
+    }
+}
+
+struct MultimodalHarness {
+    url: String,
+    engine: Arc<FakeMultimodal>,
+    stop: Arc<tokio::sync::Notify>,
+    stopped: tokio::task::JoinHandle<Result<StopReason>>,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_multimodal(engine: FakeMultimodal) -> MultimodalHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let engine = Arc::new(engine);
+    let Started::Serving(server) = start_multimodal(engine.clone(), opts).await.unwrap() else {
+        panic!("expected a fresh server");
+    };
+    let url = server.health().url.clone();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let signal = stop.clone();
+    let stopped = tokio::spawn(async move {
+        server
+            .run_until(async move { signal.notified().await })
+            .await
+    });
+    MultimodalHarness {
+        url,
+        engine,
+        stop,
+        stopped,
+        _dir: dir,
+    }
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+impl MultimodalHarness {
+    /// Signal and await the server so the test leaves nothing running.
+    async fn shutdown(self) {
+        self.stop.notify_one();
+        let _ = self.stopped.await;
+    }
+}
+
+#[tokio::test]
+async fn embed_multimodal_returns_embeddings_model_and_dimensions() {
+    let h = spawn_multimodal(FakeMultimodal::text_and_image()).await;
+    let image = b64(&[1, 2, 3, 4]);
+    let (status, body) = post(
+        &format!("{}/embed_multimodal", h.url),
+        json!({"inputs": [
+            {"text": "hello"},
+            {"text": "a photo <|image|>", "images": [image]},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Fake/Multimodal-1");
+    assert_eq!(body["dimensions"], 3);
+    assert_eq!(
+        body["embeddings"],
+        json!([[5.0, 0.0, 1.0], [17.0, 1.0, 1.0]])
+    );
+    let seen = h.engine.seen.lock().unwrap().clone();
+    assert_eq!(seen[0][1].images.len(), 1);
+    assert_eq!(seen[0][1].images[0].bytes, vec![1, 2, 3, 4]);
+    // The multimodal kind is reported by `/health`.
+    let health: Value = reqwest::get(format!("{}/health", h.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["kind"], "multimodal");
+    assert_eq!(health["modalities"], json!(["text", "image"]));
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn embed_multimodal_validates_base64_modalities_and_limits() {
+    let h = spawn_multimodal(FakeMultimodal::text_only()).await;
+    let url = format!("{}/embed_multimodal", h.url);
+
+    // Undecodable base64 is a 400.
+    let (status, body) = post(&url, json!({"inputs": [{"images": ["not base64!!"]}]})).await;
+    assert_eq!(status, 400, "{body}");
+
+    // A modality the engine does not list is a 422.
+    let (status, body) = post(&url, json!({"inputs": [{"images": [b64(&[1, 2, 3])]}]})).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("image"));
+
+    // An input with neither text nor media is a 422.
+    let (status, _) = post(&url, json!({"inputs": [{}]})).await;
+    assert_eq!(status, 422);
+
+    // Too many inputs is a 413.
+    let many: Vec<Value> = (0..9).map(|_| json!({"text": "x"})).collect();
+    assert_eq!(post(&url, json!({"inputs": many})).await.0, 413);
+    // Empty is a 422.
+    assert_eq!(post(&url, json!({"inputs": []})).await.0, 422);
+
+    // A text input still works and reports the prefix is applied.
+    let url_q = format!("{}/embed_multimodal", h.url);
+    let (status, _) = post(
+        &url_q,
+        json!({"inputs": [{"text": "hi"}], "input_type": "query"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // The TEI `/embed` route on a multimodal server embeds text and enforces
+    // the same limits.
+    assert_eq!(
+        post(&format!("{}/embed", h.url), json!({"inputs": []}))
+            .await
+            .0,
+        422
+    );
+    let (status, body) = post(&format!("{}/embed", h.url), json!({"inputs": ["x"]})).await;
+    assert_eq!((status, body), (200, json!([[1.0, 0.0, 1.0]])));
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn openai_embeddings_accept_media_items_on_a_multimodal_server() {
+    let h = spawn_multimodal(FakeMultimodal::text_and_image()).await;
+    let image = b64(&[9, 9]);
+    let (status, body) = post(
+        &format!("{}/v1/embeddings", h.url),
+        json!({"model": "Fake/Multimodal-1", "input": [
+            "plain",
+            {"type": "image", "data": image},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"][0]["embedding"], json!([5.0, 0.0, 1.0]));
+    assert_eq!(body["data"][1]["embedding"], json!([0.0, 1.0, 1.0]));
+
+    // An item type the engine does not list is a 400 in the OpenAI shape.
+    let (status, body) = post(
+        &format!("{}/v1/embeddings", h.url),
+        json!({"model": "Fake/Multimodal-1", "input": [{"type": "video", "data": b64(&[1])}]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("video"));
+    h.shutdown().await;
 }

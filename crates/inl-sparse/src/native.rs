@@ -1,26 +1,31 @@
 //! In-process native sparse encoder: KURE-Sparse-nano (ModernBERT MLM + SPLADE
 //! pooling) on candle. Device/dtype selection, the load slot, batching and the
-//! per-batch deadline mirror [`crate::embedder::native::NativeEmbedder`]; the
-//! model itself lives in [`super::modernbert`].
+//! per-batch deadline come from `inl-core`; the model itself lives in
+//! [`super::modernbert`].
 
 use super::modernbert::{ModernBertConfig, ModernBertMlm, SpladePooling};
-use super::{SparseEncoder, SparseVector};
-use crate::config::{SparseConfig, DEFAULT_SPARSE_MAX_LENGTH};
-use crate::embedder::deadline::BatchDeadline;
-use crate::embedder::hub::ModelSource;
-use crate::embedder::native::{
-    apply_cache_dir, device_kind, device_label, dtype_name, effective_batch_timeout,
-    model_cache_dir, parse_device, parse_dtype, resolve_device, LoadSlot, NativeDevice,
-    NativeDtype,
-};
-use crate::error::{MinSyncError, Result};
+use super::{SparseEngine, SparseVector};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use inl_core::deadline::BatchDeadline;
+use inl_core::device::{
+    device_label, dtype_name, effective_batch_timeout, model_cache_dir, resolve_device, DeviceSpec,
+    DtypeSpec, LoadSlot,
+};
+use inl_core::hub::ModelSource;
+use inl_core::{EngineInfo, InlError, Modality, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenizers::{Tokenizer, TruncationParams};
+
+/// Default model: in-process KURE-Sparse-nano on candle.
+pub const DEFAULT_MODEL_ID: &str = "nlpai-lab/KURE-Sparse-nano";
+
+/// Default context for the sparse encoder, in tokens. The model supports
+/// 8192; chunks are far shorter, and the cap bounds activation memory.
+pub const DEFAULT_MAX_LENGTH: usize = 2048;
 
 /// Default cap on padded tokens (`inputs x longest input`) per forward pass.
 /// Bounds activations and keeps one pass short enough to finish inside the
@@ -32,7 +37,118 @@ use tokenizers::{Tokenizer, TruncationParams};
 /// more per token the larger the batch. 1024 is within 5% of the best value
 /// on every corpus measured and does not shrink batches of short chunks the
 /// way 128-256 does.
-const MAX_BATCH_TOKENS: usize = 1024;
+pub const DEFAULT_MAX_BATCH_TOKENS: usize = 1024;
+
+/// The model's query / document markers. The checkpoint was trained with them
+/// as dedicated tokens and masks them out of the pooled output.
+pub const DEFAULT_QUERY_PREFIX: &str = "[Q] ";
+pub const DEFAULT_PASSAGE_PREFIX: &str = "[D] ";
+
+/// Settings for an in-process sparse encoder. Plain options with a `Default`
+/// (the recommended configuration) and builder-style setters; there is no
+/// provider prefix — `id` is a Hugging Face repo id or a local directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseOptions {
+    /// Hugging Face repo id or a directory laid out like a snapshot.
+    pub id: String,
+    /// `auto`, `cpu`, `metal`, or `cuda`. `None` is `auto` (Metal on macOS,
+    /// else CUDA when built with the feature, else the CPU).
+    pub device: Option<String>,
+    /// `auto`, `f32`, `f16`, or `bf16`. `None`/`auto` is f32 on every device;
+    /// see [`SparseEncoder::new`] for why.
+    pub dtype: Option<String>,
+    /// Context length in tokens.
+    pub max_length: usize,
+    /// Inputs per forward pass.
+    pub batch_size: usize,
+    /// Cap on padded tokens (`inputs x longest input`) per forward pass.
+    pub max_batch_tokens: usize,
+    /// Deadline for one whole encode call.
+    pub timeout_seconds: u64,
+    /// Native only: deadline in seconds for one forward pass; at least 900 on CPU.
+    pub per_batch_timeout_seconds: Option<u64>,
+    /// Directory for cached native model files (`INL_CACHE_DIR` when unset).
+    pub cache_dir: Option<PathBuf>,
+    /// Query marker; `None` adds nothing.
+    pub query_prefix: Option<String>,
+    /// Passage marker; `None` adds nothing.
+    pub passage_prefix: Option<String>,
+}
+
+impl Default for SparseOptions {
+    fn default() -> Self {
+        Self {
+            id: DEFAULT_MODEL_ID.to_string(),
+            device: None,
+            dtype: None,
+            max_length: DEFAULT_MAX_LENGTH,
+            batch_size: 64,
+            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
+            timeout_seconds: 60,
+            per_batch_timeout_seconds: None,
+            cache_dir: None,
+            query_prefix: Some(DEFAULT_QUERY_PREFIX.to_string()),
+            passage_prefix: Some(DEFAULT_PASSAGE_PREFIX.to_string()),
+        }
+    }
+}
+
+impl SparseOptions {
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    pub fn with_device(mut self, device: impl Into<String>) -> Self {
+        self.device = Some(device.into());
+        self
+    }
+
+    pub fn with_dtype(mut self, dtype: impl Into<String>) -> Self {
+        self.dtype = Some(dtype.into());
+        self
+    }
+
+    pub fn with_max_length(mut self, max_length: usize) -> Self {
+        self.max_length = max_length;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    pub fn with_max_batch_tokens(mut self, max_batch_tokens: usize) -> Self {
+        self.max_batch_tokens = max_batch_tokens;
+        self
+    }
+
+    pub fn with_timeout_seconds(mut self, timeout_seconds: u64) -> Self {
+        self.timeout_seconds = timeout_seconds;
+        self
+    }
+
+    pub fn with_per_batch_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.per_batch_timeout_seconds = Some(seconds);
+        self
+    }
+
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(cache_dir.into());
+        self
+    }
+
+    pub fn with_query_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.query_prefix = Some(prefix.into());
+        self
+    }
+
+    pub fn with_passage_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.passage_prefix = Some(prefix.into());
+        self
+    }
+}
 
 /// Process-wide, like the dense engine: a timed-out forward pass strands its
 /// thread (and the model) until exit, so later calls must fail fast.
@@ -50,21 +166,12 @@ struct Loaded {
     batch_timeout: Duration,
 }
 
-/// What a host needs to record which sparse space the vectors belong to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparseIdentity {
-    pub id: String,
-    /// Number of terms in the output space.
-    pub dimension: usize,
-    pub dtype: &'static str,
-    pub device: &'static str,
-    pub max_length: usize,
-}
-
-pub struct NativeSparseEncoder {
+/// The in-process learned-sparse encoder: `nlpai-lab/KURE-Sparse-nano`
+/// (ModernBERT MLM + SPLADE pooling) on candle.
+pub struct SparseEncoder {
     model_id: String,
-    device: NativeDevice,
-    dtype: Option<NativeDtype>,
+    device: DeviceSpec,
+    dtype: Option<DtypeSpec>,
     max_length: usize,
     batch_size: usize,
     max_batch_tokens: usize,
@@ -78,35 +185,41 @@ pub struct NativeSparseEncoder {
     forward: Arc<Mutex<()>>,
 }
 
-impl NativeSparseEncoder {
-    pub fn from_config(settings: &SparseConfig) -> Result<Self> {
-        let model_id = parse_native_model_id(&settings.id)?.to_string();
-        let seconds = settings
+impl SparseEncoder {
+    /// Build an encoder from `options`. Nothing is loaded yet: the first
+    /// encode (or [`Self::identity`]) brings the weights in.
+    pub fn new(options: SparseOptions) -> Result<Self> {
+        if options.id.trim().is_empty() {
+            return Err(InlError::Config(
+                "sparse encoder id is missing a model name or directory".to_string(),
+            ));
+        }
+        let seconds = options
             .per_batch_timeout_seconds
-            .unwrap_or(settings.timeout_seconds);
+            .unwrap_or(options.timeout_seconds);
         if seconds == 0 {
-            return Err(MinSyncError::Config(
-                "sparse.timeout_seconds / per_batch_timeout_seconds must be greater than 0 for the native encoder"
+            return Err(InlError::Config(
+                "timeout_seconds / per_batch_timeout_seconds must be greater than 0 for the native encoder"
                     .to_string(),
             ));
         }
-        if settings.batch_size == 0 {
-            return Err(MinSyncError::Config(
-                "sparse.batch_size must be greater than 0".to_string(),
+        if options.batch_size == 0 {
+            return Err(InlError::Config(
+                "batch_size must be greater than 0".to_string(),
             ));
         }
         Ok(Self {
-            model_id,
-            device: parse_device(settings.device.as_deref())?,
-            dtype: parse_dtype(settings.dtype.as_deref())?,
-            max_length: settings.max_length.unwrap_or(DEFAULT_SPARSE_MAX_LENGTH),
-            batch_size: settings.batch_size,
-            max_batch_tokens: settings.max_batch_tokens.unwrap_or(MAX_BATCH_TOKENS),
+            model_id: options.id,
+            device: DeviceSpec::parse(options.device.as_deref())?,
+            dtype: DtypeSpec::parse(options.dtype.as_deref())?,
+            max_length: options.max_length,
+            batch_size: options.batch_size,
+            max_batch_tokens: options.max_batch_tokens,
             batch_timeout: Duration::from_secs(seconds),
-            batch_timeout_explicit: settings.per_batch_timeout_seconds.is_some(),
-            cache_dir: settings.model_cache_dir.as_ref().map(PathBuf::from),
-            query_prefix: settings.query_prefix.clone(),
-            passage_prefix: settings.passage_prefix.clone(),
+            batch_timeout_explicit: options.per_batch_timeout_seconds.is_some(),
+            cache_dir: options.cache_dir,
+            query_prefix: options.query_prefix,
+            passage_prefix: options.passage_prefix,
             inner: LoadSlot::new(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             forward: Arc::new(Mutex::new(())),
@@ -123,14 +236,15 @@ impl NativeSparseEncoder {
                 let cache_dir = self.cache_dir.clone();
                 let (timeout, explicit) = (self.batch_timeout, self.batch_timeout_explicit);
                 tokio::task::spawn_blocking(move || {
-                    apply_cache_dir(cache_dir.as_deref());
                     let device = resolve_device(device)?;
                     // f32 on every device. Metal f16 measured no faster for this
                     // model (19.0 vs 18.8 chunks/s) but flips which terms clear the
-                    // SPLADE threshold (query weights off by up to 0.0185, three terms
-                    // dropped), and a sparse index is decided by which terms exist.
-                    let dtype = dtype.map_or(DType::F32, NativeDtype::to_candle);
-                    let source = ModelSource::resolve(&model_id, PathBuf::from(model_cache_dir()))?;
+                    // SPLADE threshold (query weights off by up to 0.0185, three
+                    // terms dropped), and a sparse index is decided by which terms
+                    // exist. Any other dtype is the caller's explicit choice.
+                    let dtype = dtype.map_or(DType::F32, DtypeSpec::to_candle);
+                    let source =
+                        ModelSource::resolve(&model_id, model_cache_dir(cache_dir.as_deref()))?;
                     let loaded = load_model(&source, &device, dtype, max_length)?;
                     let batch_timeout = effective_batch_timeout(timeout, explicit, device.is_cpu());
                     tracing::debug!(
@@ -148,23 +262,23 @@ impl NativeSparseEncoder {
                 })
                 .await
                 .map_err(|error| {
-                    MinSyncError::Embedding(format!(
-                        "native sparse model load join failed: {error}"
-                    ))
+                    InlError::Inference(format!("native sparse model load join failed: {error}"))
                 })?
             })
             .await
     }
 
     /// The sparse space this encoder produces. Loads the model if needed.
-    pub async fn identity(&self) -> Result<SparseIdentity> {
+    pub async fn identity(&self) -> Result<EngineInfo> {
         let loaded = self.loaded().await?;
-        Ok(SparseIdentity {
-            id: format!("native:{}", self.model_id),
+        Ok(EngineInfo {
+            model_id: self.model_id.clone(),
             dimension: loaded.pooling.dimension(loaded.model.vocab_size()),
-            dtype: dtype_name(loaded.dtype),
-            device: device_kind(&loaded.device),
+            dtype: dtype_name(loaded.dtype).to_string(),
+            device: loaded.device.clone(),
+            attention: loaded.model.attention_name().to_string(),
             max_length: self.max_length,
+            modalities: vec![Modality::Text],
         })
     }
 
@@ -184,6 +298,54 @@ impl NativeSparseEncoder {
         }
     }
 
+    /// Encode documents: the passage marker is prepended to every input.
+    pub async fn encode(&self, texts: &[String]) -> Result<Vec<SparseVector>> {
+        let inputs = texts
+            .iter()
+            .map(|text| self.prefixed(&self.passage_prefix, text))
+            .collect();
+        self.encode_inputs(inputs).await
+    }
+
+    /// Encode one query: the query marker is prepended.
+    pub async fn encode_query(&self, text: &str) -> Result<SparseVector> {
+        self.encode_inputs(vec![self.prefixed(&self.query_prefix, text)])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| InlError::Inference("empty response".to_string()))
+    }
+
+    /// How many of `texts` reach the context limit once the passage marker and
+    /// special tokens are counted.
+    pub async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
+        // A chunk can only reach the limit if its UTF-8 byte length does; skip
+        // tokenizing the clearly short ones.
+        let candidates: Vec<String> = texts
+            .iter()
+            .filter(|text| text.len() >= self.max_length)
+            .map(|text| self.prefixed(&self.passage_prefix, text))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let loaded = self.loaded().await?;
+        let limit = self.max_length.min(loaded.model.positions());
+        let counted = tokio::task::spawn_blocking(move || -> Result<usize> {
+            // The loaded tokenizer already truncates, so a text that hit the
+            // limit comes back exactly `limit` long.
+            Ok(tokenize_all(&loaded.tokenizer, &candidates)?
+                .iter()
+                .filter(|ids| ids.len() >= limit)
+                .count())
+        })
+        .await
+        .map_err(|error| {
+            InlError::Inference(format!("native sparse tokenize join failed: {error}"))
+        })??;
+        Ok(counted)
+    }
+
     async fn encode_inputs(&self, inputs: Vec<String>) -> Result<Vec<SparseVector>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -196,7 +358,7 @@ impl NativeSparseEncoder {
             tokio::task::spawn_blocking(move || tokenize_all(&loaded.tokenizer, &inputs))
                 .await
                 .map_err(|error| {
-                    MinSyncError::Embedding(format!("native sparse tokenize join failed: {error}"))
+                    InlError::Inference(format!("native sparse tokenize join failed: {error}"))
                 })??
         };
         let lengths: Vec<usize> = tokenized.iter().map(Vec::len).collect();
@@ -225,7 +387,7 @@ impl NativeSparseEncoder {
                     loaded.batch_timeout,
                     move || {
                         let _guard = forward.lock().map_err(|error| {
-                            MinSyncError::Embedding(format!(
+                            InlError::Inference(format!(
                                 "native sparse model lock poisoned: {error}"
                             ))
                         })?;
@@ -234,7 +396,7 @@ impl NativeSparseEncoder {
                 )
                 .await?;
             if vectors.len() != expected {
-                return Err(MinSyncError::Embedding(format!(
+                return Err(InlError::Inference(format!(
                     "native sparse encoder returned {} vectors for {expected} inputs",
                     vectors.len()
                 )));
@@ -248,25 +410,15 @@ impl NativeSparseEncoder {
         all.into_iter()
             .map(|vector| {
                 vector.ok_or_else(|| {
-                    MinSyncError::Embedding("native sparse encoder lost an input".to_string())
+                    InlError::Inference("native sparse encoder lost an input".to_string())
                 })
             })
             .collect()
     }
 }
 
-fn parse_native_model_id(id: &str) -> Result<&str> {
-    let model = id.strip_prefix("native:").unwrap_or(id);
-    if model.is_empty() {
-        return Err(MinSyncError::Config(
-            "native sparse encoder id is missing a model name".to_string(),
-        ));
-    }
-    Ok(model)
-}
-
-fn load_error(what: &str, error: &dyn std::fmt::Display) -> MinSyncError {
-    MinSyncError::Embedding(format!("native sparse model {what}: {error}"))
+fn load_error(what: &str, error: &dyn std::fmt::Display) -> InlError {
+    InlError::Inference(format!("native sparse model {what}: {error}"))
 }
 
 /// Read the checkpoint: `config.json`, `modules.json` -> the SPLADE pooling
@@ -331,7 +483,7 @@ fn load_pooling(source: &ModelSource) -> Result<SpladePooling> {
                 .is_some_and(|kind| kind.to_ascii_lowercase().contains("splade"))
         })
         .ok_or_else(|| {
-            MinSyncError::Embedding(
+            InlError::Inference(
                 "native sparse model modules.json has no SPLADE pooling module".to_string(),
             )
         })?;
@@ -354,9 +506,7 @@ fn tokenize_all(tokenizer: &Tokenizer, inputs: &[String]) -> Result<Vec<Vec<u32>
                 .encode(text.as_str(), true)
                 .map(|encoding| encoding.get_ids().to_vec())
                 .map_err(|error| {
-                    MinSyncError::Embedding(format!(
-                        "native sparse tokenizer encode failed: {error}"
-                    ))
+                    InlError::Inference(format!("native sparse tokenizer encode failed: {error}"))
                 })
         })
         .collect()
@@ -371,7 +521,7 @@ fn encode_batch(loaded: &Loaded, rows: &[Vec<u32>]) -> Result<Vec<SparseVector>>
         flat.extend(std::iter::repeat_n(loaded.pad_id, seq - row.len()));
     }
     let ids = Tensor::from_vec(flat, (rows.len(), seq), loaded.model.device())
-        .map_err(|error| MinSyncError::Embedding(format!("native sparse input failed: {error}")))?;
+        .map_err(|error| InlError::Inference(format!("native sparse input failed: {error}")))?;
     let dense = loaded.model.splade(&ids, rows, &loaded.pooling)?;
     dense
         .into_iter()
@@ -384,7 +534,7 @@ fn encode_batch(loaded: &Loaded, rows: &[Vec<u32>]) -> Result<Vec<SparseVector>>
             // `from_pairs` drops non-finite weights silently; a vector that lost
             // terms to NaN would index wrongly, so fail the batch instead.
             if row.iter().any(|weight| !weight.is_finite()) {
-                return Err(MinSyncError::Embedding(
+                return Err(InlError::Inference(
                     "native sparse encoder produced non-finite weights".to_string(),
                 ));
             }
@@ -432,79 +582,9 @@ pub(crate) fn plan_batches(
 }
 
 #[async_trait]
-impl SparseEncoder for NativeSparseEncoder {
-    fn id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn max_length(&self) -> Option<usize> {
-        Some(self.max_length)
-    }
-
-    fn is_deterministic(&self) -> bool {
-        true
-    }
-
-    async fn count_truncated(&self, texts: &[String]) -> Result<usize> {
-        // A chunk can only reach the limit if its UTF-8 byte length does; skip
-        // tokenizing the clearly short ones.
-        let candidates: Vec<String> = texts
-            .iter()
-            .filter(|text| text.len() >= self.max_length)
-            .map(|text| self.prefixed(&self.passage_prefix, text))
-            .collect();
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-        let loaded = self.loaded().await?;
-        let limit = self.max_length.min(loaded.model.positions());
-        let counted = tokio::task::spawn_blocking(move || -> Result<usize> {
-            // The loaded tokenizer already truncates, so a text that hit the
-            // limit comes back exactly `limit` long.
-            Ok(tokenize_all(&loaded.tokenizer, &candidates)?
-                .iter()
-                .filter(|ids| ids.len() >= limit)
-                .count())
-        })
-        .await
-        .map_err(|error| {
-            MinSyncError::Embedding(format!("native sparse tokenize join failed: {error}"))
-        })??;
-        Ok(counted)
-    }
-
-    async fn encode(&self, texts: &[String]) -> Result<Vec<SparseVector>> {
-        let inputs = texts
-            .iter()
-            .map(|text| self.prefixed(&self.passage_prefix, text))
-            .collect();
-        self.encode_inputs(inputs).await
-    }
-
-    async fn encode_query(&self, text: &str) -> Result<SparseVector> {
-        self.encode_inputs(vec![self.prefixed(&self.query_prefix, text)])
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| MinSyncError::Embedding("empty response".to_string()))
-    }
-}
-
-/// `minsync serve --sparse` runs the same engine, batch planner and deadline
-/// as `sync`; only the prefixes move to the caller.
-#[async_trait]
-impl crate::serve::SparseServeEngine for NativeSparseEncoder {
-    async fn load(&self) -> Result<crate::serve::EngineInfo> {
-        SPARSE_DEADLINE.ensure_healthy("native sparse encoding")?;
-        let loaded = self.loaded().await?;
-        Ok(crate::serve::EngineInfo {
-            model_id: self.model_id.clone(),
-            dimension: loaded.pooling.dimension(loaded.model.vocab_size()),
-            dtype: dtype_name(loaded.dtype).to_string(),
-            device: loaded.device.clone(),
-            attention: loaded.model.attention_name().to_string(),
-            max_length: self.max_length,
-        })
+impl SparseEngine for SparseEncoder {
+    async fn load(&self) -> Result<EngineInfo> {
+        self.identity().await
     }
 
     async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
@@ -523,12 +603,20 @@ impl crate::serve::SparseServeEngine for NativeSparseEncoder {
         })
         .await
         .map_err(|error| {
-            MinSyncError::Embedding(format!("native sparse tokenize join failed: {error}"))
+            InlError::Inference(format!("native sparse tokenize join failed: {error}"))
         })?
     }
 
     async fn encode(&self, texts: Vec<String>) -> Result<Vec<SparseVector>> {
         self.encode_inputs(texts).await
+    }
+
+    async fn unload(&self) -> bool {
+        self.inner.unload().await
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.inner.is_loaded()
     }
 }
 
@@ -542,12 +630,11 @@ pub(crate) mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_splade")
     }
 
-    pub(crate) fn tiny_settings() -> SparseConfig {
-        SparseConfig {
-            id: format!("native:{}", tiny_dir().display()),
+    pub(crate) fn tiny_options() -> SparseOptions {
+        SparseOptions {
+            id: tiny_dir().display().to_string(),
             device: Some("cpu".to_string()),
-            dtype: Some("f32".to_string()),
-            ..SparseConfig::default()
+            ..SparseOptions::default()
         }
     }
 
@@ -585,7 +672,7 @@ pub(crate) mod tests {
     async fn encodes_text_end_to_end_like_the_huggingface_reference() {
         // Real tokenizer + [D]/[Q] prefixes + model + pooling, from raw strings.
         for case in golden().cases.iter().filter(|c| c.max_length == 64) {
-            let encoder = NativeSparseEncoder::from_config(&tiny_settings()).unwrap();
+            let encoder = SparseEncoder::new(tiny_options()).unwrap();
             let got = if case.kind == "document" {
                 encoder.encode(&case.texts).await.unwrap()
             } else {
@@ -605,18 +692,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn small_batches_and_token_budgets_do_not_change_vectors() {
         let case = golden().cases.into_iter().next().unwrap();
-        let reference = NativeSparseEncoder::from_config(&tiny_settings())
+        let reference = SparseEncoder::new(tiny_options())
             .unwrap()
             .encode(&case.texts)
             .await
             .unwrap();
         for (batch_size, tokens) in [(1, 8192), (2, 8192), (64, 20), (3, 1)] {
-            let settings = SparseConfig {
+            let options = SparseOptions {
                 batch_size,
-                max_batch_tokens: Some(tokens),
-                ..tiny_settings()
+                max_batch_tokens: tokens,
+                ..tiny_options()
             };
-            let got = NativeSparseEncoder::from_config(&settings)
+            let got = SparseEncoder::new(options)
                 .unwrap()
                 .encode(&case.texts)
                 .await
@@ -642,11 +729,11 @@ pub(crate) mod tests {
             .iter()
             .find(|c| c.kind == "document" && c.max_length == 12)
             .unwrap();
-        let settings = SparseConfig {
-            max_length: Some(12),
-            ..tiny_settings()
+        let options = SparseOptions {
+            max_length: 12,
+            ..tiny_options()
         };
-        let encoder = NativeSparseEncoder::from_config(&settings).unwrap();
+        let encoder = SparseEncoder::new(options).unwrap();
         let got = encoder.encode(&case.texts).await.unwrap();
         for (index, (got, want)) in got.iter().zip(&case.batched).enumerate() {
             assert_close(got, want, &format!("truncated text {index}"));
@@ -659,17 +746,20 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn empty_input_loads_nothing_and_returns_nothing() {
-        let encoder = NativeSparseEncoder::from_config(&tiny_settings()).unwrap();
+        let encoder = SparseEncoder::new(tiny_options()).unwrap();
         assert!(encoder.encode(&[]).await.unwrap().is_empty());
         assert!(!encoder.is_loaded(), "empty input must not load the model");
     }
 
     #[tokio::test]
     async fn identity_reports_the_term_space_and_unload_releases_the_model() {
-        let encoder = NativeSparseEncoder::from_config(&tiny_settings()).unwrap();
+        let encoder = SparseEncoder::new(tiny_options()).unwrap();
         let identity = encoder.identity().await.unwrap();
         assert_eq!(identity.dimension, 62);
-        assert_eq!((identity.dtype, identity.device), ("f32", "cpu"));
+        assert_eq!(
+            (identity.dtype.as_str(), identity.device.as_str()),
+            ("f32", "cpu")
+        );
         assert!(encoder.is_loaded());
         assert!(encoder.unload().await);
         assert!(!encoder.is_loaded());
@@ -679,45 +769,46 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_missing_model_is_a_clear_error_not_a_panic() {
-        let settings = SparseConfig {
-            id: "native:/definitely/not/here".to_string(),
-            model_cache_dir: Some(tempfile::tempdir().unwrap().path().display().to_string()),
-            ..tiny_settings()
+        // An existing, empty directory: the resolver treats it as a local
+        // snapshot and the missing config.json is a clear error, no network.
+        let empty = tempfile::tempdir().unwrap();
+        let options = SparseOptions {
+            id: empty.path().display().to_string(),
+            cache_dir: Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+            ..tiny_options()
         };
-        let encoder = NativeSparseEncoder::from_config(&settings).unwrap();
+        let encoder = SparseEncoder::new(options).unwrap();
         let error = encoder.encode_query("x").await.unwrap_err();
-        assert!(matches!(error, MinSyncError::Embedding(_)), "{error}");
+        assert!(matches!(error, InlError::Inference(_)), "{error}");
+        assert!(error.to_string().contains("config.json"), "{error}");
     }
 
     #[test]
     fn rejects_unusable_settings_up_front() {
-        for settings in [
-            SparseConfig {
+        for options in [
+            SparseOptions {
                 batch_size: 0,
-                ..tiny_settings()
+                ..tiny_options()
             },
-            SparseConfig {
+            SparseOptions {
                 timeout_seconds: 0,
                 per_batch_timeout_seconds: None,
-                ..tiny_settings()
+                ..tiny_options()
             },
-            SparseConfig {
-                id: "native:".to_string(),
-                ..tiny_settings()
+            SparseOptions {
+                id: String::new(),
+                ..tiny_options()
             },
-            SparseConfig {
+            SparseOptions {
                 device: Some("tpu".to_string()),
-                ..tiny_settings()
+                ..tiny_options()
             },
-            SparseConfig {
+            SparseOptions {
                 dtype: Some("int4".to_string()),
-                ..tiny_settings()
+                ..tiny_options()
             },
         ] {
-            assert!(
-                NativeSparseEncoder::from_config(&settings).is_err(),
-                "{settings:?}"
-            );
+            assert!(SparseEncoder::new(options.clone()).is_err(), "{options:?}");
         }
     }
 
@@ -777,9 +868,9 @@ pub(crate) mod tests {
             .into_iter()
             .find(|c| c.kind == "document" && c.max_length == 64)
             .unwrap();
-        let alone = NativeSparseEncoder::from_config(&SparseConfig {
+        let alone = SparseEncoder::new(SparseOptions {
             batch_size: 1,
-            ..tiny_settings()
+            ..tiny_options()
         })
         .unwrap();
         let mut want = Vec::new();
@@ -792,7 +883,7 @@ pub(crate) mod tests {
                     .remove(0),
             );
         }
-        let got = NativeSparseEncoder::from_config(&tiny_settings())
+        let got = SparseEncoder::new(tiny_options())
             .unwrap()
             .encode(&case.texts)
             .await

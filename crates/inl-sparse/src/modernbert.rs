@@ -15,9 +15,9 @@
 //! dependency of this crate, applies no padding mask to the sliding window
 //! of padded keys, and has no MLM-logit chunking.
 
-use crate::error::{MinSyncError, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
+use inl_core::{InlError, Result};
 use serde::Deserialize;
 
 /// `config.json` of a ModernBERT checkpoint (the fields the forward pass uses).
@@ -105,7 +105,7 @@ impl ModernBertConfig {
     /// silently mis-read (it supports the layout the checkpoint family uses).
     pub fn validate(&self) -> Result<()> {
         let unsupported = |what: &str| {
-            Err(MinSyncError::Embedding(format!(
+            Err(InlError::Inference(format!(
                 "unsupported ModernBERT config: {what}"
             )))
         };
@@ -155,7 +155,7 @@ impl ModernBertConfig {
         }
         match (self.global_rope_theta, self.local_rope_theta) {
             (Some(global), Some(local)) => Ok((global, local)),
-            _ => Err(MinSyncError::Embedding(
+            _ => Err(InlError::Inference(
                 "unsupported ModernBERT config: no rope_parameters or global/local_rope_theta"
                     .to_string(),
             )),
@@ -450,7 +450,7 @@ impl ModernBertMlm {
     pub fn load(cfg: &ModernBertConfig, vb: VarBuilder, positions: usize) -> Result<Self> {
         cfg.validate()?;
         Self::build(cfg, vb, positions).map_err(|error| {
-            MinSyncError::Embedding(format!("native sparse model build failed: {error}"))
+            InlError::Inference(format!("native sparse model build failed: {error}"))
         })
     }
 
@@ -637,9 +637,7 @@ impl ModernBertMlm {
     pub fn logits(&self, ids: &Tensor, lengths: &[usize]) -> Result<Tensor> {
         self.head_states(ids, lengths)
             .and_then(|states| self.decoder.forward(&states))
-            .map_err(|error| {
-                MinSyncError::Embedding(format!("native sparse forward failed: {error}"))
-            })
+            .map_err(|error| InlError::Inference(format!("native sparse forward failed: {error}")))
     }
 
     /// SPLADE term weights, one dense `[dimension]` row per input.
@@ -683,9 +681,8 @@ impl ModernBertMlm {
             }
             Ok(out)
         };
-        inner().map_err(|error| {
-            MinSyncError::Embedding(format!("native sparse forward failed: {error}"))
-        })
+        inner()
+            .map_err(|error| InlError::Inference(format!("native sparse forward failed: {error}")))
     }
 }
 
@@ -758,7 +755,7 @@ impl SpladePooling {
     /// Refuse a pooling whose behavior this port does not reproduce.
     pub fn validate(&self, vocab_size: usize) -> Result<()> {
         let unsupported = |what: String| {
-            Err(MinSyncError::Embedding(format!(
+            Err(InlError::Inference(format!(
                 "unsupported SPLADE pooling: {what}"
             )))
         };
@@ -858,16 +855,15 @@ impl SpladePooling {
             let zeros = Tensor::zeros((batch, vocab_size), DType::F32, logits.device())?;
             self.fold(&self.finish(&self.accumulate(&zeros, logits, &mask.keep)?, &mask.open)?)
         };
-        inner().map_err(|error| {
-            MinSyncError::Embedding(format!("native sparse pooling failed: {error}"))
-        })
+        inner()
+            .map_err(|error| InlError::Inference(format!("native sparse pooling failed: {error}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse::SparseVector;
+    use crate::SparseVector;
     use candle_core::safetensors;
     use serde::Deserialize;
     use std::path::{Path, PathBuf};

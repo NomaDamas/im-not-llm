@@ -4,6 +4,8 @@
 pub mod modernbert;
 pub mod native;
 
+pub use native::{SparseEncoder, SparseOptions};
+
 use async_trait::async_trait;
 use inl_core::{EngineInfo, InlError, Result};
 use serde::{Deserialize, Deserializer, Serialize};

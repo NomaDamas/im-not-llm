@@ -4,17 +4,16 @@
 //!
 //! Needs the model in the Hugging Face cache (or network): run with
 //! `cargo test --release --test gemma2_live -- --ignored --nocapture`.
-//! `MINSYNC_TEST_DEVICE=cpu|metal` picks the device (default cpu).
+//! `INL_TEST_DEVICE=cpu|metal` picks the device (default cpu).
 
-use minsync::config::Config;
-use minsync::embedder::native::NativeEmbedder;
-use minsync::embedder::Embedder;
+use inl_text::{DeviceSpec, DtypeSpec, TextEmbedder, TextOptions};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Golden {
     texts: Vec<String>,
     emb: Vec<Vec<f32>>,
+    emb256: Vec<Vec<f32>>,
 }
 
 fn golden() -> Golden {
@@ -23,13 +22,20 @@ fn golden() -> Golden {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn embedder(dtype: &str) -> NativeEmbedder {
-    let mut config = Config::default_for("12345678-1234-4234-9234-123456789abc");
-    config.embedder.id = "native:google/embeddinggemma-2".to_string();
-    config.embedder.device =
-        Some(std::env::var("MINSYNC_TEST_DEVICE").unwrap_or_else(|_| "cpu".into()));
-    config.embedder.dtype = Some(dtype.to_string());
-    NativeEmbedder::from_config(&config.embedder).unwrap()
+fn device() -> DeviceSpec {
+    let value = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into());
+    DeviceSpec::parse(Some(&value)).unwrap()
+}
+
+fn embedder(dtype: DtypeSpec, output_dim: Option<usize>) -> TextEmbedder {
+    TextEmbedder::new(
+        TextOptions::default()
+            .with_id("google/embeddinggemma-2")
+            .with_device(device())
+            .with_dtype(Some(dtype))
+            .with_output_dim(output_dim),
+    )
+    .unwrap()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -39,10 +45,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: loads native:google/embeddinggemma-2; run with --ignored"]
+#[ignore = "live: loads google/embeddinggemma-2; run with --ignored"]
 async fn matches_the_sentence_transformers_reference_in_f32() {
     let golden = golden();
-    let model = embedder("f32");
+    let model = embedder(DtypeSpec::F32, None);
     let identity = model.identity().await.unwrap();
     assert_eq!(identity.dimension, 768);
     assert_eq!(identity.dtype, "f32");
@@ -56,8 +62,30 @@ async fn matches_the_sentence_transformers_reference_in_f32() {
             similarity > 0.9999,
             "batched row {row}: cosine {similarity}"
         );
-        let alone = model.embed_single(&golden.texts[row]).await.unwrap();
-        let similarity = cosine(&alone, expected);
+        let alone = model
+            .embed(std::slice::from_ref(&golden.texts[row]))
+            .await
+            .unwrap();
+        let similarity = cosine(&alone[0], expected);
         assert!(similarity > 0.9999, "alone row {row}: cosine {similarity}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: loads google/embeddinggemma-2; run with --ignored"]
+async fn matryoshka_256_matches_the_reference_truncation() {
+    let golden = golden();
+    let model = embedder(DtypeSpec::F32, Some(256));
+    let identity = model.identity().await.unwrap();
+    assert_eq!(identity.dimension, 256);
+
+    let vectors = model.embed(&golden.texts).await.unwrap();
+    for (row, expected) in golden.emb256.iter().enumerate() {
+        assert_eq!(vectors[row].len(), 256);
+        let similarity = cosine(&vectors[row], expected);
+        assert!(
+            similarity > 0.9999,
+            "row {row}: cosine {similarity} against the reference truncation"
+        );
     }
 }

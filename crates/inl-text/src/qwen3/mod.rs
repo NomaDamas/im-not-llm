@@ -13,15 +13,13 @@
 //! * only the last token is normalized, since it is the only one pooled;
 //! * the final L2 normalization runs in f32 whatever the model dtype.
 
-mod attention;
+pub use inl_core::attention::{AttentionBackend, AttentionRequest};
 
-pub use attention::{AttentionBackend, AttentionRequest};
-
-use crate::embedder::hub::{hf_repo, safetensors_weight_files};
-use crate::error::{MinSyncError, Result as MinSyncResult};
-use attention::{attend, BatchMask};
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
+use inl_core::attention::{attend, BatchMask};
+use inl_core::hub::{hf_repo, safetensors_weight_files};
+use inl_core::{InlError, Result as InlResult};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -59,14 +57,14 @@ struct VisionLanguageConfig {
     text_config: Config,
 }
 
-fn parse_config(bytes: &[u8]) -> MinSyncResult<(Config, Option<&'static str>)> {
+fn parse_config(bytes: &[u8]) -> InlResult<(Config, Option<&'static str>)> {
     if let Ok(config) = serde_json::from_slice::<Config>(bytes) {
         return Ok((config, None));
     }
     if let Ok(config) = serde_json::from_slice::<VisionLanguageConfig>(bytes) {
         return Ok((config.text_config, Some("model.language_model")));
     }
-    Err(MinSyncError::Embedding(
+    Err(InlError::Inference(
         "native model config is neither a Qwen3 nor a Qwen3-VL text config".to_string(),
     ))
 }
@@ -367,9 +365,9 @@ pub struct LoadOptions<'a> {
 }
 
 impl Qwen3Embedder {
-    pub fn from_hf(options: &LoadOptions<'_>) -> MinSyncResult<Self> {
+    pub fn from_hf(options: &LoadOptions<'_>) -> InlResult<Self> {
         let load_error = |what: &str, error: &dyn std::fmt::Display| {
-            MinSyncError::Embedding(format!("native model {what}: {error}"))
+            InlError::Inference(format!("native model {what}: {error}"))
         };
         let repo = hf_repo(options.repo_id, options.default_cache_dir.clone())?;
         let config_path = repo
@@ -402,7 +400,7 @@ impl Qwen3Embedder {
         Self::new(model, tokenizer, options.max_length)
     }
 
-    fn new(model: Qwen3Model, mut tokenizer: Tokenizer, max_length: usize) -> MinSyncResult<Self> {
+    fn new(model: Qwen3Model, mut tokenizer: Tokenizer, max_length: usize) -> InlResult<Self> {
         // Left padding keeps the last position a real token for last-token pooling.
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
@@ -414,9 +412,7 @@ impl Qwen3Embedder {
                 max_length,
                 ..Default::default()
             }))
-            .map_err(|e| {
-                MinSyncError::Embedding(format!("native tokenizer truncation failed: {e}"))
-            })?;
+            .map_err(|e| InlError::Inference(format!("native tokenizer truncation failed: {e}")))?;
         Ok(Self { model, tokenizer })
     }
 
