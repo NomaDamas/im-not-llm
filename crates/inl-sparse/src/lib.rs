@@ -1,14 +1,11 @@
-//! Learned sparse (SPLADE) retrieval: the vector type and the encoder
-//! contract. Providers live in [`native`] (in-process candle), [`tei`]
-//! (remote `/embed_sparse`) and [`served`] (a running `minsync serve`).
+//! Learned sparse (SPLADE) encoders: the vector type, the engine contract the
+//! server drives, and the in-process candle engine in [`native`].
 
 pub mod modernbert;
 pub mod native;
-pub mod served;
-pub mod tei;
 
-use crate::error::{MinSyncError, Result};
 use async_trait::async_trait;
+use inl_core::{EngineInfo, InlError, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// A sparse term-weight vector: `indices` strictly ascending, every weight
@@ -26,20 +23,20 @@ impl SparseVector {
     /// Validate and wrap parallel `indices` / `values`.
     pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Result<Self> {
         if indices.len() != values.len() {
-            return Err(MinSyncError::Embedding(format!(
+            return Err(InlError::Inference(format!(
                 "sparse vector has {} indices but {} values",
                 indices.len(),
                 values.len()
             )));
         }
         if let Some(pair) = indices.windows(2).find(|pair| pair[0] >= pair[1]) {
-            return Err(MinSyncError::Embedding(format!(
+            return Err(InlError::Inference(format!(
                 "sparse vector indices must be strictly ascending (saw {} then {})",
                 pair[0], pair[1]
             )));
         }
         if let Some(value) = values.iter().find(|v| !v.is_finite() || **v <= 0.0) {
-            return Err(MinSyncError::Embedding(format!(
+            return Err(InlError::Inference(format!(
                 "sparse vector weights must be finite and positive (saw {value})"
             )));
         }
@@ -232,34 +229,24 @@ impl<'de> Deserialize<'de> for SparseVector {
     }
 }
 
-/// Produces [`SparseVector`]s. Mirrors [`crate::embedder::Embedder`]: passages
-/// at index time, queries at search time (the model marks the two
-/// differently), no query-time shortcut.
+/// A learned-sparse encoder behind a server or a host.
 #[async_trait]
-pub trait SparseEncoder: Send + Sync {
-    /// Model identity recorded in the cursor (`naver/...`, without provider).
-    fn id(&self) -> &str;
+pub trait SparseEngine: Send + Sync {
+    /// Load the model (once) and describe it. `dimension` is the number of
+    /// terms in the output space.
+    async fn load(&self) -> Result<EngineInfo>;
 
-    /// Encode passages, one vector per input, in order.
-    async fn encode(&self, texts: &[String]) -> Result<Vec<SparseVector>>;
+    /// Tokens per input, as the model would see them before truncation.
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>>;
 
-    /// Encode one search query.
-    async fn encode_query(&self, text: &str) -> Result<SparseVector>;
+    /// Encode `texts` exactly as given (no query / passage markers added).
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<SparseVector>>;
 
-    /// Passages the model had to cut to fit its context.
-    async fn count_truncated(&self, _texts: &[String]) -> Result<usize> {
-        Ok(0)
-    }
+    /// Release the weights; the next call reloads. True when a model was
+    /// resident.
+    async fn unload(&self) -> bool;
 
-    fn max_length(&self) -> Option<usize> {
-        None
-    }
-
-    /// True when re-running identical input is guaranteed to give identical
-    /// output (in-process inference on a fixed device).
-    fn is_deterministic(&self) -> bool {
-        false
-    }
+    fn is_loaded(&self) -> bool;
 }
 
 #[cfg(test)]

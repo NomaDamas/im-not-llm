@@ -1675,6 +1675,7 @@ dependencies = [
 name = "inl-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "candle-core",
  "candle-nn",
  "hex",

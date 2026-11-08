@@ -18,6 +18,7 @@ accelerate = ["candle-core/accelerate"]
 mkl = ["candle-core/mkl"]
 
 [dependencies]
+async-trait.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 hf-hub.workspace = true
