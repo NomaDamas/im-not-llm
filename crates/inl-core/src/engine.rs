@@ -63,3 +63,43 @@ pub trait DenseEngine: Send + Sync {
 
     fn is_loaded(&self) -> bool;
 }
+
+/// One media item, as raw encoded bytes (PNG/JPEG/WebP/... for images,
+/// MP4/WebM/... for video, WAV/MP3/... for audio). The engine decodes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaBytes {
+    pub bytes: Vec<u8>,
+    /// MIME type when the caller knows it (`image/png`); engines sniff the
+    /// bytes when absent.
+    pub mime: Option<String>,
+}
+
+/// One embedding input. A text-only input is a plain text embedding; media
+/// are consumed in order by the `<|image|>` / `<|video|>` / `<|audio|>`
+/// placeholders in `text` (EmbeddingGemma 2's interleaving). When `text` is
+/// `None` and there is exactly one media item, the input is that item alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultimodalInput {
+    pub text: Option<String>,
+    pub images: Vec<MediaBytes>,
+    pub videos: Vec<MediaBytes>,
+    pub audios: Vec<MediaBytes>,
+}
+
+/// An embedder over text, images, video and audio into one shared space.
+#[async_trait]
+pub trait MultimodalEngine: Send + Sync {
+    /// Load the model (once) and describe it. `info.modalities` lists what
+    /// this build/checkpoint accepts; an input using another is
+    /// [`crate::InlError::InvalidInput`].
+    async fn load(&self) -> Result<EngineInfo>;
+
+    /// Embed `inputs`: unit-length vectors in input order.
+    async fn embed(&self, inputs: Vec<MultimodalInput>) -> Result<Vec<Vec<f32>>>;
+
+    /// Release the weights; the next call reloads. True when a model was
+    /// resident.
+    async fn unload(&self) -> bool;
+
+    fn is_loaded(&self) -> bool;
+}

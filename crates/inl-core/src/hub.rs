@@ -265,14 +265,10 @@ pub fn safetensors_weight_files(repo: &HubRepo) -> Result<Vec<PathBuf>> {
         })
     };
     let index: serde_json::Value = serde_json::from_slice(&std::fs::read(fetch(INDEX_FILE)?)?)
-        .map_err(|e| {
-            InlError::Inference(format!("native model {INDEX_FILE} is invalid: {e}"))
-        })?;
+        .map_err(|e| InlError::Inference(format!("native model {INDEX_FILE} is invalid: {e}")))?;
     let mut shards: Vec<String> = index["weight_map"]
         .as_object()
-        .ok_or_else(|| {
-            InlError::Inference(format!("native model {INDEX_FILE} has no weight_map"))
-        })?
+        .ok_or_else(|| InlError::Inference(format!("native model {INDEX_FILE} has no weight_map")))?
         .values()
         .filter_map(|file| file.as_str().map(str::to_string))
         .collect();

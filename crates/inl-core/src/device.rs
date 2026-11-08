@@ -281,7 +281,10 @@ mod tests {
     fn dtype_auto_means_the_engine_picks() {
         assert_eq!(DtypeSpec::parse(None).unwrap(), None);
         assert_eq!(DtypeSpec::parse(Some("auto")).unwrap(), None);
-        assert_eq!(DtypeSpec::parse(Some("bf16")).unwrap(), Some(DtypeSpec::Bf16));
+        assert_eq!(
+            DtypeSpec::parse(Some("bf16")).unwrap(),
+            Some(DtypeSpec::Bf16)
+        );
         assert!(DtypeSpec::parse(Some("int8")).is_err());
     }
 
@@ -309,7 +312,10 @@ mod tests {
     #[test]
     fn cpu_gets_a_long_deadline_unless_one_is_explicit() {
         let short = Duration::from_secs(60);
-        assert_eq!(effective_batch_timeout(short, false, true), CPU_BATCH_TIMEOUT);
+        assert_eq!(
+            effective_batch_timeout(short, false, true),
+            CPU_BATCH_TIMEOUT
+        );
         assert_eq!(effective_batch_timeout(short, true, true), short);
         assert_eq!(effective_batch_timeout(short, false, false), short);
         let long = Duration::from_secs(2000);

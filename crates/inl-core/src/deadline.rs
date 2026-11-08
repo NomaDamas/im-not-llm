@@ -81,10 +81,7 @@ mod tests {
             .await;
 
         let elapsed = started.elapsed();
-        assert!(
-            matches!(outcome, Err(InlError::Timeout(_))),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, Err(InlError::Timeout(_))), "{outcome:?}");
         assert!(elapsed < Duration::from_millis(400), "waited {elapsed:?}");
     }
 
@@ -101,9 +98,7 @@ mod tests {
         let deadline = BatchDeadline::new();
 
         let outcome: Result<()> = deadline
-            .run("embed", LONG, || {
-                Err(InlError::Inference("boom".into()))
-            })
+            .run("embed", LONG, || Err(InlError::Inference("boom".into())))
             .await;
 
         assert!(matches!(outcome, Err(InlError::Inference(message)) if message == "boom"));
