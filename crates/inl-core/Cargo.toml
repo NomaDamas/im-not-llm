@@ -1,0 +1,39 @@
+[package]
+name = "inl-core"
+description = "Shared runtime for im-not-llm engines: device/dtype selection, model hub, attention, deadlines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# NVIDIA GPUs. Needs the CUDA toolkit (nvcc) at build time.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cudnn = ["cuda", "candle-core/cudnn"]
+# Apple Accelerate for CPU matmul on macOS.
+accelerate = ["candle-core/accelerate"]
+# Intel MKL for CPU matmul on x86.
+mkl = ["candle-core/mkl"]
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+hf-hub.workspace = true
+sha2.workspace = true
+hex = "0.4"
+thiserror.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,26 @@
+[package]
+name = "inl-server"
+description = "Loopback HTTP daemon and lifecycle API for im-not-llm engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+inl-core = { path = "../inl-core" }
+inl-text = { path = "../inl-text" }
+inl-sparse = { path = "../inl-sparse" }
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,30 @@
+[package]
+name = "inl-sparse"
+description = "Learned-sparse (SPLADE) encoders: ModernBERT MLM + SPLADE pooling on candle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+cuda = ["inl-core/cuda"]
+cudnn = ["inl-core/cudnn"]
+accelerate = ["inl-core/accelerate"]
+mkl = ["inl-core/mkl"]
+
+[dependencies]
+inl-core = { path = "../inl-core" }
+async-trait.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
