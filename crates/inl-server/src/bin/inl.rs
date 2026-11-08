@@ -109,7 +109,8 @@ struct DiscoverArgs {
     /// state directory.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
-    /// Model id the server was started for (defaults to the kind's model).
+    /// Model id the server serves (defaults to the kind's model). Device and
+    /// dtype need not be repeated: the server is found by model and kind.
     #[arg(long)]
     model: Option<String>,
     /// `auto`, `cpu`, `metal` or `cuda`.
@@ -127,7 +128,12 @@ struct DiscoverArgs {
 }
 
 impl DiscoverArgs {
-    fn resolve(&self) -> Result<(PathBuf, String)> {
+    /// The running server this command talks to. An explicit `--state-dir`
+    /// names it directly; otherwise it is found by model and kind among the
+    /// live servers, whatever device / dtype they were started with. More than
+    /// one match is an error that lists them, because stopping the wrong
+    /// server is worse than asking.
+    async fn client(&self) -> Result<Option<DaemonClient>> {
         let kind = kind_of(self.sparse, self.multimodal)?;
         let engine_args = EngineArgs {
             model: self.model.clone(),
@@ -135,14 +141,33 @@ impl DiscoverArgs {
             dtype: self.dtype.clone(),
             cache_dir: None,
         };
-        let instance = engine_args.instance_key(kind)?;
-        let state_dir = self
-            .state_dir
-            .clone()
-            .unwrap_or_else(|| inl_server::default_state_dir(&instance));
-        Ok((state_dir, instance))
+        if let Some(state_dir) = &self.state_dir {
+            let instance = engine_args.instance_key(kind)?;
+            return Ok(DaemonClient::discover(state_dir, &instance));
+        }
+        let model = engine_args.model_or_default(kind);
+        let serve_root = inl_core::device::cache_root().join("serve");
+        let mut found = inl_server::find_instances(&serve_root, &model, kind).await;
+        match found.len() {
+            0 => Ok(None),
+            1 => {
+                let one = found.remove(0);
+                Ok(DaemonClient::discover(&one.state_dir, &one.instance))
+            }
+            _ => Err(InlError::Config(format!(
+                "{} servers run {model}: {}; pass --state-dir to pick one",
+                found.len(),
+                found
+                    .iter()
+                    .map(|f| format!("{} ({}, {})", f.health.url, f.health.device, f.health.dtype))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 }
+
+const NO_SERVER: &str = "inl: no running server found (start one with `inl serve`)";
 
 fn kind_of(sparse: bool, multimodal: bool) -> Result<EngineKind> {
     match (sparse, multimodal) {
@@ -225,12 +250,8 @@ async fn serve(args: ServeArgs) -> Result<ExitCode> {
 }
 
 async fn health(args: DiscoverArgs) -> Result<ExitCode> {
-    let (state_dir, instance) = args.resolve()?;
-    let Some(client) = DaemonClient::discover(&state_dir, &instance) else {
-        eprintln!(
-            "inl: no server recorded in {} (start one with `inl serve`)",
-            state_dir.display()
-        );
+    let Some(client) = args.client().await? else {
+        eprintln!("{NO_SERVER}");
         return Ok(ExitCode::FAILURE);
     };
     match client.health().await {
@@ -253,12 +274,8 @@ async fn health(args: DiscoverArgs) -> Result<ExitCode> {
 }
 
 async fn stop(args: DiscoverArgs) -> Result<ExitCode> {
-    let (state_dir, instance) = args.resolve()?;
-    let Some(client) = DaemonClient::discover(&state_dir, &instance) else {
-        eprintln!(
-            "inl: no server recorded in {} (start one with `inl serve`)",
-            state_dir.display()
-        );
+    let Some(client) = args.client().await? else {
+        eprintln!("{NO_SERVER}");
         return Ok(ExitCode::FAILURE);
     };
     client.stop().await?;
@@ -267,12 +284,8 @@ async fn stop(args: DiscoverArgs) -> Result<ExitCode> {
 }
 
 async fn unload(args: DiscoverArgs) -> Result<ExitCode> {
-    let (state_dir, instance) = args.resolve()?;
-    let Some(client) = DaemonClient::discover(&state_dir, &instance) else {
-        eprintln!(
-            "inl: no server recorded in {} (start one with `inl serve`)",
-            state_dir.display()
-        );
+    let Some(client) = args.client().await? else {
+        eprintln!("{NO_SERVER}");
         return Ok(ExitCode::FAILURE);
     };
     let unloaded = client.unload().await?;

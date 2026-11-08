@@ -91,3 +91,57 @@ test('Daemon serves Qwen3-Embedding with an ok /health', { skip: !live }, async 
 
   assert.equal(await daemon.stop(), 'signal')
 })
+
+test('Daemon serves EmbeddingGemma 2 image + text embeddings that match the reference', { skip: !live }, async (t) => {
+  const { readFileSync } = await import('node:fs')
+  const fixtures = new URL('../../../crates/inl-vision/tests/fixtures/embeddinggemma2/', import.meta.url)
+  const golden = JSON.parse(readFileSync(new URL('golden_vision.json', fixtures), 'utf8'))
+  const image = readFileSync(new URL('img_a.png', fixtures)).toString('base64')
+
+  const dir = mkdtempSync(join(tmpdir(), 'inl-node-live-mm-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const engine = {
+    kind: 'multimodal',
+    model: 'google/embeddinggemma-2',
+    dtype: 'f32',
+    ...(device ? { device } : {}),
+  }
+  const daemon = await Daemon.spawn(engine, { stateDir: dir })
+  t.after(async () => {
+    try {
+      await daemon.stop()
+    } catch {
+      /* already stopped */
+    }
+  })
+  const health = daemon.health()
+  assert.equal(health.kind, 'multimodal')
+  assert.deepEqual(health.modalities, ['text', 'image', 'video'])
+
+  const response = await fetch(`${daemon.url()}/embed_multimodal`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      inputs: [
+        { images: [image] },
+        { text: 'A gradient picture: <|image|> with a blue box.', images: [image] },
+      ],
+    }),
+  })
+  assert.equal(response.status, 200)
+  const { embeddings, dimensions } = await response.json()
+  assert.equal(dimensions, 768)
+  const cosine = (a, b) => dot(a, b) / (norm(a) * norm(b))
+  const imageCosine = cosine(embeddings[0], golden.images[0].embedding)
+  const mixedCosine = cosine(embeddings[1], golden.text_image.embedding)
+  t.diagnostic(`image cosine ${imageCosine.toFixed(8)}, interleaved cosine ${mixedCosine.toFixed(8)}`)
+  assert.ok(imageCosine > 0.9999, `image embedding drifted: ${imageCosine}`)
+  assert.ok(mixedCosine > 0.9999, `interleaved embedding drifted: ${mixedCosine}`)
+
+  const audio = await fetch(`${daemon.url()}/embed_multimodal`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ inputs: [{ audios: [image] }] }),
+  })
+  assert.equal(audio.status, 422)
+})

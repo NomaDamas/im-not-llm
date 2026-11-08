@@ -10,13 +10,14 @@
 //! EmbeddingGemma 2 additionally supports Matryoshka truncation via
 //! [`TextOptions::output_dim`] and task-prefix helpers ([`Gemma2Task`]).
 
-mod gemma2;
+pub mod gemma2;
 mod native;
 mod qwen3;
 mod session;
 
-pub use gemma2::{gemma2_document, Gemma2Task};
+pub use gemma2::{gemma2_document, Gemma2Embedder, Gemma2Task};
 pub use native::{Architecture, TextEmbedder, TextIdentity, TextOptions};
+pub use qwen3::LoadOptions;
 pub use session::TextSession;
 
 // Convenience re-exports so callers can configure a `TextOptions` without

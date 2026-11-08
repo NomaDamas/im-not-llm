@@ -1131,3 +1131,66 @@ async fn openai_embeddings_accept_media_items_on_a_multimodal_server() {
     assert!(body["error"]["message"].as_str().unwrap().contains("video"));
     h.shutdown().await;
 }
+
+// ---- discovery without knowing the serve flags --------------------------------
+
+/// A server started with `--device metal --dtype f32` must be found by a
+/// client that only knows the model and kind: the lifecycle commands cannot be
+/// required to repeat every serve flag.
+#[tokio::test]
+async fn find_instances_locates_a_server_by_model_and_kind_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let key = InstanceKey {
+        model: "Fake/Multimodal-1".into(),
+        device: Some("metal".into()),
+        dtype: Some("f32".into()),
+        kind: EngineKind::Multimodal,
+        ..InstanceKey::default()
+    };
+    let instance = instance_key(&key).unwrap();
+    let dir = root.path().join(&instance);
+    let mut opts = options(&dir);
+    opts.instance = instance.clone();
+    let daemon = Daemon::spawn(
+        Engine::multimodal(Arc::new(FakeMultimodal::text_and_image())),
+        opts,
+    )
+    .await
+    .unwrap();
+
+    // A different kind and a different model must not match.
+    let found = find_instances(root.path(), "Fake/Multimodal-1", EngineKind::Multimodal).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].instance, instance);
+    assert!(found[0].health.is_ready());
+    assert!(
+        find_instances(root.path(), "Fake/Multimodal-1", EngineKind::Dense)
+            .await
+            .is_empty()
+    );
+    assert!(
+        find_instances(root.path(), "Fake/Other", EngineKind::Multimodal)
+            .await
+            .is_empty()
+    );
+
+    daemon.stop().await.unwrap();
+    assert!(
+        find_instances(root.path(), "Fake/Multimodal-1", EngineKind::Multimodal)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn find_instances_ignores_stale_state_dirs_whose_server_is_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("org-model-aaaaaaaaaaaa");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A crashed server left its files behind; nothing listens on this port.
+    std::fs::write(dir.join("port"), "1").unwrap();
+    std::fs::write(dir.join("host"), "127.0.0.1").unwrap();
+    assert!(find_instances(root.path(), "org/model", EngineKind::Dense)
+        .await
+        .is_empty());
+}

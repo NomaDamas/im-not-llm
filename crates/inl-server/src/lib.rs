@@ -490,6 +490,52 @@ pub fn default_state_dir(instance: &str) -> PathBuf {
     cache_root().join("serve").join(instance)
 }
 
+/// A live server found under a serve root.
+#[derive(Debug, Clone)]
+pub struct FoundInstance {
+    pub instance: String,
+    pub state_dir: PathBuf,
+    pub health: Health,
+}
+
+/// Servers under `serve_root` (`<cache_root>/serve`) that serve `model` as
+/// `kind` and answer `/health`, whatever device / dtype / attention they were
+/// started with. Lifecycle commands use this so they need not repeat every
+/// serve flag. A directory is a candidate only by name; what decides is the
+/// answering server's own `kind` and `model_id`, so a stale directory left by a
+/// crashed server (nothing listens) is skipped.
+pub async fn find_instances(
+    serve_root: &Path,
+    model: &str,
+    kind: EngineKind,
+) -> Vec<FoundInstance> {
+    let Ok(entries) = std::fs::read_dir(serve_root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let state_dir = entry.path();
+        let Some(instance) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(client) = DaemonClient::discover(&state_dir, &instance) else {
+            continue;
+        };
+        let Some(health) = client.health().await else {
+            continue;
+        };
+        if health.kind == kind.as_str() && health.model_id == model {
+            found.push(FoundInstance {
+                instance,
+                state_dir,
+                health,
+            });
+        }
+    }
+    found.sort_by(|a, b| a.instance.cmp(&b.instance));
+    found
+}
+
 /// HTTP client for talking to an `inl serve` on this machine.
 ///
 /// The server is loopback plain HTTP, so TLS never runs; building the client

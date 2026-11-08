@@ -9,15 +9,16 @@ repository.workspace = true
 
 [features]
 default = []
-cuda = ["inl-core/cuda"]
-cudnn = ["inl-core/cudnn"]
-accelerate = ["inl-core/accelerate"]
-mkl = ["inl-core/mkl"]
+cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-vision/cuda"]
+cudnn = ["inl-core/cudnn", "inl-text/cudnn", "inl-sparse/cudnn", "inl-vision/cudnn"]
+accelerate = ["inl-core/accelerate", "inl-text/accelerate", "inl-sparse/accelerate", "inl-vision/accelerate"]
+mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-vision/mkl"]
 
 [dependencies]
 inl-core = { path = "../inl-core" }
 inl-text = { path = "../inl-text" }
 inl-sparse = { path = "../inl-sparse" }
+inl-vision = { path = "../inl-vision" }
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true

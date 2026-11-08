@@ -12,11 +12,11 @@
 use inl_core::attention::AttentionRequest;
 use inl_core::device::{DeviceSpec, DtypeSpec};
 use inl_core::{InlError, Result as InlResult};
-use inl_server::{Daemon as EngineDaemon, DaemonClient as EngineDaemonClient};
 use inl_server::{
     default_state_dir, instance_key, parse_loopback_host, Engine, EngineKind, Health, InstanceKey,
     ServeOptions,
 };
+use inl_server::{Daemon as EngineDaemon, DaemonClient as EngineDaemonClient};
 use inl_sparse::SparseOptions;
 use inl_text::{TextOptions, TextSession};
 use napi::bindgen_prelude::*;
@@ -209,11 +209,13 @@ pub struct TextIdentity {
 }
 
 fn text_session(options: TextEmbedderOptions) -> InlResult<TextSession> {
-    let mut text = TextOptions::default();
-    text.id = options.id.unwrap_or_default();
-    text.device = DeviceSpec::parse(options.device.as_deref())?;
-    text.dtype = DtypeSpec::parse(options.dtype.as_deref())?;
-    text.attention = AttentionRequest::parse(options.attention.as_deref())?;
+    let mut text = TextOptions {
+        id: options.id.unwrap_or_default(),
+        device: DeviceSpec::parse(options.device.as_deref())?,
+        dtype: DtypeSpec::parse(options.dtype.as_deref())?,
+        attention: AttentionRequest::parse(options.attention.as_deref())?,
+        ..TextOptions::default()
+    };
     if let Some(value) = options.max_length {
         text.max_length = value as usize;
     }
@@ -372,10 +374,12 @@ impl From<inl_sparse::SparseVector> for SparseVector {
 }
 
 fn sparse_encoder(options: SparseEncoderOptions) -> InlResult<inl_sparse::SparseEncoder> {
-    let mut sparse = SparseOptions::default();
-    sparse.id = options.id.unwrap_or_default();
-    sparse.device = options.device;
-    sparse.dtype = options.dtype;
+    let mut sparse = SparseOptions {
+        id: options.id.unwrap_or_default(),
+        device: options.device,
+        dtype: options.dtype,
+        ..SparseOptions::default()
+    };
     if let Some(value) = options.max_length {
         sparse.max_length = value as usize;
     }
@@ -607,11 +611,13 @@ fn build_engine(options: &EngineOptions, kind: EngineKind) -> InlResult<Engine> 
     let model = engine_option_model(options, kind);
     match kind {
         EngineKind::Dense => {
-            let mut text = TextOptions::default();
-            text.id = model;
-            text.device = DeviceSpec::parse(options.device.as_deref())?;
-            text.dtype = DtypeSpec::parse(options.dtype.as_deref())?;
-            text.attention = AttentionRequest::parse(options.attention.as_deref())?;
+            let mut text = TextOptions {
+                id: model,
+                device: DeviceSpec::parse(options.device.as_deref())?,
+                dtype: DtypeSpec::parse(options.dtype.as_deref())?,
+                attention: AttentionRequest::parse(options.attention.as_deref())?,
+                ..TextOptions::default()
+            };
             if let Some(value) = options.max_length {
                 text.max_length = value as usize;
             }
@@ -619,10 +625,12 @@ fn build_engine(options: &EngineOptions, kind: EngineKind) -> InlResult<Engine> 
             Ok(Engine::dense(Arc::new(inl_text::TextEmbedder::new(text)?)))
         }
         EngineKind::Sparse => {
-            let mut sparse = SparseOptions::default();
-            sparse.id = model;
-            sparse.device = options.device.clone();
-            sparse.dtype = options.dtype.clone();
+            let mut sparse = SparseOptions {
+                id: model,
+                device: options.device.clone(),
+                dtype: options.dtype.clone(),
+                ..SparseOptions::default()
+            };
             if let Some(value) = options.max_length {
                 sparse.max_length = value as usize;
             }
@@ -631,9 +639,22 @@ fn build_engine(options: &EngineOptions, kind: EngineKind) -> InlResult<Engine> 
                 sparse,
             )?)))
         }
-        EngineKind::Multimodal => Err(InlError::Config(
-            "no multimodal engine is available yet".to_string(),
-        )),
+        EngineKind::Multimodal => {
+            let mut multimodal = inl_vision::MultimodalOptions {
+                id: model,
+                device: DeviceSpec::parse(options.device.as_deref())?,
+                dtype: DtypeSpec::parse(options.dtype.as_deref())?,
+                attention: AttentionRequest::parse(options.attention.as_deref())?,
+                ..inl_vision::MultimodalOptions::default()
+            };
+            if let Some(value) = options.max_length {
+                multimodal.max_length = value as usize;
+            }
+            multimodal.cache_dir = options.cache_dir.clone().map(PathBuf::from);
+            Ok(Engine::multimodal(Arc::new(
+                inl_vision::MultimodalEmbedder::new(multimodal),
+            )))
+        }
     }
 }
 

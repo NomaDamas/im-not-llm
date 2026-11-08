@@ -7,7 +7,7 @@
 //! directory.
 
 use inl_core::device::{DeviceSpec, DtypeSpec};
-use inl_core::{InlError, Result};
+use inl_core::Result;
 use inl_server::{Engine, EngineKind, InstanceKey};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,10 +97,17 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
             let encoder = inl_sparse::SparseEncoder::new(options)?;
             Ok(Engine::sparse(Arc::new(encoder)))
         }
-        EngineKind::Multimodal => Err(InlError::Config(
-            "no multimodal engine is available yet: the vision engine lives in a future inl-vision \
-             crate"
-                .to_string(),
-        )),
+        EngineKind::Multimodal => {
+            let options = inl_vision::MultimodalOptions {
+                id: model,
+                device: DeviceSpec::parse(args.device.as_deref())?,
+                dtype: DtypeSpec::parse(args.dtype.as_deref())?,
+                cache_dir: args.cache_dir.clone(),
+                ..inl_vision::MultimodalOptions::default()
+            };
+            Ok(Engine::multimodal(Arc::new(
+                inl_vision::MultimodalEmbedder::new(options),
+            )))
+        }
     }
 }

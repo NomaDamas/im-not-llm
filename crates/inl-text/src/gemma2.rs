@@ -595,15 +595,29 @@ impl Gemma2Model {
         })
     }
 
+    /// Scaled token embeddings `[batch, seq, hidden_size]` for `input_ids`.
+    fn embed_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)? * self.embed_scale
+    }
+
     /// The unit-length embedding of every row, `[batch, embedding_dim]`.
     /// `lens` are the real token counts; rows are right padded to `seq`.
     fn forward_pooled(&self, input_ids: &Tensor, lens: &[usize]) -> Result<Tensor> {
-        let (batch, seq) = input_ids.dims2()?;
+        let embeds = self.embed_ids(input_ids)?;
+        self.forward_pooled_from_embeds(&embeds, lens)
+    }
+
+    /// Like [`Self::forward_pooled`] but starting from already-built
+    /// `inputs_embeds` `[batch, seq, hidden_size]`. The interleaved multimodal
+    /// path uses this: vision soft tokens replace the placeholder rows before
+    /// the tower runs, and the per-layer embeddings (PLE) are derived from the
+    /// merged embedding, exactly as the reference does.
+    fn forward_pooled_from_embeds(&self, embeds: &Tensor, lens: &[usize]) -> Result<Tensor> {
+        let (batch, seq, _) = embeds.dims3()?;
         if lens.len() != batch {
             candle_core::bail!("expected {batch} row lengths, got {}", lens.len());
         }
         let layers = self.cfg.num_hidden_layers;
-        let embeds = (self.embed_tokens.forward(input_ids)? * self.embed_scale)?;
         let per_layer = (embeds.apply(&self.ple_projection)? * self.ple_scale)?
             .reshape((batch, seq, layers, self.cfg.hidden_size_per_layer_input))?
             .apply(&self.ple_norm)?;
@@ -613,7 +627,7 @@ impl Gemma2Model {
         let sliding_rows = self.sliding_rotary.rows(seq)?;
         let full_rows = self.full_rotary.rows(seq)?;
 
-        let mut hidden = embeds;
+        let mut hidden = embeds.clone();
         for (index, layer) in self.layers.iter().enumerate() {
             let per_layer_input = per_layer.narrow(2, index, 1)?.squeeze(2)?;
             let ((cos, sin), mask) = match layer.kind {
@@ -712,6 +726,37 @@ impl Gemma2Embedder {
 
     pub fn backend(&self) -> AttentionBackend {
         AttentionBackend::Eager
+    }
+
+    /// The compute device the weights live on.
+    pub fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    /// Width of a row of `inputs_embeds` (the text tower's hidden size).
+    pub fn hidden_size(&self) -> usize {
+        self.model.cfg.hidden_size
+    }
+
+    /// Scaled token embeddings `[batch, seq, hidden_size]`, the same values the
+    /// tower starts from. Callers that interleave multimodal soft tokens build
+    /// `inputs_embeds` by overwriting placeholder rows of this tensor.
+    pub fn token_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.model.embed_ids(input_ids)
+    }
+
+    /// Mean-pooled, projected, unit-length embeddings from prebuilt
+    /// `inputs_embeds` `[batch, seq, hidden_size]`; `lens` are the real token
+    /// counts per row. This is [`Self::embed`] without the tokenizer, for
+    /// callers that inject soft tokens into the sequence.
+    pub fn embed_from_embeds(
+        &self,
+        inputs_embeds: &Tensor,
+        lens: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.model
+            .forward_pooled_from_embeds(inputs_embeds, lens)?
+            .to_vec2::<f32>()
     }
 
     /// Unit-length embeddings, one per input.
