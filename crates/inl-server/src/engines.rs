@@ -76,20 +76,24 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
     let model = args.model_or_default(kind);
     match kind {
         EngineKind::Dense => {
-            let mut options = inl_text::TextOptions::default();
-            options.id = model;
-            options.device = DeviceSpec::parse(args.device.as_deref())?;
-            options.dtype = DtypeSpec::parse(args.dtype.as_deref())?;
-            options.cache_dir = args.cache_dir.clone();
+            let options = inl_text::TextOptions {
+                id: model,
+                device: DeviceSpec::parse(args.device.as_deref())?,
+                dtype: DtypeSpec::parse(args.dtype.as_deref())?,
+                cache_dir: args.cache_dir.clone(),
+                ..inl_text::TextOptions::default()
+            };
             let embedder = inl_text::TextEmbedder::new(options)?;
             Ok(Engine::dense(Arc::new(embedder)))
         }
         EngineKind::Sparse => {
-            let mut options = inl_sparse::SparseOptions::default();
-            options.id = model;
-            options.device = args.device.clone();
-            options.dtype = args.dtype.clone();
-            options.cache_dir = args.cache_dir.clone();
+            let options = inl_sparse::SparseOptions {
+                id: model,
+                device: args.device.clone(),
+                dtype: args.dtype.clone(),
+                cache_dir: args.cache_dir.clone(),
+                ..inl_sparse::SparseOptions::default()
+            };
             let encoder = inl_sparse::SparseEncoder::new(options)?;
             Ok(Engine::sparse(Arc::new(encoder)))
         }

@@ -609,7 +609,7 @@ async fn daemon_client_discover_probe_wait_unload_and_stop() {
         .is_none());
 
     assert!(client.unload().await.unwrap());
-    assert_eq!(client.probe().await.unwrap().loaded, false);
+    assert!(!client.probe().await.unwrap().loaded);
 
     client.stop().await.unwrap();
     assert_eq!(daemon.wait().await.unwrap(), StopReason::Signal);

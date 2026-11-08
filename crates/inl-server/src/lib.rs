@@ -337,6 +337,8 @@ impl StopReason {
     }
 }
 
+/// Both variants are built once per process, so the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Started {
     /// This process loaded the model and owns the listener.
     Serving(Server),
@@ -1695,6 +1697,8 @@ fn http_error(error: reqwest::Error) -> InlError {
 /// A running server, in this process or another. `Daemon::spawn` returns one
 /// either way: a server already serving the instance is adopted instead of
 /// loading a second copy of the model.
+/// Both variants are built once per process, so the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Daemon {
     /// This process loaded the model and owns the listener.
     Serving(ServerHandle),

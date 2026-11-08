@@ -1,0 +1,32 @@
+[package]
+name = "inl-node"
+description = "Node-API binding for the im-not-llm engines (dense text, learned sparse, daemon lifecycle)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+# Documented but not built here: enable with `--features cuda` on a CUDA host.
+cuda = ["inl-text/cuda", "inl-sparse/cuda", "inl-core/cuda"]
+cudnn = ["inl-core/cudnn"]
+accelerate = ["inl-core/accelerate"]
+mkl = ["inl-core/mkl"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inl-core = { path = "../../crates/inl-core" }
+inl-text = { path = "../../crates/inl-text" }
+inl-sparse = { path = "../../crates/inl-sparse" }
+inl-server = { path = "../../crates/inl-server" }
+napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "3"
+tokio.workspace = true
+
+[build-dependencies]
+napi-build = "2"
