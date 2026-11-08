@@ -3,9 +3,10 @@
 How to build and run im-not-llm on the machines it is exercised on, with the
 exact commands, environment variables and the issues each setup hits.
 
-Everything below was verified on 2026-11-09 against the workspace at
-`crates/{inl-core,inl-text,inl-sparse,inl-server}` (the `inl-vision` crate and
-the Node bindings are developed separately).
+Verified 2026-11-09 against `main` @ `ce93d66` for
+`crates/{inl-core,inl-text,inl-sparse,inl-server}`. `crates/inl-vision` and
+`bindings/node` are developed separately; they are workspace members now, so a
+`cargo build -p inl-server` pulls `inl-vision` in.
 
 ## Env vars, once
 
@@ -25,20 +26,20 @@ Feature flags: `cuda` (NVIDIA), `cudnn` (implies `cuda`; needs cuDNN),
 ## macOS (Apple Silicon, Metal)
 
 ```sh
-cargo test                                    # CPU + Metal, 145 tests + 7 ignored live
-cargo test -p inl-text --test gemma2_live -- --ignored --nocapture
+cargo test   # 147 tests + 7 ignored live, CPU/Metal
+HF_HOME=... cargo test -p inl-text --test gemma2_live -- --ignored --nocapture
 HF_HOME=... INL_TEST_DEVICE=metal cargo test -p inl-sparse --test sparse_live -- --ignored --nocapture
 ```
 
-## gpu01 — Linux x86_64, RTX PRO 6000 Blackwell (sm_120), driver 580
+## gpu01 — Linux x86_64, 3x RTX PRO 6000 Blackwell Max-Q (sm_120), driver 580
 
 The preinstalled toolkit was CUDA 12.0 (`/usr/bin/nvcc`), which predates
-Blackwell: `sm_120` needs CUDA >= 12.8, and `sm_120a` (= what `cudaforge`
+Blackwell: `sm_120` needs CUDA >= 12.8, and `sm_120a` (what `cudaforge`
 generates for compute capability 12.0) needs CUDA >= 12.9. A user-space
-toolkit was installed instead of using the system one:
+toolkit was installed instead of touching the system one:
 
 ```sh
-# one-time: install CUDA 12.9.1 into a writable prefix, no root needed
+# one-time: CUDA 12.9.1 into a writable prefix, no root needed
 curl -LO https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux.run
 mkdir -p /tmp/cuda_tmp
 bash cuda_12.9.1_575.57.08_linux.run --silent --override --toolkit \
@@ -46,27 +47,34 @@ bash cuda_12.9.1_575.57.08_linux.run --silent --override --toolkit \
 ```
 
 * Home (`/data`) is **NFS**; `/` (and so `/tmp`) is a **local NVMe**. The
-  installer `chgrp -R`s its whole ~10 GB tree, which takes tens of minutes on
-  NFS, so put `--tmpdir` and `--toolkitpath` on local disk. Cargo is much
-  faster with `CARGO_TARGET_DIR` and `CARGO_HOME` on local disk too.
+  installer `chgrp -R`s its whole ~10 GB tree, which took >30 min on NFS; put
+  `--tmpdir` and `--toolkitpath` on local disk (installed in ~4 min there).
+  Copy `~/.cargo` to local disk as well (`CARGO_HOME=/tmp/cargo-home`): builds
+  went from >30 min stuck on `cargo fetch` to seconds, because every crate
+  read/lock in `~/.cargo` is an NFS round trip. Keep `CARGO_TARGET_DIR` local
+  too.
 * `cudaforge` picks the arch from `CUDA_COMPUTE_CAP`, else `nvidia-smi`. With
   the 12.9 toolkit, either works: capability 12.0 becomes `sm_120a`.
-  (Option (b), PTX for an older arch, is not clean here: `CUDA_COMPUTE_CAP=90`
-  yields `sm_90a`, which is arch-specific and cannot be JITed forward to
-  `sm_120`.)
+  Option (b) — PTX for an older arch — is not clean here:
+  `CUDA_COMPUTE_CAP=90` yields `sm_90a`, which is arch-specific and cannot be
+  JITed forward to `sm_120`, so the kernel build would produce unusable code.
+* No cuDNN is installed on this box, so the `cudnn` feature was not tried.
 
 ```sh
 export CUDA_HOME=/tmp/cuda-12.9
-export PATH=$CUDA_HOME/bin:$PATH          # or use $CUDA_HOME/bin/nvcc explicitly
-export CARGO_HOME=/tmp/cargo-home          # local, faster than NFS ~/.cargo
+export CUDA_PATH=/tmp/cuda-12.9
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export CARGO_HOME=/tmp/cargo-home
 export CARGO_TARGET_DIR=/tmp/inl-target-gpu01cuda
 export HF_HOME=/data/home/jeffrey/.cache/huggingface
-export CUDA_VISIBLE_DEVICES=1              # other GPUs run other people's jobs
-cargo test -p inl-core -p inl-text -p inl-sparse -p inl-server --features cuda
-INL_TEST_DEVICE=cuda cargo test --features cuda -p inl-text -p inl-sparse -- --ignored --nocapture --test-threads=1
+export CUDA_VISIBLE_DEVICES=0              # pick the idle card, it changes
+cargo test -j16 -p inl-core -p inl-text -p inl-sparse -p inl-server --features cuda
+INL_TEST_DEVICE=cuda cargo test -j16 --release --features cuda -p inl-sparse -p inl-text -- --ignored --nocapture --test-threads=1
 ```
 
-Use `-j16` or fewer: the box is shared.
+Use `-j16` or fewer, and re-check `nvidia-smi` before each run: GPU 1 was idle
+when work started and 100%-utilised 30 min later by another user.
 
 ## windows — Windows 11, TITAN Xp (sm_61), CUDA toolkit 11.8
 
@@ -79,17 +87,19 @@ cargo test -p inl-core -p inl-text -p inl-sparse -p inl-server
 ```
 
 CPU builds and tests fine with the GNU toolchain. **CUDA cannot be built on
-this machine**: `nvcc` needs `cl.exe`, and no Visual Studio / Build Tools (no
-`vcvars64.bat`, no `cl.exe`, no `vswhere`) is installed; the `2022`/`2019`
-directories under `Program Files (x86)\Microsoft Visual Studio` are empty.
-`nvcc` fails with `fatal : Cannot find compiler 'cl.exe' in PATH`. And even
-with `cl.exe` present, `candle-kernels` passes `-Xcompiler -fPIC` for
-non-`msvc` Rust targets, which MSVC rejects, so the CUDA build needs the
-`stable-x86_64-pc-windows-msvc` toolchain too.
+this machine.** `nvcc` needs `cl.exe`, and there is no Visual Studio / Build
+Tools: no `vcvars64.bat`, no `cl.exe`, no `vswhere.exe`; the
+`C:\Program Files (x86)\Microsoft Visual Studio\2019` and `\2022` directories
+exist but are empty. The kernel build fails with
+`nvcc fatal : Cannot find compiler 'cl.exe' in PATH`. Even with `cl.exe`
+present, `candle-kernels` passes `-Xcompiler -fPIC` for non-`msvc` Rust
+targets, which MSVC rejects, so a CUDA build would also need the
+`stable-x86_64-pc-windows-msvc` toolchain.
 
-Live tests: `gemma2_live` and `sparse_live` pass on CPU; `qwen3_live` fails
-because it compares CPU against **Metal** (macOS-only) and has no
-`INL_TEST_DEVICE` handling.
+Live tests: `gemma2_live` (2) and `sparse_live` (4) pass on CPU; `qwen3_live`
+**fails on every non-macOS machine** because it compares CPU against **Metal**
+and has no `INL_TEST_DEVICE` handling (`device metal is only available on
+macOS`).
 
 ## Model cache and `INL_TEST_DEVICE`
 
@@ -98,8 +108,9 @@ The engines cache models under `HF_HOME` when set, else
 tests.** If two live tests start at once on a cold cache they race: one
 download wins, the other's `model.safetensors` fetch fails and the loader
 falls through to `model.safetensors.index.json`, which does not exist for a
-single-file checkpoint, and the test dies with a 404. Set `HF_HOME` to a
-populated cache (or pass `--test-threads=1` on a cold one).
+single-file checkpoint, and the test dies with a 404
+(`native model weights download failed (model.safetensors.index.json)`). Set
+`HF_HOME` to a populated cache (or pass `--test-threads=1` on a cold one).
 
 Pre-populate with `huggingface_hub`:
 
@@ -110,4 +121,49 @@ for m in ["Qwen/Qwen3-Embedding-0.6B", "nlpai-lab/KURE-Sparse-nano", "google/emb
 ```
 
 (`google/embeddinggemma-2` needs a token with the license accepted; the Rust
-loader reads `HF_TOKEN` or `~/.cache/huggingface/token`.)
+loader reads `HF_TOKEN` or `~/.cache/huggingface/token`. A full
+`snapshot_download` of it succeeded without a token on the Windows box, but the
+gpu01 box had a token in place.)
+
+## Measured throughput (2026-11-09, `main` @ `ce93d66`)
+
+`bench_text --count 128 --length 64 --max-length 512`;
+`bench_sparse --n 64 --len 300`. `chunks/s` (`t/s` = tokens/s).
+
+### gpu01, RTX PRO 6000 Blackwell Max-Q (sm_120), CUDA 12.9, `cuda:0`
+
+| model | dtype | batch 8 | batch 32 | batch 64 | batch 128 |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-Embedding-0.6B | f32 | 30.7 (5751 t/s) | 24.8 (4647) | 21.6 (4058) | 21.3 (3998) |
+| Qwen3-Embedding-0.6B | bf16 | 26.3 (4931) | 13.5 (2539) | 10.8 (2028) | 16.2 (3043) |
+| EmbeddingGemma 2 | f32 | 15.2 (2875) | 17.7 (3340) | 21.3 (4019) | 17.3 (3266) |
+| EmbeddingGemma 2 | bf16 | 13.1 (2467) | — | — | — |
+
+The gpu01 sweep (remaining Gemma2 bf16 sizes, the CPU points and the whole
+`bench_sparse` sweep) was still running when this was written; its full output
+is at `/tmp/gpu01_bench2.log` on gpu01.
+
+The 64-core CPU measured 0.1 chunks/s on the same corpus (the box is shared
+with other users' jobs, so CPU numbers there are not meaningful).
+
+### windows, Ryzen 5 3600 (6 cores), CPU f32
+
+| model | batch 8 | batch 32 | batch 64 | batch 128 |
+| --- | --- | --- | --- | --- |
+| Qwen3-Embedding-0.6B | 0.95 (178 t/s) | 0.89 (167) | 0.89 (168) | 0.90 (168) |
+| EmbeddingGemma 2 | 2.25 (424) | 2.23 (420) | 2.23 (420) | 2.22 (419) |
+
+Sparse (KURE-Sparse-nano, f32, `--max-batch-tokens 4096`, `--n 64 --len 300`):
+0.26 chunks/s (296 t/s) at batch 8, 0.26 chunks/s (299 t/s) at batch 128.
+The in-crate `sparse_live::throughput_by_device_and_dtype` reports the same
+order of magnitude on CPU (1.4 chunks/s for its longer 900-char chunks).
+
+## Known issues
+
+* `qwen3_live` is macOS-only (CPU vs Metal); it cannot be run on gpu01 or
+  Windows at all.
+* The live-test model download races on a cold cache (see above).
+* Windows CUDA needs a Visual Studio host compiler + the MSVC Rust toolchain,
+  neither currently installed.
+* gpu01's `/data` is NFS: put cargo state, build dirs and the CUDA toolkit on
+  local disk or everything takes an order of magnitude longer.
