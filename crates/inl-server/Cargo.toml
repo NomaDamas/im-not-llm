@@ -8,21 +8,25 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
-cuda = ["inl-core/cuda", "inl-text/cuda", "inl-sparse/cuda", "inl-vision/cuda"]
-cudnn = ["inl-core/cudnn", "inl-text/cudnn", "inl-sparse/cudnn", "inl-vision/cudnn"]
-accelerate = ["inl-core/accelerate", "inl-text/accelerate", "inl-sparse/accelerate", "inl-vision/accelerate"]
-mkl = ["inl-core/mkl", "inl-text/mkl", "inl-sparse/mkl", "inl-vision/mkl"]
+default = ["cli"]
+# The `inl` binary: it names the concrete engine crates. The library alone
+# (`default-features = false`) only needs the engine traits, so a host that
+# brings its own engines (a text-only indexer) does not link the vision stack.
+cli = ["dep:clap", "dep:inl-text", "dep:inl-vision"]
+cuda = ["inl-core/cuda", "inl-sparse/cuda", "inl-text?/cuda", "inl-vision?/cuda"]
+cudnn = ["inl-core/cudnn", "inl-sparse/cudnn", "inl-text?/cudnn", "inl-vision?/cudnn"]
+accelerate = ["inl-core/accelerate", "inl-sparse/accelerate", "inl-text?/accelerate", "inl-vision?/accelerate"]
+mkl = ["inl-core/mkl", "inl-sparse/mkl", "inl-text?/mkl", "inl-vision?/mkl"]
 
 [dependencies]
 inl-core = { path = "../inl-core" }
-inl-text = { path = "../inl-text" }
+inl-text = { path = "../inl-text", optional = true }
 inl-sparse = { path = "../inl-sparse" }
-inl-vision = { path = "../inl-vision" }
+inl-vision = { path = "../inl-vision", optional = true }
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 fs2 = "0.4"
 reqwest.workspace = true
 serde.workspace = true
@@ -34,6 +38,7 @@ tracing.workspace = true
 [[bin]]
 name = "inl"
 path = "src/bin/inl.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 tempfile.workspace = true

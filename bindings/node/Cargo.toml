@@ -24,7 +24,7 @@ inl-core = { path = "../../crates/inl-core" }
 inl-text = { path = "../../crates/inl-text" }
 inl-sparse = { path = "../../crates/inl-sparse" }
 inl-vision = { path = "../../crates/inl-vision" }
-inl-server = { path = "../../crates/inl-server" }
+inl-server = { path = "../../crates/inl-server", default-features = false }
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 tokio.workspace = true
