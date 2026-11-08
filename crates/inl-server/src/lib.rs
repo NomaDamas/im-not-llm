@@ -1836,7 +1836,10 @@ impl Daemon {
 /// Out-of-process control of an `inl serve`: discovery files plus HTTP.
 pub struct DaemonClient {
     url: String,
-    instance: String,
+    /// When set, only a server answering as this instance counts. Unset means
+    /// the state directory itself names the server (see
+    /// [`DaemonClient::from_state_dir`]).
+    instance: Option<String>,
     client: reqwest::Client,
 }
 
@@ -1844,6 +1847,18 @@ impl DaemonClient {
     /// A client for the server recorded in `state_dir`'s discovery files, or
     /// `None` when no `port` file exists.
     pub fn discover(state_dir: &Path, instance: &str) -> Option<Self> {
+        let mut client = Self::from_state_dir(state_dir)?;
+        client.instance = Some(instance.to_string());
+        Some(client)
+    }
+
+    /// A client for whichever server `state_dir`'s discovery files record,
+    /// without insisting on an instance key. A state directory already names
+    /// one server, and a caller that only knows the directory (a lifecycle
+    /// command) cannot rebuild the key from the device, dtype and attention
+    /// the server was started with. Use [`DaemonClient::discover`] when the
+    /// instance is known and a different server must not be taken for it.
+    pub fn from_state_dir(state_dir: &Path) -> Option<Self> {
         let port: u16 = std::fs::read_to_string(state_dir.join("port"))
             .ok()?
             .trim()
@@ -1856,7 +1871,7 @@ impl DaemonClient {
         let url = base_url(SocketAddr::new(ip, port));
         Some(Self {
             url,
-            instance: instance.to_string(),
+            instance: None,
             client: loopback_client(Duration::from_secs(2))?,
         })
     }
@@ -1877,7 +1892,10 @@ impl DaemonClient {
             .json()
             .await
             .ok()?;
-        (health.instance == self.instance).then_some(health)
+        match &self.instance {
+            Some(wanted) => (&health.instance == wanted).then_some(health),
+            None => Some(health),
+        }
     }
 
     /// The server's health when it answers as this instance and is ready.

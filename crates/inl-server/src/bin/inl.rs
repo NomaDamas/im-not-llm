@@ -142,8 +142,7 @@ impl DiscoverArgs {
             cache_dir: None,
         };
         if let Some(state_dir) = &self.state_dir {
-            let instance = engine_args.instance_key(kind)?;
-            return Ok(DaemonClient::discover(state_dir, &instance));
+            return Ok(DaemonClient::from_state_dir(state_dir));
         }
         let model = engine_args.model_or_default(kind);
         let serve_root = inl_core::device::cache_root().join("serve");

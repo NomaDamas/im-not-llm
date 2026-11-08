@@ -1194,3 +1194,25 @@ async fn find_instances_ignores_stale_state_dirs_whose_server_is_gone() {
         .await
         .is_empty());
 }
+
+/// A state directory already names one server, so a client built from it alone
+/// must reach that server whatever instance key it was started under: the
+/// lifecycle commands do not know (and must not have to repeat) its device,
+/// dtype or attention.
+#[tokio::test]
+async fn client_from_a_state_dir_alone_reaches_the_server_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let daemon = Daemon::spawn(Engine::dense(Arc::new(FakeEngine::loaded())), opts)
+        .await
+        .unwrap();
+
+    let client = DaemonClient::from_state_dir(dir.path()).expect("discovery files");
+    let health = client.health().await.expect("the server it names");
+    assert_eq!(health.instance, "test-instance");
+    assert!(client.probe().await.is_some());
+    assert!(client.unload().await.unwrap());
+    client.stop().await.unwrap();
+    assert_eq!(daemon.wait().await.unwrap(), StopReason::Signal);
+    assert!(DaemonClient::from_state_dir(dir.path()).is_none());
+}
