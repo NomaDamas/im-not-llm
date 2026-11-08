@@ -36,23 +36,36 @@ async fn embed_on(device: DeviceSpec) -> Option<Vec<f32>> {
 }
 
 #[tokio::test]
-#[ignore = "loads the real checkpoint on the CPU and Metal"]
-async fn cpu_and_metal_agree() {
+#[ignore = "loads the real checkpoint on the CPU and the accelerator"]
+async fn cpu_and_accelerator_agree() {
     let golden = golden();
     let cpu = embed_on(DeviceSpec::Cpu).await.expect("cpu works");
     let cos = cosine(&cpu, &golden.images[0].embedding);
     eprintln!("cpu image-only cosine vs reference = {cos:.8}");
     assert!(cos > 0.9999);
 
-    #[cfg(target_os = "macos")]
-    {
-        let metal = embed_on(DeviceSpec::Metal).await.expect("metal works");
-        let cos = cosine(&metal, &golden.images[0].embedding);
-        eprintln!("metal image-only cosine vs reference = {cos:.8}");
-        assert!(cos > 0.9999);
-        let cos = cosine(&cpu, &metal);
-        eprintln!("cpu vs metal cosine = {cos:.8}");
-        assert!(cos > 0.9999);
-        assert!(metal.iter().all(|v| v.is_finite()));
+    // `INL_TEST_DEVICE` picks the accelerator, as the text live tests do; the
+    // default is Metal on macOS (the device this test was written for) and CPU
+    // elsewhere, where there is no accelerator to compare against.
+    let default = if cfg!(target_os = "macos") {
+        "metal"
+    } else {
+        "cpu"
+    };
+    let spec = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| default.to_string());
+    let spec = DeviceSpec::parse(Some(&spec)).unwrap();
+    if spec == DeviceSpec::Cpu {
+        eprintln!(
+            "no accelerator selected (INL_TEST_DEVICE={spec:?}): comparing the CPU with itself"
+        );
+        return;
     }
+    let accelerated = embed_on(spec).await.expect("accelerator works");
+    assert!(accelerated.iter().all(|value| value.is_finite()));
+    let cos = cosine(&accelerated, &golden.images[0].embedding);
+    eprintln!("{spec:?} image-only cosine vs reference = {cos:.8}");
+    assert!(cos > 0.9999, "{spec:?} image-only cosine {cos}");
+    let cos = cosine(&cpu, &accelerated);
+    eprintln!("cpu vs {spec:?} cosine = {cos:.8}");
+    assert!(cos > 0.9999, "cpu vs {spec:?} cosine {cos}");
 }

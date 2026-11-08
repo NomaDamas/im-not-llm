@@ -15,7 +15,7 @@
 
 pub use inl_core::attention::{AttentionBackend, AttentionRequest};
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 use inl_core::attention::{attend, BatchMask};
 use inl_core::hub::{hf_repo, safetensors_weight_files};
@@ -116,7 +116,10 @@ impl Module for Mlp {
 }
 
 /// `cos` / `sin` of every position below the tokenizer's maximum length,
-/// `[positions, head_dim]` in the model dtype.
+/// `[positions, head_dim / 2]` in the model dtype: the layout
+/// [`candle_nn::rotary_emb::rope`] reads (it applies the half-split rotation to
+/// each `(x[i], x[i + head_dim / 2])` pair, the same function the hand-written
+/// `x * cos + rotate_half(x) * sin` computed with five kernels instead of one).
 struct RotaryTable {
     cos: Tensor,
     sin: Tensor,
@@ -132,39 +135,46 @@ impl RotaryTable {
         let inv_freq: Vec<f64> = (0..half)
             .map(|i| 1.0 / cfg.rope_theta.powf((2 * i) as f64 / dim as f64))
             .collect();
-        let mut cos = Vec::with_capacity(positions * dim);
-        let mut sin = Vec::with_capacity(positions * dim);
+        let mut cos = Vec::with_capacity(positions * half);
+        let mut sin = Vec::with_capacity(positions * half);
         for position in 0..positions {
-            for index in 0..dim {
-                let angle = position as f64 * inv_freq[index % half];
+            for freq in &inv_freq {
+                let angle = position as f64 * freq;
                 cos.push(angle.cos() as f32);
                 sin.push(angle.sin() as f32);
             }
         }
         let table =
-            |values: Vec<f32>| Tensor::from_vec(values, (positions, dim), device)?.to_dtype(dtype);
+            |values: Vec<f32>| Tensor::from_vec(values, (positions, half), device)?.to_dtype(dtype);
         Ok(Self {
             cos: table(cos)?,
             sin: table(sin)?,
         })
     }
 
-    /// `[1, 1, seq, head_dim]` views that broadcast over batch and heads.
+    /// `[seq, head_dim / 2]` contiguous rows.
     fn rows(&self, seq: usize) -> Result<(Tensor, Tensor)> {
-        let rows = |t: &Tensor| t.narrow(0, 0, seq)?.unsqueeze(0)?.unsqueeze(0);
-        Ok((rows(&self.cos)?, rows(&self.sin)?))
+        Ok((self.cos.narrow(0, 0, seq)?, self.sin.narrow(0, 0, seq)?))
     }
 }
 
+/// The half-split rotary the fused kernel applies, for the CPU fallback in
+/// tests: `x * [cos, cos] + rotate_half(x) * [sin, sin]`.
+#[cfg(test)]
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    use candle_core::D;
     let half = x.dim(D::Minus1)? / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
     Tensor::cat(&[&x2.neg()?, &x1], x.rank() - 1)
 }
 
+#[cfg(test)]
 fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    x.broadcast_mul(cos)? + rotate_half(x)?.broadcast_mul(sin)?
+    use candle_core::D;
+    let cos = Tensor::cat(&[cos, cos], D::Minus1)?;
+    let sin = Tensor::cat(&[sin, sin], D::Minus1)?;
+    x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
 }
 
 struct Attention {
@@ -226,17 +236,17 @@ impl Attention {
         let q = hidden
             .apply(&self.q_proj)?
             .reshape((batch, seq, self.num_heads, dim))?;
-        let q = q.apply(&self.q_norm)?.transpose(1, 2)?;
+        let q = q.apply(&self.q_norm)?.transpose(1, 2)?.contiguous()?;
         let k = hidden
             .apply(&self.k_proj)?
             .reshape((batch, seq, self.num_kv_heads, dim))?;
-        let k = k.apply(&self.k_norm)?.transpose(1, 2)?;
+        let k = k.apply(&self.k_norm)?.transpose(1, 2)?.contiguous()?;
         let v = hidden
             .apply(&self.v_proj)?
             .reshape((batch, seq, self.num_kv_heads, dim))?
             .transpose(1, 2)?;
-        let q = apply_rotary(&q, rotary.0, rotary.1)?;
-        let k = apply_rotary(&k, rotary.0, rotary.1)?;
+        let q = candle_nn::rotary_emb::rope(&q, rotary.0, rotary.1)?;
+        let k = candle_nn::rotary_emb::rope(&k, rotary.0, rotary.1)?;
         let out = attend(backend, &q, &k, &v, mask, self.scale, self.num_kv_groups)?;
         out.transpose(1, 2)?
             .reshape((batch, seq, self.num_heads * dim))?
@@ -463,6 +473,7 @@ impl Qwen3Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::D;
     use std::collections::HashMap;
 
     /// Deterministic pseudo-random values in [-0.5, 0.5).
@@ -661,6 +672,34 @@ mod tests {
     fn empty_input_yields_no_embeddings() {
         let embedder = embedder(&Device::Cpu, DType::F32, AttentionBackend::CpuFlash);
         assert!(embedder.embed::<&str>(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fused_rope_matches_the_manual_half_split_rotation() {
+        // The fused kernel applies the same half-split rotation the hand-written
+        // `x * [cos, cos] + rotate_half(x) * [sin, sin]` did, in one kernel.
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let (heads, seq) = (2usize, 5usize);
+        let dim = cfg.head_dim();
+        let x =
+            Tensor::from_vec(pseudo(heads * seq * dim, 11), (1, heads, seq, dim), &device).unwrap();
+        let table = RotaryTable::new(&cfg, seq, &device, DType::F32).unwrap();
+        let (cos, sin) = table.rows(seq).unwrap();
+        let fused = candle_nn::rotary_emb::rope(&x.contiguous().unwrap(), &cos, &sin).unwrap();
+        let manual = apply_rotary(&x, &cos, &sin).unwrap();
+        let diff = (fused - manual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "fused rope differs from the manual rotation by {diff}"
+        );
     }
 
     #[test]

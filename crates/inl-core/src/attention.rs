@@ -159,33 +159,43 @@ impl BatchMask {
     }
 }
 
-/// Causal mask plus a mask for the keys that are left padding. Built on the
-/// host in one pass; the reference implementation built the same values with
-/// about six full-size device tensors.
+/// Causal mask plus a mask for the keys that are left padding, `[batch, 1, seq, seq]`
+/// in the model dtype.
+///
+/// Built from four small device ops rather than as a host `batch x seq x seq`
+/// vector: writing that vector and uploading it costs milliseconds per MiB on a
+/// discrete GPU (a pageable host->device copy runs near 0.7 GB/s, and the
+/// zeroed `Vec` is a second pass over the same memory), while the same values
+/// come out of elementwise kernels over data that is already on the device.
 fn additive_mask(
     pad_lens: &[usize],
     seq_len: usize,
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let batch = pad_lens.len();
-    let mut data = vec![0f32; batch * seq_len * seq_len];
-    for (row, &pad) in pad_lens.iter().enumerate() {
-        let plane = &mut data[row * seq_len * seq_len..(row + 1) * seq_len * seq_len];
-        for (query, scores) in plane.chunks_mut(seq_len).enumerate() {
-            for (key, slot) in scores.iter_mut().enumerate() {
-                let mut value = 0.0;
-                if key > query {
-                    value += MASK_VALUE;
-                }
-                if key < pad {
-                    value += MASK_VALUE;
-                }
-                *slot = value;
-            }
-        }
-    }
-    Tensor::from_vec(data, (batch, 1, seq_len, seq_len), device)?.to_dtype(dtype)
+    let positions = Tensor::arange(0u32, seq_len as u32, device)?;
+    let query_col = positions.reshape((seq_len, 1))?;
+    let key_row = positions.reshape((1, seq_len))?;
+    // `key > query` for the causal part ...
+    let future = key_row
+        .broadcast_gt(&query_col)?
+        .to_dtype(dtype)?
+        .affine(f64::from(MASK_VALUE), 0.0)?;
+    // ... and `key < pad` for the left padding of each row.
+    let pads = Tensor::from_vec(
+        pad_lens.iter().map(|&pad| pad as u32).collect::<Vec<u32>>(),
+        (pad_lens.len(), 1, 1),
+        device,
+    )?;
+    let padding = key_row
+        .reshape((1, 1, seq_len))?
+        .broadcast_lt(&pads)?
+        .to_dtype(dtype)?
+        .affine(f64::from(MASK_VALUE), 0.0)?;
+    // Broadcasting `[seq, seq]` against `[batch, 1, seq]` sums the two masks;
+    // a key that is both in the future and padding therefore keeps twice the
+    // value, exactly as the reference `value += MASK_VALUE` twice did.
+    future.broadcast_add(&padding)?.unsqueeze(1)
 }
 
 /// Grouped-query attention: `[B, Nkv, T, D]` -> `[B, Nkv * n_rep, T, D]`.
@@ -387,6 +397,38 @@ mod tests {
                     .expect("diff")
             })
             .fold(0.0, f32::max)
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)] // `query` and `key` are positions the mask depends on
+    fn additive_mask_matches_the_reference_formula() {
+        // Locks the exact values the slice-filled builder must produce.
+        let device = Device::Cpu;
+        let seq = 7usize;
+        let pads = vec![0usize, 3, 7];
+        let mask = additive_mask(&pads, seq, &device, DType::F32).unwrap();
+        let rows = mask
+            .reshape((3, seq, seq))
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        for (row, &pad) in pads.iter().enumerate() {
+            for query in 0..seq {
+                for key in 0..seq {
+                    let mut expected = 0.0;
+                    if key > query {
+                        expected += MASK_VALUE;
+                    }
+                    if key < pad {
+                        expected += MASK_VALUE;
+                    }
+                    assert_eq!(
+                        rows[row][query][key], expected,
+                        "row {row} query {query} key {key}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ struct Args {
     length: usize,
     output_dim: Option<usize>,
     max_length: usize,
+    max_batch_tokens: Option<usize>,
 }
 
 impl Default for Args {
@@ -32,6 +33,7 @@ impl Default for Args {
             length: 128,
             output_dim: None,
             max_length: 2048,
+            max_batch_tokens: None,
         }
     }
 }
@@ -49,6 +51,9 @@ fn parse_args() -> Result<Args, String> {
             "--count" => args.count = value()?.parse().map_err(|e| format!("{e}"))?,
             "--length" => args.length = value()?.parse().map_err(|e| format!("{e}"))?,
             "--max-length" => args.max_length = value()?.parse().map_err(|e| format!("{e}"))?,
+            "--max-batch-tokens" => {
+                args.max_batch_tokens = Some(value()?.parse().map_err(|e| format!("{e}"))?)
+            }
             "--output-dim" => args.output_dim = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--help" | "-h" => return Err("help".to_string()),
             other => return Err(format!("unknown flag {other}")),
@@ -73,19 +78,22 @@ async fn main() {
             eprintln!(
                 "usage: bench_text [--model ID] [--device auto|cpu|metal|cuda] \
                  [--dtype auto|f32|f16|bf16] [--batch-size N] [--count N] \
-                 [--length WORDS] [--max-length TOKENS] [--output-dim N]"
+                 [--length WORDS] [--max-length TOKENS] [--max-batch-tokens N] [--output-dim N]"
             );
             std::process::exit(2);
         }
     };
 
-    let options = TextOptions::default()
+    let mut options = TextOptions::default()
         .with_id(args.model.clone())
         .with_device(DeviceSpec::parse(args.device.as_deref()).unwrap())
         .with_dtype(DtypeSpec::parse(args.dtype.as_deref()).unwrap())
         .with_batch_size(args.batch_size)
         .with_max_length(args.max_length)
         .with_output_dim(args.output_dim);
+    if let Some(max_batch_tokens) = args.max_batch_tokens {
+        options = options.with_max_batch_tokens(max_batch_tokens);
+    }
     let embedder = TextEmbedder::new(options).expect("build embedder");
     let identity = embedder.identity().await.expect("load model");
 

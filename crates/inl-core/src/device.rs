@@ -97,12 +97,76 @@ pub fn dtype_name(dtype: DType) -> &'static str {
 
 /// Open the device `spec` names.
 pub fn resolve_device(spec: DeviceSpec) -> Result<Device> {
-    match spec {
-        DeviceSpec::Cpu => Ok(Device::Cpu),
-        DeviceSpec::Auto => Ok(auto_device()),
-        DeviceSpec::Metal => metal_device(),
-        DeviceSpec::Cuda => cuda_device(),
+    let device = match spec {
+        DeviceSpec::Cpu => Device::Cpu,
+        DeviceSpec::Auto => auto_device(),
+        DeviceSpec::Metal => metal_device()?,
+        DeviceSpec::Cuda => cuda_device()?,
+    };
+    prepare_device(&device);
+    Ok(device)
+}
+
+/// Environment override for CUDA GEMM accumulation precision. A comma-separated
+/// list of `f32`, `f16`, `bf16` selects which of them may run with reduced
+/// precision (tensor-core) accumulation; `none` selects the exact CUBLAS
+/// compute types. See [`prepare_device`].
+pub const CUDA_REDUCED_PRECISION_ENV: &str = "INL_CUDA_REDUCED_PRECISION";
+
+/// What [`CUDA_REDUCED_PRECISION_ENV`] means when it is not set.
+///
+/// `bf16` and `f16` are half-precision weights, whose GEMMs are already lossy:
+/// candle defaults them to `CUBLAS_COMPUTE_32F`, which on a Blackwell part
+/// costs the tensor cores the dtype exists for. `f32` is left exact: TF32
+/// rounds the operands to 10 mantissa bits, which is a real numeric change to
+/// the default path and has to clear the live goldens before it can be on.
+pub const CUDA_REDUCED_PRECISION_DEFAULT: &str = "bf16,f16";
+
+/// One-time tuning of a freshly opened device.
+///
+/// CUDA tensors track their uses with cuda events unless the context opts out,
+/// which costs two event creations on every allocation (and the matching
+/// destroys) for a guarantee nothing here needs: every engine in this
+/// workspace launches its work on the device's single stream, so there is no
+/// cross-stream use for an event to order. Turning the tracking off removes
+/// that per-allocation driver traffic.
+///
+/// It then selects the GEMM accumulation precision from
+/// [`CUDA_REDUCED_PRECISION_ENV`] (default [`CUDA_REDUCED_PRECISION_DEFAULT`]).
+/// CPU and Metal are untouched.
+pub fn prepare_device(device: &Device) {
+    #[cfg(feature = "cuda")]
+    if let Ok(cuda) = device.as_cuda_device() {
+        // SAFETY: single stream, as above; no tensor is used or freed from a
+        // second stream, so no event ordering is lost.
+        unsafe { cuda.disable_event_tracking() };
+        let selected = std::env::var(CUDA_REDUCED_PRECISION_ENV)
+            .unwrap_or_else(|_| CUDA_REDUCED_PRECISION_DEFAULT.to_string());
+        let wants = |name: &str| {
+            selected
+                .split(',')
+                .any(|part| part.trim() == name || part.trim() == "all")
+        };
+        candle_core::cuda_backend::set_gemm_reduced_precision_f32(wants("f32"));
+        candle_core::cuda_backend::set_gemm_reduced_precision_f16(wants("f16"));
+        candle_core::cuda_backend::set_gemm_reduced_precision_bf16(wants("bf16"));
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+}
+
+/// Free and total bytes of device memory, when the device exposes them. CUDA
+/// reports them; CPU and Metal are unified-memory devices whose budget the OS
+/// manages, so they answer `None`.
+pub fn device_memory_bytes(device: &Device) -> Option<(usize, usize)> {
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() {
+        if let Ok(info) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info() {
+            return Some(info);
+        }
+    }
+    let _ = device;
+    None
 }
 
 fn auto_device() -> Device {

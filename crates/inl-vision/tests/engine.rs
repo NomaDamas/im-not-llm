@@ -9,10 +9,14 @@ use common::*;
 use inl_core::{MediaBytes, MultimodalEngine, MultimodalInput};
 use inl_vision::{DeviceSpec, MultimodalEmbedder, MultimodalOptions};
 
+/// `INL_TEST_DEVICE=cpu|metal|cuda` runs the golden on that device (default
+/// CPU). The reference vectors are CPU f32 outputs of the Hugging Face model,
+/// so any device must reproduce them: this is the CUDA / Metal correctness check.
 fn options() -> MultimodalOptions {
+    let device = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".to_string());
     MultimodalOptions::default()
         .with_id("google/embeddinggemma-2")
-        .with_device(DeviceSpec::Cpu)
+        .with_device(DeviceSpec::parse(Some(&device)).unwrap())
 }
 
 fn media(name: &str) -> MediaBytes {

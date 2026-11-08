@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use candle_core::{DType, Device};
 use inl_core::deadline::BatchDeadline;
 use inl_core::device::{
-    device_kind, device_label, dtype_name, effective_batch_timeout, model_cache_dir,
-    resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
+    device_kind, device_label, device_memory_bytes, dtype_name, effective_batch_timeout,
+    model_cache_dir, resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
 };
 use inl_core::engine::{DenseEngine, EngineInfo, Modality};
 use inl_core::hub::ModelSource;
@@ -144,6 +144,8 @@ struct LoadedModel {
     device: String,
     dtype: DType,
     backend: AttentionBackend,
+    /// Padded-token cap for one forward pass (see [`effective_max_batch_tokens`]).
+    max_batch_tokens: usize,
     /// Deadline for one forward pass on the device the model loaded onto.
     batch_timeout: Duration,
     /// Matryoshka truncation length, validated at load; `None` keeps the model
@@ -413,6 +415,7 @@ impl TextEmbedder {
                 let batch_timeout = self.batch_timeout;
                 let batch_timeout_explicit = self.batch_timeout_explicit;
                 let requested_output_dim = self.output_dim;
+                let self_cap = self.max_batch_tokens;
                 tokio::task::spawn_blocking(move || {
                     let device = resolve_device(device_spec)?;
                     let cache = model_cache_dir(cache_dir.as_deref());
@@ -440,11 +443,13 @@ impl TextEmbedder {
                         batch_timeout_explicit,
                         device.is_cpu(),
                     );
+                    let max_batch_tokens = effective_max_batch_tokens(self_cap, &device);
                     tracing::debug!(
                         device = ?device.location(),
                         ?dtype,
                         attention = ?model.backend(),
                         batch_timeout_seconds = batch_timeout.as_secs(),
+                        max_batch_tokens,
                         "native embedder ready"
                     );
                     Ok(LoadedModel {
@@ -453,6 +458,7 @@ impl TextEmbedder {
                         device: device_label(&device),
                         dtype,
                         backend: model.backend(),
+                        max_batch_tokens,
                         batch_timeout,
                         output_dim,
                         model: Arc::new(Mutex::new(model)),
@@ -562,7 +568,7 @@ impl TextEmbedder {
             self.max_length,
             per_row_attention_bytes,
             ATTENTION_BYTES_BUDGET,
-            self.max_batch_tokens,
+            loaded.max_batch_tokens,
             backend,
         );
         embed_in_batches(
@@ -740,6 +746,35 @@ fn batch_timeout(options: &TextOptions) -> Result<Duration> {
         ));
     }
     Ok(Duration::from_secs(seconds))
+}
+
+/// The padded-token cap a forward pass runs under: the caller's, unless the
+/// caller left it at [`DEFAULT_MAX_BATCH_TOKENS`], in which case the device's
+/// own memory decides.
+///
+/// 4096 was sized for a unified-memory GPU, where activations compete with the
+/// weights for the same RAM. A discrete GPU with tens of GB free can hold far
+/// more, and a pass that holds more tokens amortizes the fixed cost of each
+/// kernel launch and each host-side op over more work instead of paying it once
+/// per small batch. One padded token is budgeted at 64 KiB of activations (the
+/// residual stream plus the MLP intermediates of a few-thousand-wide model),
+/// and a single pass never claims more than an eighth of what is free at load
+/// time. CPU and Metal (unified memory, no free-memory reading) keep the crate
+/// default.
+pub(crate) fn effective_max_batch_tokens(configured: usize, device: &Device) -> usize {
+    const BYTES_PER_PADDED_TOKEN: usize = 64 * 1024;
+    /// Upper bound on the derived cap, so a very large free pool still yields a
+    /// finite plan (256 Ki padded tokens is far beyond any batch that fits).
+    const CEILING: usize = 1 << 18;
+    if configured != DEFAULT_MAX_BATCH_TOKENS {
+        return configured;
+    }
+    match device_memory_bytes(device) {
+        Some((free, _)) => {
+            (free / 8 / BYTES_PER_PADDED_TOKEN).clamp(DEFAULT_MAX_BATCH_TOKENS, CEILING)
+        }
+        None => DEFAULT_MAX_BATCH_TOKENS,
+    }
 }
 
 /// Validate a requested Matryoshka output dimension against the loaded model.

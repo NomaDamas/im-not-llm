@@ -24,7 +24,7 @@
 //! The checkpoint overflows float16, so only f32 and bf16 are accepted.
 
 use crate::qwen3::{AttentionBackend, AttentionRequest, LoadOptions};
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
 use inl_core::hub::ModelSource;
 use inl_core::{InlError, Result as InlResult};
 
@@ -282,8 +282,8 @@ impl PleBlock {
     }
 }
 
-/// `cos` / `sin` of every position below the context, `[positions, head_dim]`
-/// in the model dtype.
+/// `cos` / `sin` of every position below the context, `[positions, head_dim / 2]`
+/// in the model dtype: the layout [`candle_nn::rotary_emb::rope`] reads.
 struct RotaryTable {
     cos: Tensor,
     sin: Tensor,
@@ -301,40 +301,45 @@ impl RotaryTable {
         let inv_freq: Vec<f64> = (0..half)
             .map(|i| 1.0 / theta.powf((2 * i) as f64 / head_dim as f64))
             .collect();
-        let mut cos = Vec::with_capacity(positions * head_dim);
-        let mut sin = Vec::with_capacity(positions * head_dim);
+        let mut cos = Vec::with_capacity(positions * half);
+        let mut sin = Vec::with_capacity(positions * half);
         for position in 0..positions {
-            for index in 0..head_dim {
-                let angle = position as f64 * inv_freq[index % half];
+            for freq in &inv_freq {
+                let angle = position as f64 * freq;
                 cos.push(angle.cos() as f32);
                 sin.push(angle.sin() as f32);
             }
         }
-        let table = |values: Vec<f32>| {
-            Tensor::from_vec(values, (positions, head_dim), device)?.to_dtype(dtype)
-        };
+        let table =
+            |values: Vec<f32>| Tensor::from_vec(values, (positions, half), device)?.to_dtype(dtype);
         Ok(Self {
             cos: table(cos)?,
             sin: table(sin)?,
         })
     }
 
-    /// `[1, 1, seq, head_dim]` views that broadcast over batch and heads.
+    /// `[seq, head_dim / 2]` contiguous rows.
     fn rows(&self, seq: usize) -> Result<(Tensor, Tensor)> {
-        let rows = |t: &Tensor| t.narrow(0, 0, seq)?.unsqueeze(0)?.unsqueeze(0);
-        Ok((rows(&self.cos)?, rows(&self.sin)?))
+        Ok((self.cos.narrow(0, 0, seq)?, self.sin.narrow(0, 0, seq)?))
     }
 }
 
+/// The half-split rotary the fused kernel applies, kept as the test reference.
+#[cfg(test)]
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    use candle_core::D;
     let half = x.dim(D::Minus1)? / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
     Tensor::cat(&[&x2.neg()?, &x1], x.rank() - 1)
 }
 
+#[cfg(test)]
 fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    x.broadcast_mul(cos)? + rotate_half(x)?.broadcast_mul(sin)?
+    use candle_core::D;
+    let cos = Tensor::cat(&[cos, cos], D::Minus1)?;
+    let sin = Tensor::cat(&[sin, sin], D::Minus1)?;
+    x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?
 }
 
 struct Attention {
@@ -385,19 +390,21 @@ impl Attention {
             .apply(&self.q_proj)?
             .reshape((batch, seq, self.heads, dim))?
             .apply(&self.q_norm)?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let k = hidden
             .apply(&self.k_proj)?
             .reshape((batch, seq, self.kv_heads, dim))?
             .apply(&self.k_norm)?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
+        let q = candle_nn::rotary_emb::rope(&q, rotary.0, rotary.1)?;
+        let k = candle_nn::rotary_emb::rope(&k, rotary.0, rotary.1)?;
         let v = hidden
             .apply(&self.v_proj)?
             .reshape((batch, seq, self.kv_heads, dim))?
             .contiguous()?;
         let v = candle_nn::ops::rms_norm(&v, &self.v_ones, self.eps)?.transpose(1, 2)?;
-        let q = apply_rotary(&q, rotary.0, rotary.1)?.contiguous()?;
-        let k = apply_rotary(&k, rotary.0, rotary.1)?.contiguous()?;
         let v = v.contiguous()?;
 
         // Grouped-query attention: query head `h` reads KV head `h / groups`.
@@ -903,6 +910,32 @@ mod tests {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
         let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
         dot / (norm(a) * norm(b))
+    }
+
+    #[test]
+    fn fused_rope_matches_the_manual_half_split_rotation() {
+        let device = Device::Cpu;
+        let (head_dim, seq) = (16usize, 5usize);
+        let table = RotaryTable::new(head_dim, 10_000.0, seq, &device, DType::F32).unwrap();
+        let (cos, sin) = table.rows(seq).unwrap();
+        let x = Tensor::from_vec(
+            (0..2 * seq * head_dim)
+                .map(|i| (i % 17) as f32 * 0.05 - 0.4)
+                .collect::<Vec<f32>>(),
+            (1, 2, seq, head_dim),
+            &device,
+        )
+        .unwrap();
+        let fused = candle_nn::rotary_emb::rope(&x.contiguous().unwrap(), &cos, &sin).unwrap();
+        let manual = apply_rotary(&x, &cos, &sin).unwrap();
+        let diff = max_diff(
+            &fused.flatten_all().unwrap().to_vec1().unwrap(),
+            &manual.flatten_all().unwrap().to_vec1().unwrap(),
+        );
+        assert!(
+            diff < 1e-5,
+            "fused rope differs from the manual rotation by {diff}"
+        );
     }
 
     #[test]

@@ -17,8 +17,9 @@ Verified 2026-11-09 against `main` @ `ce93d66` for
 | `NVCC_CCBIN` | Host compiler `nvcc` hands its generated code to (Windows). |
 | `CUDA_VISIBLE_DEVICES` | Which GPU candle opens as `cuda:0`. |
 | `HF_HOME` | Model cache the engines *and* the `hf-hub` client read. Set it to a populated cache to avoid re-downloading. |
-| `INL_TEST_DEVICE` | `cpu`/`metal`/`cuda` for the ignored live tests (`gemma2_live`, `sparse_live`). |
+| `INL_TEST_DEVICE` | `cpu`/`metal`/`cuda` for the ignored live tests (`gemma2_live`, `qwen3_live`, `sparse_live`, `inl-vision`'s `live`). |
 | `INL_CACHE_DIR` | Model cache when `HF_HOME` is not set (`~/.cache/im-not-llm/models` by default). |
+| `INL_CUDA_REDUCED_PRECISION` | Which CUDA GEMMs may use reduced-precision (tensor-core) accumulation: a comma-separated list of `f32`, `f16`, `bf16`, or `none`. Default `bf16,f16`; `f32` (TF32) is off because it rounds the default path's operands to 10 mantissa bits. |
 
 Feature flags: `cuda` (NVIDIA), `cudnn` (implies `cuda`; needs cuDNN),
 `accelerate` (macOS CPU BLAS), `mkl` (x86 CPU BLAS).
@@ -75,6 +76,37 @@ INL_TEST_DEVICE=cuda cargo test -j16 --release --features cuda -p inl-sparse -p 
 
 Use `-j16` or fewer, and re-check `nvidia-smi` before each run: GPU 1 was idle
 when work started and 100%-utilised 30 min later by another user.
+
+### What CUDA does differently from the other devices
+
+`inl-core::device::resolve_device` tunes a CUDA device once, when it is opened:
+
+* **cuda event tracking off.** candle's CUDA tensors create two cuda events on
+  every allocation (`cuEventCreate`/`cuEventDestroy`) to order cross-stream use.
+  Every engine here runs on the device's single stream, so the events protect
+  nothing; a text forward allocated ~1500 tensors, i.e. ~3000 event pairs.
+* **reduced-precision GEMMs for half precision** (see
+  `INL_CUDA_REDUCED_PRECISION`): candle defaults bf16/f16 GEMMs to
+  `CUBLAS_COMPUTE_32F`, which does not use the tensor cores the dtype exists for.
+* **the padded-token cap comes from device memory.** `TextOptions`'
+  `max_batch_tokens` default (4096) was sized for a unified-memory GPU; on CUDA
+  the planner now derives the cap from free device memory (one padded token
+  budgeted at 64 KiB, never more than an eighth of what is free) unless the
+  caller set the option. On gpu01 that turns `--batch-size 64` from 15-row
+  batches into 64-row batches. Metal and CPU keep 4096.
+
+The model side is device-independent but worth knowing on CUDA:
+
+* `candle_nn::rotary_emb::rope` replaces the hand-written
+  `x * cos + rotate_half(x) * sin` (measured on gpu01: 294 us -> 20 us per call
+  for `[8, 16, 187, 128]` f32).
+* the attention mask is built with device ops, not as a host `batch x seq x seq`
+  vector. On gpu01 a `[32, 1, 193, 193]` f32 mask cost 5-9 ms to allocate, 3-5 ms
+  to fill and 6-8 ms to upload (pageable host->device runs near 0.7 GB/s) per
+  forward; the device build is a handful of elementwise kernels.
+* `AttentionBackend` has no CUDA fused kernel: candle's `sdpa` implements only
+  `cpu_fwd` and `metal_fwd` at this revision, so `Auto` resolves to `Tiled` on
+  CUDA. `candle-flash-attn` would be a new dependency with its own kernels.
 
 ## windows — Windows 11, TITAN Xp (sm_61), CUDA toolkit 11.8
 
