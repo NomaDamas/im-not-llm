@@ -12,7 +12,7 @@ pub mod vision;
 pub use engine::{MultimodalEmbedder, MultimodalOptions};
 pub use media::RgbImage;
 pub use preprocess::{decode, preprocess_rgb, PreprocessedImage};
-pub use vision::{VisionBatch, VisionConfig, VisionOutput, VisionTower};
+pub use vision::{AttentionImpl, VisionBatch, VisionConfig, VisionOutput, VisionTower};
 
 pub use inl_core::attention::AttentionRequest;
 pub use inl_core::device::{DeviceSpec, DtypeSpec};

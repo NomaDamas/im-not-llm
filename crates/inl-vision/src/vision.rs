@@ -175,6 +175,77 @@ impl RmsNorm {
     }
 }
 
+/// How the vision tower computes attention scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionImpl {
+    /// Query-tiled `softmax(q k^T + mask) v`: the score matrix never exists at once.
+    Tiled,
+    /// Metal's fused scaled-dot-product kernel.
+    MetalSdpa,
+}
+
+impl AttentionImpl {
+    /// `Auto` takes the fused Metal kernel where there is one; `Eager` and
+    /// `Tiled` both mean the tiled reference path; `Fused` is an error where no
+    /// fused kernel exists.
+    pub fn resolve(
+        request: inl_core::attention::AttentionRequest,
+        device: &Device,
+        head_dim: usize,
+    ) -> inl_core::Result<Self> {
+        use inl_core::attention::AttentionRequest;
+        let metal_ok = device.is_metal() && [32, 64, 72, 80, 96, 128, 256, 512].contains(&head_dim);
+        match request {
+            AttentionRequest::Eager | AttentionRequest::Tiled => Ok(Self::Tiled),
+            AttentionRequest::Auto => Ok(if metal_ok { Self::MetalSdpa } else { Self::Tiled }),
+            AttentionRequest::Fused if metal_ok => Ok(Self::MetalSdpa),
+            AttentionRequest::Fused => Err(inl_core::InlError::Config(format!(
+                "attention = \"fused\" is unavailable for the vision tower on {:?} with head_dim {head_dim}",
+                device.location()
+            ))),
+        }
+    }
+}
+
+/// `softmax(q k^T + mask) v` with scaling 1.0 over `q, k, v: [B, H, T, D]`.
+///
+/// The additive `mask` keeps padding keys out of every real row; rows of
+/// padding queries are unspecified (the pooler strips them).
+fn masked_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    kind: AttentionImpl,
+) -> Result<Tensor> {
+    let (_, heads, seq, _) = q.dims4()?;
+    match kind {
+        AttentionImpl::MetalSdpa => {
+            let mask = mask.expand((q.dim(0)?, heads, seq, seq))?;
+            candle_nn::ops::sdpa(q, k, v, Some(&mask), false, 1.0, 1.0)
+        }
+        AttentionImpl::Tiled => {
+            let kt = k.transpose(2, 3)?.contiguous()?;
+            let mut blocks = Vec::with_capacity(seq.div_ceil(ATTENTION_TILE));
+            let mut start = 0;
+            while start < seq {
+                let rows = ATTENTION_TILE.min(seq - start);
+                let q_tile = q.narrow(2, start, rows)?.contiguous()?;
+                let scores = q_tile.matmul(&kt)?;
+                let mask_tile = mask.narrow(2, start, rows)?;
+                let weights = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask_tile)?)?;
+                blocks.push(weights.matmul(v)?);
+                start += rows;
+            }
+            if blocks.len() == 1 {
+                Ok(blocks.pop().unwrap())
+            } else {
+                Tensor::cat(&blocks, 2)
+            }
+        }
+    }
+}
+
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -206,7 +277,13 @@ impl Attention {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, rope: (&Tensor, &Tensor), mask: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        rope: (&Tensor, &Tensor),
+        mask: &Tensor,
+        kind: AttentionImpl,
+    ) -> Result<Tensor> {
         let (batch, seq, _) = hidden.dims3()?;
         let dim = self.head_dim;
         let q = hidden
@@ -233,26 +310,8 @@ impl Attention {
             Tensor::cat(&vec![&x; groups], 2)?.reshape((batch, self.heads, seq, dim))
         };
         let (k, v) = (repeat(&k)?.contiguous()?, repeat(&v)?.contiguous()?);
-        let kt = k.transpose(2, 3)?.contiguous()?;
 
-        // Scaling is 1.0 in the reference; scores are tiled over queries so the
-        // [batch, heads, seq, seq] matrix never exists at once.
-        let mut blocks = Vec::with_capacity(seq.div_ceil(ATTENTION_TILE));
-        let mut start = 0;
-        while start < seq {
-            let rows = ATTENTION_TILE.min(seq - start);
-            let q_tile = q.narrow(2, start, rows)?.contiguous()?;
-            let scores = q_tile.matmul(&kt)?;
-            let mask_tile = mask.narrow(2, start, rows)?;
-            let weights = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask_tile)?)?;
-            blocks.push(weights.matmul(&v)?);
-            start += rows;
-        }
-        let attn = if blocks.len() == 1 {
-            blocks.pop().unwrap()
-        } else {
-            Tensor::cat(&blocks, 2)?
-        };
+        let attn = masked_attention(&q, &k, &v, mask, kind)?;
         attn.transpose(1, 2)?
             .reshape((batch, seq, self.heads * dim))?
             .apply(&self.o_proj)
@@ -313,10 +372,16 @@ impl EncoderLayer {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, rope: (&Tensor, &Tensor), mask: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        rope: (&Tensor, &Tensor),
+        mask: &Tensor,
+        kind: AttentionImpl,
+    ) -> Result<Tensor> {
         let residual = hidden;
         let h = self.input_layernorm.forward(hidden)?;
-        let h = self.attention.forward(&h, rope, mask)?;
+        let h = self.attention.forward(&h, rope, mask, kind)?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let hidden = (residual + h)?;
         let h = self.pre_feedforward_layernorm.forward(&hidden)?;
@@ -358,6 +423,7 @@ pub struct VisionTower {
     cfg: VisionConfig,
     device: Device,
     dtype: DType,
+    attention: AttentionImpl,
 }
 
 impl VisionTower {
@@ -394,10 +460,26 @@ impl VisionTower {
             embed_projection,
             embed_norm,
             root_hidden_size: (cfg.hidden_size as f64).sqrt(),
+            attention: AttentionImpl::Tiled,
             cfg,
             device,
             dtype,
         })
+    }
+
+    /// Choose the attention implementation. A tower starts on the tiled
+    /// reference path; the engine passes the caller's request (`Auto` takes the
+    /// fused kernel where one exists).
+    pub fn with_attention(
+        mut self,
+        request: inl_core::attention::AttentionRequest,
+    ) -> inl_core::Result<Self> {
+        self.attention = AttentionImpl::resolve(request, &self.device, self.cfg.head_dim)?;
+        Ok(self)
+    }
+
+    pub fn attention_impl(&self) -> AttentionImpl {
+        self.attention
     }
 
     pub fn config(&self) -> &VisionConfig {
@@ -502,7 +584,7 @@ impl VisionTower {
         let (cos, sin) = self.rope(batch.position_ids)?;
         let mask = self.attention_mask(batch.padding)?;
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, (&cos, &sin), &mask)?;
+            hidden = layer.forward(&hidden, (&cos, &sin), &mask, self.attention)?;
         }
 
         let pooled = self.pool(
@@ -650,5 +732,87 @@ mod tests {
         let cfg = VisionConfig::parse(bytes).unwrap();
         assert_eq!(cfg.hidden_size, 768);
         assert_eq!(cfg.num_hidden_layers, 16);
+    }
+
+    /// Random q/k/v over `seq` tokens whose last `seq - real` keys are padding.
+    fn attention_case(
+        device: &Device,
+        seq: usize,
+        real: usize,
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
+        let (heads, dim) = (4, 64);
+        let mk = || Tensor::randn(0f32, 1f32, (1, heads, seq, dim), device).unwrap();
+        let mut mask = vec![0f32; seq * seq];
+        for query in 0..seq {
+            for key in real..seq {
+                mask[query * seq + key] = MASKED;
+            }
+        }
+        let mask = Tensor::from_vec(mask, (1, 1, seq, seq), device).unwrap();
+        (mk(), mk(), mk(), mask)
+    }
+
+    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn tiled_attention_ignores_padding_keys() {
+        let device = Device::Cpu;
+        let (q, k, v, mask) = attention_case(&device, 40, 31);
+        let tiled = masked_attention(&q, &k, &v, &mask, AttentionImpl::Tiled).unwrap();
+        // Same result when the padding keys are physically removed.
+        let kr = k.narrow(2, 0, 31).unwrap().contiguous().unwrap();
+        let vr = v.narrow(2, 0, 31).unwrap().contiguous().unwrap();
+        let scores = q.matmul(&kr.transpose(2, 3).unwrap()).unwrap();
+        let want = candle_nn::ops::softmax_last_dim(&scores)
+            .unwrap()
+            .matmul(&vr)
+            .unwrap();
+        assert!(
+            max_diff(
+                &tiled.narrow(2, 0, 31).unwrap(),
+                &want.narrow(2, 0, 31).unwrap()
+            ) < 1e-4
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_metal_attention_matches_tiled_on_real_rows() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        let (q, k, v, mask) = attention_case(&device, 300, 211);
+        let tiled = masked_attention(&q, &k, &v, &mask, AttentionImpl::Tiled).unwrap();
+        let fused = masked_attention(&q, &k, &v, &mask, AttentionImpl::MetalSdpa).unwrap();
+        let diff = max_diff(
+            &tiled.narrow(2, 0, 211).unwrap(),
+            &fused.narrow(2, 0, 211).unwrap(),
+        );
+        assert!(diff < 1e-3, "fused attention drifted from tiled by {diff}");
+    }
+
+    #[test]
+    fn attention_impl_follows_the_device_and_request() {
+        use inl_core::attention::AttentionRequest;
+        let cpu = Device::Cpu;
+        assert_eq!(
+            AttentionImpl::resolve(AttentionRequest::Auto, &cpu, 64).unwrap(),
+            AttentionImpl::Tiled
+        );
+        assert_eq!(
+            AttentionImpl::resolve(AttentionRequest::Eager, &cpu, 64).unwrap(),
+            AttentionImpl::Tiled,
+            "eager keeps the reference tiled path"
+        );
+        assert!(AttentionImpl::resolve(AttentionRequest::Fused, &cpu, 64).is_err());
     }
 }

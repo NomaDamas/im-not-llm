@@ -10,7 +10,7 @@
 
 use crate::preprocess::{self, PreprocessedImage};
 use crate::video;
-use crate::vision::{VisionBatch, VisionConfig, VisionTower};
+use crate::vision::{AttentionImpl, VisionBatch, VisionConfig, VisionTower};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -264,15 +264,6 @@ impl Loaded {
                     .to_string(),
             ));
         }
-        if !matches!(
-            options.attention,
-            AttentionRequest::Auto | AttentionRequest::Eager
-        ) {
-            return Err(InlError::Config(
-                "EmbeddingGemma 2 supports only attention = \"auto\" or \"eager\"".to_string(),
-            ));
-        }
-
         let cache = options.cache_dir.clone().unwrap_or_else(std::env::temp_dir);
         let source = ModelSource::resolve(&options.id, cache)?;
 
@@ -294,7 +285,8 @@ impl Loaded {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, &device) }
             .map_err(|e| InlError::Inference(format!("vision weight load failed: {e}")))?;
         let vision = VisionTower::new(vision_config, text_hidden, vb)
-            .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?;
+            .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?
+            .with_attention(options.attention)?;
 
         let tokenizer = Tokenizer::from_file(source.fetch("tokenizer.json")?)
             .map_err(|e| InlError::Inference(format!("tokenizer parse failed: {e}")))?;
@@ -305,7 +297,11 @@ impl Loaded {
             dimension: options.output_dim.unwrap_or(FULL_DIM),
             dtype: dtype_name(dtype).to_string(),
             device: device_label(&device),
-            attention: "eager".to_string(),
+            attention: match vision.attention_impl() {
+                AttentionImpl::MetalSdpa => "fused",
+                AttentionImpl::Tiled => "tiled",
+            }
+            .to_string(),
             max_length: options.max_length,
             modalities: vec![Modality::Text, Modality::Image, Modality::Video],
         };
