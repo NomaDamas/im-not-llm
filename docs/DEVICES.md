@@ -241,21 +241,44 @@ gpu01 box had a token in place.)
 `bench_text --count 128 --length 64 --max-length 512`;
 `bench_sparse --n 64 --len 300`. `chunks/s` (`t/s` = tokens/s).
 
-### gpu01, RTX PRO 6000 Blackwell Max-Q (sm_120), CUDA 12.9, `cuda:0`
+### gpu01 controlled CUDA A/B (2026-11-10)
 
-| model | dtype | batch 8 | batch 32 | batch 64 | batch 128 |
+Pinned to physical card 2 (`GPU-0ad354e1-d2d1-9aba-d6a0-cdec1e78ec53`),
+idle before the first run. Before: `d6da2ef` (parent of `55acc36`, pinned
+candle git revision); after: `bb37000` (CUDA optimizations plus registry
+candle 0.11.1). This compares complete builds, not an isolated attribution
+to one kernel change. Other cards remained busy; card 2 retained about
+20–22 GiB of another process's allocations and temperatures ranged 80–92°C.
+Results therefore include shared-host/thermal variation, not exclusive-card
+laboratory precision.
+
+Three interleaved repeats, reversing variant order on the second repeat.
+Text: `--count 1024 --length 128`; sparse: `--n 1024 --len 128
+--max-batch-tokens 65536`. Model load is outside reported inference time;
+the larger corpus amortizes the text harness's cold first forward. Dense
+batch sizes are requested maxima: before uses the old 4096-token cap, after
+uses its device-memory cap. Sparse uses the same explicit cap in both builds.
+Cells are median chunks/s, **before → after (ratio)**; TF32 rows are separate
+opt-in after-build measurements, not the default. Raw samples, including
+tokens/s, actual commands and GPU telemetry: `docs/cuda-ab-20261110.jsonl`.
+
+| model | dtype / variant | batch 8 | batch 32 | batch 64 | batch 128 |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3-Embedding-0.6B | f32 | 30.7 (5751 t/s) | 24.8 (4647) | 21.6 (4058) | 21.3 (3998) |
-| Qwen3-Embedding-0.6B | bf16 | 26.3 (4931) | 13.5 (2539) | 10.8 (2028) | 16.2 (3043) |
-| EmbeddingGemma 2 | f32 | 15.2 (2875) | 17.7 (3340) | 21.3 (4019) | 17.3 (3266) |
-| EmbeddingGemma 2 | bf16 | 13.1 (2467) | — | — | — |
+| Qwen3-Embedding-0.6B | f32 | 41.0 → 44.4 (1.08×) | 35.1 → 45.1 (1.29×) | 34.2 → 41.4 (1.21×) | 35.7 → 40.6 (1.14×) |
+| Qwen3-Embedding-0.6B | f32 + TF32 | 76.2 | 64.2 | 69.3 | 78.2 |
+| Qwen3-Embedding-0.6B | bf16 | 67.7 → 94.2 (1.39×) | 95.9 → 108.3 (1.13×) | 120.9 → 146.2 (1.21×) | 92.7 → 154.4 (1.67×) |
+| EmbeddingGemma 2 | f32 | 144.9 → 156.8 (1.08×) | 141.4 → 128.0 (0.91×) | 113.5 → 96.7 (0.85×) | 94.8 → 86.7 (0.91×) |
+| EmbeddingGemma 2 | f32 + TF32 | 213.2 | 230.1 | 129.6 | 137.8 |
+| EmbeddingGemma 2 | bf16 | 135.8 → 164.5 (1.21×) | 182.8 → 138.4 (0.76×) | 143.7 → 135.5 (0.94×) | 137.9 → 128.3 (0.93×) |
+| KURE-Sparse-nano | f32 | 49.9 → 53.1 (1.06×) | 47.7 → 48.8 (1.02×) | 53.0 → 55.2 (1.04×) | 65.3 → 60.9 (0.93×) |
+| KURE-Sparse-nano | f32 + TF32 | 71.6 | 59.7 | 65.2 | 71.5 |
+| KURE-Sparse-nano | f16 | 94.5 → 111.0 (1.17×) | 82.0 → 72.4 (0.88×) | 94.3 → 100.5 (1.07×) | 70.5 → 88.6 (1.26×) |
 
-The gpu01 sweep (remaining Gemma2 bf16 sizes, the CPU points and the whole
-`bench_sparse` sweep) was still running when this was written; its full output
-is at `/tmp/gpu01_bench2.log` on gpu01.
-
-The 64-core CPU measured 0.1 chunks/s on the same corpus (the box is shared
-with other users' jobs, so CPU numbers there are not meaningful).
+Conclusion: Qwen3 improves across these batch sizes; EmbeddingGemma 2 does
+**not** have a blanket speedup, and sparse gains are modest/mixed. bf16 is
+faster than f32 throughout this after-build text sweep, reversing the earlier
+small-corpus result. Keep f32's TF32 accumulation opt-in: throughput alone
+does not justify changing the numerical default. No tolerance was relaxed.
 
 ### windows, Ryzen 5 3600 (6 cores), CPU f32
 
