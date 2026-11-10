@@ -225,7 +225,11 @@ async fn throughput_by_device_and_dtype() {
             println!("{device}/{dtype}: unavailable");
             continue;
         }
-        encoder.encode(&chunks[..4]).await.unwrap(); // warm up
+        // A dtype the device has no kernels for (bf16 before sm_80) fails here.
+        if let Err(error) = encoder.encode(&chunks[..4]).await {
+            println!("{device}/{dtype}: unavailable ({error})");
+            continue;
+        }
         let started = std::time::Instant::now();
         let vectors = encoder.encode(&chunks).await.unwrap();
         let seconds = started.elapsed().as_secs_f64();

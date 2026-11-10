@@ -110,7 +110,7 @@ The model side is device-independent but worth knowing on CUDA:
 
 ## windows — Windows 11, TITAN Xp (sm_61), CUDA toolkit 11.8
 
-Default Rust toolchain is `stable-x86_64-pc-windows-gnu`.
+CPU builds and tests use the default `stable-x86_64-pc-windows-gnu` toolchain:
 
 ```bat
 set "CARGO_TARGET_DIR=C:\Users\vkehfdl1\im-not-llm\target-win"
@@ -118,33 +118,62 @@ set "HF_HOME=C:\Users\vkehfdl1\.cache\huggingface"
 cargo test -p inl-core -p inl-text -p inl-sparse -p inl-server
 ```
 
-CPU builds and tests fine with the GNU toolchain. **CUDA cannot be built on
-this machine.** `nvcc` needs `cl.exe`, and there is no Visual Studio / Build
-Tools: no `vcvars64.bat`, no `cl.exe`, no `vswhere.exe`; the
-`C:\Program Files (x86)\Microsoft Visual Studio\2019` and `\2022` directories
-exist but are empty. The kernel build fails with
-`nvcc fatal : Cannot find compiler 'cl.exe' in PATH`. Even with `cl.exe`
-present, `candle-kernels` passes `-Xcompiler -fPIC` for non-`msvc` Rust
-targets, which MSVC rejects, so a CUDA build would also need the
-`stable-x86_64-pc-windows-msvc` toolchain.
+### CUDA on Windows
 
-Live tests: `gemma2_live` (2) and `sparse_live` (4) pass on CPU; `qwen3_live`
-**fails on every non-macOS machine** because it compares CPU against **Metal**
-and has no `INL_TEST_DEVICE` handling (`device metal is only available on
-macOS`).
+`nvcc` needs MSVC's `cl.exe` as host compiler, and `candle-kernels` passes
+`-Xcompiler -fPIC` (which MSVC rejects) for every non-`msvc` Rust target, so
+a CUDA build needs both:
+
+1. Visual Studio 2019 Build Tools with the C++ workload (CUDA 11.8 does not
+   accept a newer MSVC than VS 2022 17.x; 2019 is the safe pick):
+   `vs_buildtools.exe --quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`
+   (from `https://aka.ms/vs/16/release/vs_buildtools.exe`, admin shell).
+2. `rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal`.
+
+The TITAN Xp is sm_61 (Pascal). candle's kernels assume sm_70+ in two places
+(`sum_f16` uses `atomicAdd(__half*, __half)`, and the MoE WMMA kernels use
+`nvcuda::wmma`), so `nvcc` fails on them for `CUDA_COMPUTE_CAP=61`.
+`scripts/patch_candle_kernels_pre_volta.py` copies the `candle-kernels` crate
+cargo resolved and guards those spots (the MoE kernels trap; im-not-llm never
+calls them) and writes a cargo config pointing at the copy:
+
+```bat
+python scripts\patch_candle_kernels_pre_volta.py C:\Users\vkehfdl1\ckpv
+```
+
+Then build from a shell with the MSVC environment (`inl-cuda.cmd` on the box):
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "CUDA_COMPUTE_CAP=61"
+set "CARGO_TARGET_DIR=C:\Users\vkehfdl1\im-not-llm\target-win-cuda"
+cargo +stable-x86_64-pc-windows-msvc test --release --features cuda --config C:\Users\vkehfdl1\ckpv.toml ^
+  -p inl-text -p inl-sparse --test gemma2_live --test qwen3_live --test sparse_live -- --ignored --test-threads=1
+```
+
+GPUs with compute capability 7.0+ do not need the patch script.
+
+dtype on sm_61: `auto` resolves to f32, which is the only sensible choice.
+Pascal has no fast f16 path (Qwen3-Embedding-0.6B, `bench_text --count 256
+--length 128 --batch-size 32`: f32 10.0 chunks/s, f16 0.55 chunks/s) and no
+bf16 kernels (`CUDA_ERROR_NOT_FOUND, named symbol not found`).
+
+Live goldens with `INL_TEST_DEVICE=cuda` (2026-11-10): `gemma2_live` 2/2,
+`qwen3_live` 1/1 (cosine CPU vs CUDA 1.0000002 / 0.99999964), `sparse_live`
+4/4 (CUDA f32 16.4 chunks/s, f16 1.5, bf16 unavailable), `inl-vision --test
+engine` 1/1 (cosines >= 0.9999997).
 
 ## Model cache and `INL_TEST_DEVICE`
 
 The engines cache models under `HF_HOME` when set, else
-`~/.cache/im-not-llm/models`. **Populate that cache before running the live
-tests.** If two live tests start at once on a cold cache they race: one
-download wins, the other's `model.safetensors` fetch fails and the loader
-falls through to `model.safetensors.index.json`, which does not exist for a
-single-file checkpoint, and the test dies with a 404
-(`native model weights download failed (model.safetensors.index.json)`). Set
-`HF_HOME` to a populated cache (or pass `--test-threads=1` on a cold one).
-
-Pre-populate with `huggingface_hub`:
+`~/.cache/im-not-llm/models` (the vision engine included). Concurrent first
+uses of one cache download each file once: `inl_core::hub` takes a per-file
+lock and the waiters read what the holder downloaded. A 404 for
+`model.safetensors` is the only thing that sends the loader looking for a
+sharded `model.safetensors.index.json`; any other failure is reported as
+itself. Pre-populating with `huggingface_hub` saves time on the first run:
 
 ```python
 from huggingface_hub import snapshot_download
@@ -192,10 +221,9 @@ order of magnitude on CPU (1.4 chunks/s for its longer 900-char chunks).
 
 ## Known issues
 
-* `qwen3_live` is macOS-only (CPU vs Metal); it cannot be run on gpu01 or
-  Windows at all.
-* The live-test model download races on a cold cache (see above).
-* Windows CUDA needs a Visual Studio host compiler + the MSVC Rust toolchain,
-  neither currently installed.
+* `qwen3_live` compares CPU against `INL_TEST_DEVICE` (default `auto`); on a
+  CPU-only build it compares the CPU with itself.
+* sm_6x CUDA builds need `scripts/patch_candle_kernels_pre_volta.py` (see
+  windows above).
 * gpu01's `/data` is NFS: put cargo state, build dirs and the CUDA toolkit on
   local disk or everything takes an order of magnitude longer.
