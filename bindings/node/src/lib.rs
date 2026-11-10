@@ -491,6 +491,9 @@ pub struct EngineOptions {
     pub max_length: Option<u32>,
     /// Model cache directory (else the shared `HF_HOME` cache).
     pub cache_dir: Option<String>,
+    /// Multimodal only: towers to load, from `text`, `image`, `video` and
+    /// `audio`; omitted loads every tower the checkpoint has.
+    pub modalities: Option<Vec<String>>,
 }
 
 /// Loopback server settings for [`Daemon::spawn`].
@@ -651,6 +654,11 @@ fn build_engine(options: &EngineOptions, kind: EngineKind) -> InlResult<Engine> 
                 multimodal.max_length = value as usize;
             }
             multimodal.cache_dir = options.cache_dir.clone().map(PathBuf::from);
+            multimodal.modalities = options
+                .modalities
+                .as_deref()
+                .map(inl_core::Modality::parse_list)
+                .transpose()?;
             Ok(Engine::multimodal(Arc::new(
                 inl_vision::MultimodalEmbedder::new(multimodal),
             )))

@@ -170,6 +170,8 @@ export interface EngineOptions {
   maxLength?: number
   /** Model cache directory (else the shared `HF_HOME` cache). */
   cacheDir?: string
+  /** Multimodal only: towers to load; omitted loads every tower the checkpoint has. */
+  modalities?: Array<'text' | 'image' | 'video' | 'audio'>
 }
 
 /** Loopback server settings for {@link Daemon.spawn}. */

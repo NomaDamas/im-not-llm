@@ -28,6 +28,9 @@ pub struct EngineArgs {
     pub dtype: Option<String>,
     /// Model cache directory; `None` is `INL_CACHE_DIR` / the per-user cache.
     pub cache_dir: Option<PathBuf>,
+    /// Multimodal towers to load (`text`, `image`, `video`, `audio`); `None`
+    /// loads every tower the checkpoint has.
+    pub modalities: Option<Vec<String>>,
 }
 
 impl EngineArgs {
@@ -103,6 +106,11 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
                 device: DeviceSpec::parse(args.device.as_deref())?,
                 dtype: DtypeSpec::parse(args.dtype.as_deref())?,
                 cache_dir: args.cache_dir.clone(),
+                modalities: args
+                    .modalities
+                    .as_deref()
+                    .map(inl_core::Modality::parse_list)
+                    .transpose()?,
                 ..inl_vision::MultimodalOptions::default()
             };
             Ok(Engine::multimodal(Arc::new(

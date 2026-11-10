@@ -1,8 +1,10 @@
-//! Multimodal (image / video) embedding for EmbeddingGemma 2.
+//! Multimodal (image / video / audio) embedding for EmbeddingGemma 2.
 //!
-//! [`MultimodalEmbedder`] loads the checkpoint once and embeds text, images and
-//! video into one shared space. It implements [`inl_core::MultimodalEngine`].
+//! [`MultimodalEmbedder`] loads the checkpoint once and embeds text, images,
+//! video and audio into one shared space. It implements
+//! [`inl_core::MultimodalEngine`].
 
+pub mod audio;
 pub mod engine;
 pub mod media;
 pub mod preprocess;

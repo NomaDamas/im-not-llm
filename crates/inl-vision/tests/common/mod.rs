@@ -81,6 +81,42 @@ pub fn video_golden() -> VideoGolden {
         .expect("golden_video.json parses")
 }
 
+#[derive(Deserialize)]
+pub struct AudioGolden {
+    pub audio: String,
+    pub samples: usize,
+    pub features: Stage,
+    pub feature_frames: usize,
+    pub feature_valid: usize,
+    pub tower: Stage,
+    pub tower_frames: usize,
+    pub tower_valid: usize,
+    pub audio_tokens: usize,
+    pub embedding: Vec<f32>,
+    pub interleaved_text: String,
+    pub interleaved_embedding: Vec<f32>,
+    pub long_seconds: f64,
+    pub long_tokens: usize,
+}
+
+pub fn audio_golden() -> AudioGolden {
+    serde_json::from_slice(&std::fs::read(fixture_dir().join("golden_audio.json")).unwrap())
+        .expect("golden_audio.json parses")
+}
+
+/// Largest absolute difference, smallest row cosine and largest reference
+/// magnitude of `actual` (all rows) against the sampled reference rows.
+pub fn compare_rows(actual: &[Vec<f32>], expected: &Stage) -> (f32, f32, f32) {
+    let reference = expected.to_rows();
+    let (mut worst, mut worst_cosine, mut magnitude) = (0.0f32, 1.0f32, 0.0f32);
+    for (i, &row) in expected.rows.iter().enumerate() {
+        worst = worst.max(max_abs_diff(&actual[row], &reference[i]));
+        worst_cosine = worst_cosine.min(cosine(&actual[row], &reference[i]));
+        magnitude = reference[i].iter().fold(magnitude, |m, v| m.max(v.abs()));
+    }
+    (worst, worst_cosine, magnitude)
+}
+
 pub fn video_bytes(name: &str) -> Vec<u8> {
     std::fs::read(fixture_dir().join(name)).unwrap()
 }

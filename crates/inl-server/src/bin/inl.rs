@@ -86,6 +86,11 @@ struct ServeArgs {
     /// on `POST /v1/embeddings`.
     #[arg(long)]
     multimodal: bool,
+    /// With `--multimodal`: the towers to load, comma-separated from `text`,
+    /// `image`, `video` and `audio` (default: every tower the checkpoint has).
+    /// A modality left out is not loaded and is refused with 422.
+    #[arg(long, value_delimiter = ',', requires = "multimodal")]
+    modalities: Option<Vec<String>>,
 }
 
 impl ServeArgs {
@@ -99,6 +104,7 @@ impl ServeArgs {
             device: self.device.clone(),
             dtype: self.dtype.clone(),
             cache_dir: None,
+            modalities: self.modalities.clone(),
         }
     }
 }
@@ -140,6 +146,7 @@ impl DiscoverArgs {
             device: self.device.clone(),
             dtype: self.dtype.clone(),
             cache_dir: None,
+            modalities: None,
         };
         if let Some(state_dir) = &self.state_dir {
             return Ok(DaemonClient::from_state_dir(state_dir));

@@ -1661,10 +1661,14 @@ async fn embed_multimodal(
     }
 }
 
-/// An engine failure as an HTTP error. A deadline means the model's thread is
-/// stuck for good, so the server also schedules its own shutdown.
+/// An engine failure as an HTTP error. Input the engine refused (media it
+/// cannot decode) is the caller's error; a deadline means the model's thread
+/// is stuck for good, so the server also schedules its own shutdown.
 fn engine_error(state: &AppState, error: InlError) -> ApiError {
     match error {
+        InlError::InvalidInput(_) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         InlError::Timeout(_) => {
             state.set_status(STATUS_STOPPING);
             state.wedged.notify_one();

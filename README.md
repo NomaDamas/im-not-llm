@@ -1,7 +1,7 @@
 # im-not-llm
 
 On-device inference for models that are **not** LLMs: dense text embeddings,
-learned-sparse (SPLADE) encoders, and multimodal (image / video) embeddings.
+learned-sparse (SPLADE) encoders, and multimodal (image / video / audio) embeddings.
 Rust on [candle](https://github.com/huggingface/candle), CPU / Metal / CUDA.
 
 Use it three ways, all backed by the same engines:
@@ -19,7 +19,7 @@ Use it three ways, all backed by the same engines:
 | `Qwen/Qwen3-Embedding-0.6B` | `inl-text` | 1024-d dense | f16 on Metal by default, f32 elsewhere |
 | `google/embeddinggemma-2` (text) | `inl-text` | 768-d dense | f32 or bf16 only (f16 overflows to NaN); Matryoshka 128/256/512/768 |
 | `nlpai-lab/KURE-Sparse-nano` | `inl-sparse` | 36282-term sparse | f32 on every device (f16 changes which terms clear the threshold) |
-| `google/embeddinggemma-2` (image, video, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | audio is not supported |
+| `google/embeddinggemma-2` (image, video, audio, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | f32 or bf16 (bf16 on a GPU only); never f16 |
 
 Every model is checked against its Hugging Face reference with golden tests
 (`crates/*/tests`); the tolerances are the ones in the tests.
@@ -42,7 +42,8 @@ cargo build --release -p inl-server --bin inl
 
 inl serve                         # Qwen3-Embedding-0.6B, dense
 inl serve --sparse                # KURE-Sparse-nano
-inl serve --multimodal            # EmbeddingGemma 2: text + image + video
+inl serve --multimodal            # EmbeddingGemma 2: text + image + video + audio
+inl serve --multimodal --modalities text,audio   # load only the towers listed
 inl serve --model <repo-or-dir> --device cuda --dtype bf16
 
 inl health --multimodal           # prints /health JSON; exit 0 only when status is "ok"
@@ -74,7 +75,7 @@ Windows). The server binds loopback only: it has no authentication.
 
 Errors are JSON `{"error", "error_type"}`: 400 for undecodable base64, 413 for
 oversized requests, 422 for a modality the engine does not list (for example
-audio) or an input with no text and no media.
+one left out with `--modalities`) or an input with no text and no media.
 
 `/health` reports `status` (`loading` · `ok` · `stopping`), `kind`, `model_id`,
 `dimension`, `dtype`, `device`, `attention`, `max_length`, `modalities`,
@@ -83,17 +84,23 @@ audio) or an input with no text and no media.
 
 ### Multimodal input
 
-EmbeddingGemma 2 puts text, images and video in one 768-d space, so a text query
-can be scored against image embeddings. Media inside a text input are placed by
-`<|image|>` / `<|video|>` placeholders, consumed in order:
+EmbeddingGemma 2 puts text, images, video and audio in one 768-d space, so a
+text query can be scored against image or audio embeddings. Media inside a
+text input are placed by `<|image|>` / `<|video|>` / `<|audio|>`
+placeholders, consumed in order:
 
 ```json
 {"inputs": [{"text": "A gradient picture: <|image|> with a blue box.", "images": ["<base64 png>"]}]}
 ```
 
-An input with only one image and no text is embedded as that image alone.
-Video is decoded with `ffmpeg` (on `PATH`, or `INL_FFMPEG`) at 1 frame per
-second. Image token budget (70 / 140 / 280 / 560 / 1120) trades speed for detail.
+An input with media and no text is embedded as its items alone (one
+placeholder per item, images then videos then audio, as the reference
+processor joins them). Video is decoded with `ffmpeg` (on `PATH`, or
+`INL_FFMPEG`) at 1 frame per second; audio (WAV, MP3, FLAC, ... anything
+`ffmpeg` reads) is resampled to 16 kHz mono and cut at 30 s (750 soft tokens,
+one per 40 ms). Image token budget (70 / 140 / 280 / 560 / 1120) trades speed
+for detail. `--modalities` (Node: `modalities`) skips loading the vision tower
+(no `image`, no `video`) or the audio tower (no `audio`) and their memory.
 
 ## Programmatic lifecycle
 
@@ -146,7 +153,7 @@ after a timeout every later call in that process fails fast: restart the process
 crates/inl-core     device/dtype selection, Hugging Face hub client, attention, deadlines, engine traits
 crates/inl-text     Qwen3-Embedding, EmbeddingGemma 2 text
 crates/inl-sparse   ModernBERT + SPLADE pooling (KURE-Sparse-nano)
-crates/inl-vision   EmbeddingGemma 2 vision tower, image/video preprocessing, multimodal merge
+crates/inl-vision   EmbeddingGemma 2 vision + audio towers, image/video/audio preprocessing, multimodal merge
 crates/inl-server   daemon library, `inl` CLI, lifecycle client
 bindings/node       Node-API addon
 ```
@@ -157,7 +164,7 @@ bindings/node       Node-API addon
 |---|---|
 | `HF_HOME`, `HF_ENDPOINT`, `HF_TOKEN` | Hugging Face cache, mirror and token |
 | `INL_CACHE_DIR` | model cache when `HF_HOME` is unset (`~/.cache/im-not-llm/models`) |
-| `INL_FFMPEG` | `ffmpeg` binary for video |
+| `INL_FFMPEG` | `ffmpeg` binary for video and audio |
 | `INL_TEST_DEVICE` | `cpu` / `metal` / `cuda` for the ignored live tests |
 
 ## Tests

@@ -2,7 +2,7 @@
 //! their own crates (`inl-text`, `inl-sparse`, `inl-vision`) and implement
 //! these; `inl-server` only ever sees the traits.
 
-use crate::error::Result;
+use crate::error::{InlError, Result};
 use async_trait::async_trait;
 
 /// What a loaded engine reports about itself. Also the body of `/health`'s
@@ -41,6 +41,25 @@ impl Modality {
             Self::Video => "video",
             Self::Audio => "audio",
         }
+    }
+
+    /// Parse modality names (`text`, `image`, `video`, `audio`), as a
+    /// `--modalities` flag or a binding option gives them.
+    pub fn parse_list<S: AsRef<str>>(names: &[S]) -> Result<Vec<Self>> {
+        names
+            .iter()
+            .map(|name| {
+                let name = name.as_ref().trim();
+                [Self::Text, Self::Image, Self::Video, Self::Audio]
+                    .into_iter()
+                    .find(|modality| modality.as_str() == name)
+                    .ok_or_else(|| {
+                        InlError::Config(format!(
+                            "unknown modality {name:?}: expected text, image, video or audio"
+                        ))
+                    })
+            })
+            .collect()
     }
 }
 

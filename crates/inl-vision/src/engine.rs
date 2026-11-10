@@ -1,13 +1,15 @@
-//! The EmbeddingGemma 2 multimodal embedder: image (and video) soft tokens
-//! interleaved into the text tower, behind [`MultimodalEngine`].
+//! The EmbeddingGemma 2 multimodal embedder: image, video and audio soft
+//! tokens interleaved into the text tower, behind [`MultimodalEngine`].
 //!
 //! The text tower is `inl-text`'s EmbeddingGemma 2 (its `language_model.*`
 //! weights, mean pooling, `512 -> 768` projection, L2 norm). This module adds
-//! the vision tower (`vision_tower.*`), the projection into text space
-//! (`embed_vision.*`), the `<|image|>` / `<|video|>` placeholder expansion the
-//! reference processor performs, and the `masked_scatter` merge that overwrites
-//! the placeholder rows with the soft tokens.
+//! the vision tower (`vision_tower.*`, `embed_vision.*`), the audio tower
+//! (`audio_tower.*`, `embed_audio.*`), the `<|image|>` / `<|video|>` /
+//! `<|audio|>` placeholder expansion the reference processor performs, and the
+//! `masked_scatter` merge that overwrites the placeholder rows with the soft
+//! tokens.
 
+use crate::audio::{self, AudioConfig, AudioFeatures, AudioTower};
 use crate::preprocess::{self, PreprocessedImage};
 use crate::video;
 use crate::vision::{AttentionImpl, VisionBatch, VisionConfig, VisionTower};
@@ -63,6 +65,11 @@ pub struct MultimodalOptions {
     pub video_max_soft_tokens: usize,
     /// Frames per second captured from a video.
     pub video_fps: f64,
+    /// Towers to load besides the text tower (always loaded): `None` loads
+    /// every tower the checkpoint has. Leaving out both image and video skips
+    /// the vision tower and its weights; leaving out audio skips the audio
+    /// tower. A modality left out is rejected as input.
+    pub modalities: Option<Vec<Modality>>,
     /// Matryoshka output dimension (one of 128, 256, 512, 768).
     pub output_dim: Option<usize>,
     /// Items per forward pass: inputs per text-tower pass, images/frames per
@@ -90,6 +97,7 @@ impl Default for MultimodalOptions {
             max_soft_tokens: DEFAULT_MAX_SOFT_TOKENS,
             video_max_soft_tokens: DEFAULT_VIDEO_MAX_SOFT_TOKENS,
             video_fps: video::DEFAULT_FPS,
+            modalities: None,
             output_dim: None,
             batch_size: DEFAULT_BATCH_SIZE,
             max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
@@ -140,6 +148,11 @@ impl MultimodalOptions {
         self
     }
 
+    pub fn with_modalities(mut self, modalities: Vec<Modality>) -> Self {
+        self.modalities = Some(modalities);
+        self
+    }
+
     pub fn with_output_dim(mut self, dim: usize) -> Self {
         self.output_dim = Some(dim);
         self
@@ -179,14 +192,31 @@ impl MultimodalOptions {
     }
 }
 
-/// The special tokens and ids the placeholder expansion needs.
+/// Which placeholder a media kind uses; indexes [`SpecialTokens::kinds`].
+const IMAGE: usize = 0;
+const VIDEO: usize = 1;
+const AUDIO: usize = 2;
+
+/// One media kind's placeholder token, the tokens bracketing an expanded
+/// block of it, and the placeholder's id.
+struct Placeholder {
+    token: String,
+    open: String,
+    close: String,
+    id: u32,
+}
+
+impl Placeholder {
+    /// `open` + `count` placeholder tokens + `close`.
+    fn block(&self, count: usize) -> String {
+        format!("{}{}{}", self.open, self.token.repeat(count), self.close)
+    }
+}
+
+/// The special tokens the placeholder expansion needs, by [`IMAGE`],
+/// [`VIDEO`] and [`AUDIO`].
 struct SpecialTokens {
-    image: String,
-    boi: String,
-    eoi: String,
-    video: String,
-    image_id: u32,
-    video_id: u32,
+    kinds: [Placeholder; 3],
 }
 
 impl SpecialTokens {
@@ -207,40 +237,39 @@ impl SpecialTokens {
                 .map(|v| v as u32)
                 .ok_or_else(|| InlError::Inference(format!("config.json has no {key:?}")))
         };
-        let tokens = Self {
-            image: string("image_token")?,
-            boi: string("boi_token")?,
-            eoi: string("eoi_token")?,
-            video: string("video_token")?,
-            image_id: id("image_token_id")?,
-            video_id: id("video_token_id")?,
-        };
-        for (text, expected) in [
-            (&tokens.image, tokens.image_id),
-            (&tokens.video, tokens.video_id),
-        ] {
-            match tokenizer.token_to_id(text) {
-                Some(found) if found == expected => {}
-                other => {
-                    return Err(InlError::Inference(format!(
-                        "tokenizer maps {text:?} to {other:?}, expected id {expected}"
-                    )))
+        let placeholder =
+            |token: &str, open: &str, close: &str, id_key: &str| -> Result<Placeholder> {
+                let placeholder = Placeholder {
+                    token: string(token)?,
+                    open: string(open)?,
+                    close: string(close)?,
+                    id: id(id_key)?,
+                };
+                match tokenizer.token_to_id(&placeholder.token) {
+                    Some(found) if found == placeholder.id => Ok(placeholder),
+                    other => Err(InlError::Inference(format!(
+                        "tokenizer maps {:?} to {other:?}, expected id {}",
+                        placeholder.token, placeholder.id
+                    ))),
                 }
-            }
-        }
-        Ok(tokens)
-    }
-
-    /// `boi` + `count` placeholder tokens + `eoi`.
-    fn block(&self, placeholder: &str, count: usize) -> String {
-        format!("{}{}{}", self.boi, placeholder.repeat(count), self.eoi)
+            };
+        Ok(Self {
+            kinds: [
+                placeholder("image_token", "boi_token", "eoi_token", "image_token_id")?,
+                placeholder("video_token", "boi_token", "eoi_token", "video_token_id")?,
+                placeholder("audio_token", "boa_token", "eoa_token", "audio_token_id")?,
+            ],
+        })
     }
 }
 
 /// Everything the forward pass needs, built once per load.
 struct Loaded {
     text: inl_text::Gemma2Embedder,
-    vision: VisionTower,
+    /// `None` when neither images nor video were asked for.
+    vision: Option<VisionTower>,
+    /// `None` when audio was not asked for.
+    audio: Option<AudioTower>,
     tokenizer: Tokenizer,
     tokens: SpecialTokens,
     device: Device,
@@ -286,35 +315,81 @@ impl Loaded {
         let text_hidden = text.hidden_size();
 
         let config_bytes = std::fs::read(source.fetch("config.json")?)?;
-        let vision_config = VisionConfig::parse(&config_bytes)?;
-        let weights = source.weight_files()?;
-        // SAFETY: the safetensors files are not modified while the model is loaded.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, &device) }
-            .map_err(|e| InlError::Inference(format!("vision weight load failed: {e}")))?;
-        let vision = VisionTower::new(vision_config, text_hidden, vb)
-            .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?
-            .with_attention(options.attention)?;
+        let wants = |modality: Modality| {
+            options
+                .modalities
+                .as_ref()
+                .is_none_or(|list| list.contains(&modality))
+        };
+        let audio_config = match (wants(Modality::Audio), AudioConfig::parse(&config_bytes)?) {
+            (true, Some(config)) => Some(config),
+            (true, None) if options.modalities.is_some() => {
+                return Err(InlError::Config(format!(
+                    "{} has no audio tower",
+                    options.id
+                )))
+            }
+            _ => None,
+        };
+        let wants_vision = wants(Modality::Image) || wants(Modality::Video);
+        let mut vision = None;
+        let mut audio = None;
+        if wants_vision || audio_config.is_some() {
+            let weights = source.weight_files()?;
+            // SAFETY: the safetensors files are not modified while the model is loaded.
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights, dtype, &device) }
+                .map_err(|e| InlError::Inference(format!("media weight load failed: {e}")))?;
+            if wants_vision {
+                let config = VisionConfig::parse(&config_bytes)?;
+                vision = Some(
+                    VisionTower::new(config, text_hidden, vb.clone())
+                        .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?
+                        .with_attention(options.attention)?,
+                );
+            }
+            if let Some(config) = audio_config {
+                audio = Some(
+                    AudioTower::new(config, text_hidden, vb)
+                        .map_err(|e| InlError::Inference(format!("audio build failed: {e}")))?,
+                );
+            }
+        }
 
         let tokenizer = Tokenizer::from_file(source.fetch("tokenizer.json")?)
             .map_err(|e| InlError::Inference(format!("tokenizer parse failed: {e}")))?;
         let tokens = SpecialTokens::load(&config_bytes, &source, &tokenizer)?;
 
+        let mut modalities = vec![Modality::Text];
+        if vision.is_some() {
+            modalities.extend(
+                [Modality::Image, Modality::Video]
+                    .into_iter()
+                    .filter(|&m| wants(m)),
+            );
+        }
+        if audio.is_some() {
+            modalities.push(Modality::Audio);
+        }
         let info = EngineInfo {
             model_id: options.id.clone(),
             dimension: options.output_dim.unwrap_or(FULL_DIM),
             dtype: dtype_name(dtype).to_string(),
             device: device_label(&device),
-            attention: match vision.attention_impl() {
-                AttentionImpl::MetalSdpa => "fused",
-                AttentionImpl::Tiled => "tiled",
+            // The vision tower's is the one choice made; the text tower's
+            // EmbeddingGemma 2 attention is always eager.
+            attention: match vision.as_ref().map(VisionTower::attention_impl) {
+                Some(AttentionImpl::MetalSdpa) => "fused",
+                Some(AttentionImpl::Tiled) => "tiled",
+                None => "eager",
             }
             .to_string(),
             max_length: options.max_length,
-            modalities: vec![Modality::Text, Modality::Image, Modality::Video],
+            modalities,
         };
         Ok(Self {
             text,
             vision,
+            audio,
             tokenizer,
             tokens,
             device,
@@ -325,21 +400,34 @@ impl Loaded {
         })
     }
 
-    /// Decode every image and video frame of `inputs` (CPU work: image
-    /// decoding, resampling, `ffmpeg`), recording where each input's media sit.
-    fn decode_media(&self, inputs: &[MultimodalInput]) -> Result<(Vec<MediaItem>, Vec<InputMedia>)> {
-        let mut items = Vec::new();
-        let mut layout = Vec::with_capacity(inputs.len());
+    /// Decode every image, video frame and audio clip of `inputs` (CPU work:
+    /// image decoding, resampling, `ffmpeg`, log-mel), recording where each
+    /// input's media sit.
+    fn decode_media(&self, inputs: &[MultimodalInput]) -> Result<DecodedMedia> {
+        let mut decoded = DecodedMedia {
+            items: Vec::new(),
+            clips: Vec::new(),
+            layout: Vec::with_capacity(inputs.len()),
+        };
         for input in inputs {
-            if !input.audios.is_empty() {
-                return Err(InlError::InvalidInput(
-                    "audio is not supported by this build".to_string(),
-                ));
+            for (count, modality) in [
+                (input.images.len(), Modality::Image),
+                (input.videos.len(), Modality::Video),
+                (input.audios.len(), Modality::Audio),
+            ] {
+                if count > 0 && !self.info.modalities.contains(&modality) {
+                    return Err(InlError::InvalidInput(format!(
+                        "this engine was loaded without {} support",
+                        modality.as_str()
+                    )));
+                }
             }
             let mut media = InputMedia {
                 images: Vec::with_capacity(input.images.len()),
                 videos: Vec::with_capacity(input.videos.len()),
+                audios: Vec::with_capacity(input.audios.len()),
             };
+            let items = &mut decoded.items;
             let budget = self.options.max_soft_tokens;
             for image in &input.images {
                 media.images.push(items.len());
@@ -351,7 +439,8 @@ impl Loaded {
             let budget = self.options.video_max_soft_tokens;
             let max_frames = (self.options.max_length / (budget + 2)).max(1);
             for video in &input.videos {
-                let frames = video::extract_frames(&video.bytes, self.options.video_fps, max_frames)?;
+                let frames =
+                    video::extract_frames(&video.bytes, self.options.video_fps, max_frames)?;
                 if frames.is_empty() {
                     return Err(InlError::InvalidInput(
                         "the video decoded to zero frames".to_string(),
@@ -365,9 +454,15 @@ impl Loaded {
                     });
                 }
             }
-            layout.push(media);
+            for clip in &input.audios {
+                media.audios.push(decoded.clips.len());
+                decoded
+                    .clips
+                    .push(audio::log_mel(&audio::decode(&clip.bytes)?)?);
+            }
+            decoded.layout.push(media);
         }
-        Ok((items, layout))
+        Ok(decoded)
     }
 
     /// One vision pass over `frames` (all with the same `output_length`),
@@ -379,6 +474,10 @@ impl Loaded {
         frames: &[&PreprocessedImage],
         output_length: usize,
     ) -> Result<Vec<SoftTokens>> {
+        let vision = self
+            .vision
+            .as_ref()
+            .expect("images and video decode only when the vision tower is loaded");
         let batch = frames.len();
         let patches = frames
             .iter()
@@ -400,15 +499,19 @@ impl Loaded {
             Tensor::from_vec(pixels, (batch, patches, row), &self.device)
                 .and_then(|tensor| tensor.to_dtype(self.dtype)),
         )?;
-        let position_ids = infer(Tensor::from_vec(positions, (batch, patches, 2), &self.device))?;
+        let position_ids = infer(Tensor::from_vec(
+            positions,
+            (batch, patches, 2),
+            &self.device,
+        ))?;
         let padding = infer(Tensor::from_vec(padding, (batch, patches), &self.device))?;
-        let output = infer(self.vision.forward(VisionBatch {
+        let output = infer(vision.forward(VisionBatch {
             pixel_values: &pixel_values,
             position_ids: &position_ids,
             padding: &padding,
             output_length,
         }))?;
-        let soft = infer(self.vision.embed_vision(&output.hidden))?;
+        let soft = infer(vision.embed_vision(&output.hidden))?;
         let flat: Vec<f32> = infer(
             soft.to_dtype(DType::F32)
                 .and_then(|tensor| tensor.flatten_all())
@@ -427,48 +530,97 @@ impl Loaded {
             .collect())
     }
 
+    /// One audio pass over `clips`, padded to the longest: padding sits after
+    /// every real frame and each tower frame sees only earlier frames, so the
+    /// real rows are what each clip gives alone. Padding rows are dropped.
+    fn run_audio(&self, clips: &[&AudioFeatures]) -> Result<Vec<SoftTokens>> {
+        let tower = self
+            .audio
+            .as_ref()
+            .expect("audio decodes only when the audio tower is loaded");
+        let output = infer(tower.forward(clips))?;
+        let soft = infer(
+            tower
+                .embed_audio(&output.hidden)
+                .and_then(|tensor| tensor.to_dtype(DType::F32)),
+        )?;
+        let frames = infer(soft.dim(1))?;
+        let flat: Vec<f32> = infer(soft.flatten_all().and_then(|tensor| tensor.to_vec1()))?;
+        Ok(output
+            .valid
+            .iter()
+            .enumerate()
+            .map(|(row, &tokens)| {
+                let start = row * frames * self.text_hidden;
+                SoftTokens {
+                    rows: flat[start..start + tokens * self.text_hidden].to_vec(),
+                    tokens,
+                }
+            })
+            .collect())
+    }
+
     /// Expand the placeholders of one input for its soft tokens, tokenize it
-    /// and gather the soft-token rows in placeholder order.
+    /// and gather the soft-token rows in placeholder order. `vision` holds the
+    /// soft tokens of the decoded images and frames, `audio` of the clips.
     fn prepare_text(
         &self,
         input: &MultimodalInput,
         media: &InputMedia,
-        soft: &[SoftTokens],
+        vision: &[SoftTokens],
+        audio: &[SoftTokens],
     ) -> Result<PreparedText> {
-        // The text (an image-only input is just the image placeholder).
-        let text = match (&input.text, input.images.len(), input.videos.len()) {
-            (Some(text), _, _) => text.clone(),
-            (None, 1, 0) => self.tokens.image.clone(),
-            (None, 0, 1) => self.tokens.video.clone(),
-            (None, 0, 0) => String::new(),
-            (None, _, _) => {
-                return Err(InlError::InvalidInput(
-                    "a multimodal input with no text must carry exactly one media item".to_string(),
-                ))
-            }
+        let kinds = &self.tokens.kinds;
+        // With no text the reference joins one placeholder per item with
+        // spaces: images, then videos, then audio.
+        let text = match &input.text {
+            Some(text) => text.clone(),
+            None => [
+                (IMAGE, input.images.len()),
+                (VIDEO, input.videos.len()),
+                (AUDIO, input.audios.len()),
+            ]
+            .into_iter()
+            .flat_map(|(kind, count)| std::iter::repeat_n(kinds[kind].token.as_str(), count))
+            .collect::<Vec<_>>()
+            .join(" "),
         };
 
-        let image_replacements: Vec<String> = media
-            .images
-            .iter()
-            .map(|&item| self.tokens.block(&self.tokens.image, soft[item].tokens))
-            .collect();
-        let video_replacements: Vec<String> = media
+        // The soft tokens of each kind in placeholder order, and one
+        // replacement per item (a video's is a block per frame).
+        let images: Vec<&SoftTokens> = media.images.iter().map(|&i| &vision[i]).collect();
+        let videos: Vec<&[SoftTokens]> = media
             .videos
             .iter()
-            .map(|&(first, frames)| {
-                soft[first..first + frames]
-                    .iter()
-                    .map(|frame| self.tokens.block(&self.tokens.video, frame.tokens))
-                    .collect()
-            })
+            .map(|&(first, frames)| &vision[first..first + frames])
             .collect();
+        let audios: Vec<&SoftTokens> = media.audios.iter().map(|&i| &audio[i]).collect();
+        let replacements: [Vec<String>; 3] = [
+            images
+                .iter()
+                .map(|soft| kinds[IMAGE].block(soft.tokens))
+                .collect(),
+            videos
+                .iter()
+                .map(|frames| {
+                    frames
+                        .iter()
+                        .map(|soft| kinds[VIDEO].block(soft.tokens))
+                        .collect()
+                })
+                .collect(),
+            audios
+                .iter()
+                .map(|soft| kinds[AUDIO].block(soft.tokens))
+                .collect(),
+        ];
         let expanded = expand(
             &text,
-            &self.tokens.image,
-            &self.tokens.video,
-            &image_replacements,
-            &video_replacements,
+            &[
+                (kinds[IMAGE].token.as_str(), replacements[IMAGE].as_slice()),
+                (kinds[VIDEO].token.as_str(), replacements[VIDEO].as_slice()),
+                (kinds[AUDIO].token.as_str(), replacements[AUDIO].as_slice()),
+            ],
         )?;
 
         let encoding = self
@@ -489,35 +641,27 @@ impl Loaded {
             )));
         }
 
-        let gather = |items: &mut dyn Iterator<Item = usize>| -> (Vec<f32>, usize) {
-            let mut rows = Vec::new();
-            let mut tokens = 0;
-            for item in items {
-                rows.extend_from_slice(&soft[item].rows);
-                tokens += soft[item].tokens;
+        let ordered: [Vec<&SoftTokens>; 3] = [
+            images,
+            videos.iter().flat_map(|frames| frames.iter()).collect(),
+            audios,
+        ];
+        let mut rows: [Vec<f32>; 3] = Default::default();
+        for (kind, soft) in ordered.iter().enumerate() {
+            let tokens: usize = soft.iter().map(|soft| soft.tokens).sum();
+            let seen = ids.iter().filter(|&&id| id == kinds[kind].id).count();
+            if seen != tokens {
+                return Err(InlError::InvalidInput(format!(
+                    "text has {seen} {} placeholders but the media produced {tokens} soft tokens",
+                    kinds[kind].token
+                )));
             }
-            (rows, tokens)
-        };
-        let (image_rows, image_tokens) = gather(&mut media.images.iter().copied());
-        let (video_rows, video_tokens) =
-            gather(&mut media.videos.iter().flat_map(|&(first, frames)| first..first + frames));
-        let image_seen = ids.iter().filter(|&&id| id == self.tokens.image_id).count();
-        let video_seen = ids.iter().filter(|&&id| id == self.tokens.video_id).count();
-        if image_seen != image_tokens {
-            return Err(InlError::InvalidInput(format!(
-                "text has {image_seen} image placeholders but the images produced {image_tokens} soft tokens"
-            )));
+            rows[kind] = soft
+                .iter()
+                .flat_map(|soft| soft.rows.iter().copied())
+                .collect();
         }
-        if video_seen != video_tokens {
-            return Err(InlError::InvalidInput(format!(
-                "text has {video_seen} video placeholders but the videos produced {video_tokens} soft tokens"
-            )));
-        }
-        Ok(PreparedText {
-            ids,
-            image_rows,
-            video_rows,
-        })
+        Ok(PreparedText { ids, rows })
     }
 
     /// One text-tower pass over prepared inputs, right-padded to the longest:
@@ -543,20 +687,18 @@ impl Loaded {
                 .and_then(|tensor| tensor.to_vec1()),
         )?;
 
+        let placeholder_ids = self.tokens.kinds.each_ref().map(|kind| kind.id);
         for (row, prepared) in batch.iter().enumerate() {
-            let (mut image_cursor, mut video_cursor) = (0usize, 0usize);
+            let mut cursors = [0usize; 3];
             for (pos, &id) in prepared.ids.iter().enumerate() {
-                let source = if id == self.tokens.image_id {
-                    image_cursor += hidden;
-                    &prepared.image_rows[image_cursor - hidden..image_cursor]
-                } else if id == self.tokens.video_id {
-                    video_cursor += hidden;
-                    &prepared.video_rows[video_cursor - hidden..video_cursor]
-                } else {
+                let Some(kind) = placeholder_ids.iter().position(|&p| p == id) else {
                     continue;
                 };
+                let start = cursors[kind];
+                cursors[kind] += hidden;
                 let dst = (row * seq + pos) * hidden;
-                embeds[dst..dst + hidden].copy_from_slice(source);
+                embeds[dst..dst + hidden]
+                    .copy_from_slice(&prepared.rows[kind][start..start + hidden]);
             }
         }
 
@@ -582,11 +724,23 @@ struct MediaItem {
     budget: usize,
 }
 
-/// Where one input's media sit in the decoded item list.
+/// The media of a chunk of inputs, decoded.
+struct DecodedMedia {
+    /// Images and video frames, for the vision tower.
+    items: Vec<MediaItem>,
+    /// Audio clips, for the audio tower.
+    clips: Vec<AudioFeatures>,
+    /// Per input, where its media sit in `items` and `clips`.
+    layout: Vec<InputMedia>,
+}
+
+/// Where one input's media sit in the decoded lists.
 struct InputMedia {
     images: Vec<usize>,
     /// `(first item, frames)` per video.
     videos: Vec<(usize, usize)>,
+    /// Indices into the clips.
+    audios: Vec<usize>,
 }
 
 /// One item's soft tokens in text space, `[tokens, text_hidden]` row-major.
@@ -595,11 +749,11 @@ struct SoftTokens {
     tokens: usize,
 }
 
-/// A tokenized input with its soft-token rows in placeholder order.
+/// A tokenized input with its soft-token rows in placeholder order, by
+/// [`IMAGE`], [`VIDEO`] and [`AUDIO`].
 struct PreparedText {
     ids: Vec<u32>,
-    image_rows: Vec<f32>,
-    video_rows: Vec<f32>,
+    rows: [Vec<f32>; 3],
 }
 
 /// Split `lengths` into passes of at most `max_items` items and at most
@@ -626,13 +780,19 @@ fn plan_batches(lengths: &[usize], max_items: usize, max_tokens: usize) -> Vec<V
 
 /// Vision passes over `items`: grouped by soft-token budget (one
 /// `output_length` per pass), then split by [`plan_batches`] on real patches.
-fn plan_vision(items: &[MediaItem], max_items: usize, max_tokens: usize) -> Vec<(usize, Vec<usize>)> {
+fn plan_vision(
+    items: &[MediaItem],
+    max_items: usize,
+    max_tokens: usize,
+) -> Vec<(usize, Vec<usize>)> {
     let mut budgets: Vec<usize> = items.iter().map(|item| item.budget).collect();
     budgets.sort_unstable();
     budgets.dedup();
     let mut passes = Vec::new();
     for budget in budgets {
-        let members: Vec<usize> = (0..items.len()).filter(|&i| items[i].budget == budget).collect();
+        let members: Vec<usize> = (0..items.len())
+            .filter(|&i| items[i].budget == budget)
+            .collect();
         let lengths: Vec<usize> = members.iter().map(|&i| items[i].pre.real_patches).collect();
         for batch in plan_batches(&lengths, max_items, max_tokens) {
             passes.push((budget, batch.into_iter().map(|j| members[j]).collect()));
@@ -641,58 +801,41 @@ fn plan_vision(items: &[MediaItem], max_items: usize, max_tokens: usize) -> Vec<
     passes
 }
 
-/// Expand the image/video placeholders the way the reference processor does,
-/// consuming the prebuilt replacements in text order.
-fn expand(
-    text: &str,
-    image_token: &str,
-    video_token: &str,
-    images: &[String],
-    videos: &[String],
-) -> Result<String> {
+/// Expand the placeholders the way the reference processor does: each
+/// `(placeholder, replacements)` kind consumes its replacements in text order.
+fn expand(text: &str, kinds: &[(&str, &[String])]) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut remaining = text;
-    let (mut image_index, mut video_index) = (0usize, 0usize);
+    let mut used = vec![0usize; kinds.len()];
     loop {
-        let next_image = remaining.find(image_token);
-        let next_video = remaining.find(video_token);
-        let (position, is_image) = match (next_image, next_video) {
-            (None, None) => {
-                out.push_str(remaining);
-                break;
-            }
-            (Some(p), None) => (p, true),
-            (None, Some(p)) => (p, false),
-            (Some(p), Some(q)) => (p.min(q), p <= q),
+        let next = kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(kind, (token, _))| remaining.find(token).map(|position| (position, kind)))
+            .min();
+        let Some((position, kind)) = next else {
+            out.push_str(remaining);
+            break;
         };
+        let (token, replacements) = kinds[kind];
         out.push_str(&remaining[..position]);
-        if is_image {
-            let replacement = images.get(image_index).ok_or_else(|| {
-                InlError::InvalidInput("more image placeholders than images".to_string())
-            })?;
-            out.push_str(replacement);
-            image_index += 1;
-            remaining = &remaining[position + image_token.len()..];
-        } else {
-            let replacement = videos.get(video_index).ok_or_else(|| {
-                InlError::InvalidInput("more video placeholders than videos".to_string())
-            })?;
-            out.push_str(replacement);
-            video_index += 1;
-            remaining = &remaining[position + video_token.len()..];
+        let replacement = replacements.get(used[kind]).ok_or_else(|| {
+            InlError::InvalidInput(format!(
+                "text has more {token} placeholders than media items ({})",
+                replacements.len()
+            ))
+        })?;
+        out.push_str(replacement);
+        used[kind] += 1;
+        remaining = &remaining[position + token.len()..];
+    }
+    for ((token, replacements), used) in kinds.iter().zip(used) {
+        if used != replacements.len() {
+            return Err(InlError::InvalidInput(format!(
+                "text has {used} {token} placeholders for {} media items",
+                replacements.len()
+            )));
         }
-    }
-    if image_index != images.len() {
-        return Err(InlError::InvalidInput(format!(
-            "text has {image_index} image placeholders for {} images",
-            images.len()
-        )));
-    }
-    if video_index != videos.len() {
-        return Err(InlError::InvalidInput(format!(
-            "text has {video_index} video placeholders for {} videos",
-            videos.len()
-        )));
     }
     Ok(out)
 }
@@ -755,10 +898,11 @@ impl MultimodalEmbedder {
     }
 
     /// Embed inputs, `batch_size` at a time. Their images and video frames
-    /// run through the vision tower in shared passes, then the merged
-    /// sequences through the text tower in shared passes; each pass holds at
-    /// most `batch_size` items and `max_batch_tokens` padded tokens (patches
-    /// for the vision tower). Every pass runs under
+    /// run through the vision tower in shared passes, their audio clips
+    /// through the audio tower, then the merged sequences through the text
+    /// tower; each pass holds at most `batch_size` items and
+    /// `max_batch_tokens` padded tokens (patches for the vision tower, soft
+    /// tokens for the audio tower). Every pass runs under
     /// [`MultimodalOptions::timeout_seconds`]; a pass that overruns cannot be
     /// cancelled, so after one every later call fails fast with
     /// [`InlError::Timeout`] until the process restarts.
@@ -771,10 +915,15 @@ impl MultimodalEmbedder {
         let mut out = Vec::with_capacity(inputs.len());
         let mut inputs = inputs.into_iter().peekable();
         while inputs.peek().is_some() {
-            let chunk: Arc<Vec<MultimodalInput>> = Arc::new(inputs.by_ref().take(max_items).collect());
+            let chunk: Arc<Vec<MultimodalInput>> =
+                Arc::new(inputs.by_ref().take(max_items).collect());
 
             // Decoding is CPU work (and ffmpeg), not a forward pass.
-            let (items, layout) = {
+            let DecodedMedia {
+                items,
+                clips,
+                layout,
+            } = {
                 let (loaded, chunk) = (loaded.clone(), chunk.clone());
                 blocking(move || loaded.decode_media(&chunk)).await?
             };
@@ -800,13 +949,34 @@ impl MultimodalEmbedder {
                 .map(|output| output.expect("every media item is in one vision pass"))
                 .collect();
 
+            let clips = Arc::new(clips);
+            let lengths: Vec<usize> = clips.iter().map(AudioFeatures::tokens).collect();
+            let mut heard: Vec<Option<SoftTokens>> = (0..clips.len()).map(|_| None).collect();
+            for members in plan_batches(&lengths, max_items, max_tokens) {
+                let (loaded, clips, pass) = (loaded.clone(), clips.clone(), members.clone());
+                let outputs = self
+                    .deadline
+                    .run(WHAT, budget, move || {
+                        let pass: Vec<&AudioFeatures> = pass.iter().map(|&i| &clips[i]).collect();
+                        loaded.run_audio(&pass)
+                    })
+                    .await?;
+                for (index, output) in members.into_iter().zip(outputs) {
+                    heard[index] = Some(output);
+                }
+            }
+            drop(clips);
+            let heard: Vec<SoftTokens> = heard
+                .into_iter()
+                .map(|output| output.expect("every clip is in one audio pass"))
+                .collect();
             let prepared = {
                 let (loaded, chunk) = (loaded.clone(), chunk.clone());
                 blocking(move || {
                     chunk
                         .iter()
                         .zip(&layout)
-                        .map(|(input, media)| loaded.prepare_text(input, media, &soft))
+                        .map(|(input, media)| loaded.prepare_text(input, media, &soft, &heard))
                         .collect::<Result<Vec<_>>>()
                 })
                 .await?
@@ -901,14 +1071,24 @@ mod tests {
     fn expand_consumes_media_in_order() {
         let images = vec!["I0".to_string(), "I1".to_string()];
         let videos = vec!["V0".to_string()];
-        let text = "a <|image|> b <|video|> c <|image|>";
-        let expanded = expand(text, "<|image|>", "<|video|>", &images, &videos).unwrap();
-        assert_eq!(expanded, "a I0 b V0 c I1");
+        let audios = vec!["A0".to_string()];
+        let text = "a <|image|> b <|audio|><|video|> c <|image|>";
+        let kinds = [
+            ("<|image|>", images.as_slice()),
+            ("<|video|>", videos.as_slice()),
+            ("<|audio|>", audios.as_slice()),
+        ];
+        assert_eq!(expand(text, &kinds).unwrap(), "a I0 b A0V0 c I1");
     }
 
     #[test]
-    fn expand_rejects_missing_media() {
-        let error = expand("x <|image|>", "<|image|>", "<|video|>", &[], &[]).unwrap_err();
+    fn expand_rejects_a_placeholder_media_mismatch() {
+        let none: &[String] = &[];
+        let one = ["A0".to_string()];
+        // A placeholder without its item, and an item without its placeholder.
+        let error = expand("x <|audio|>", &[("<|image|>", none), ("<|audio|>", none)]).unwrap_err();
+        assert_eq!(error.code(), "invalid_input");
+        let error = expand("x", &[("<|image|>", none), ("<|audio|>", &one)]).unwrap_err();
         assert_eq!(error.code(), "invalid_input");
     }
 

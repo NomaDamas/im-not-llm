@@ -28,7 +28,7 @@ fn ffprobe_binary() -> String {
         .unwrap_or_else(|| "ffprobe".to_string())
 }
 
-fn ensure_binary(name: &str) -> Result<()> {
+pub(crate) fn ensure_binary(name: &str) -> Result<()> {
     match Command::new(name)
         .arg("-version")
         .stdout(Stdio::null())

@@ -92,11 +92,13 @@ test('Daemon serves Qwen3-Embedding with an ok /health', { skip: !live }, async 
   assert.equal(await daemon.stop(), 'signal')
 })
 
-test('Daemon serves EmbeddingGemma 2 image + text embeddings that match the reference', { skip: !live }, async (t) => {
+test('Daemon serves EmbeddingGemma 2 image, audio and text embeddings that match the reference', { skip: !live }, async (t) => {
   const { readFileSync } = await import('node:fs')
   const fixtures = new URL('../../../crates/inl-vision/tests/fixtures/embeddinggemma2/', import.meta.url)
   const golden = JSON.parse(readFileSync(new URL('golden_vision.json', fixtures), 'utf8'))
+  const audioGolden = JSON.parse(readFileSync(new URL('golden_audio.json', fixtures), 'utf8'))
   const image = readFileSync(new URL('img_a.png', fixtures)).toString('base64')
+  const clip = readFileSync(new URL(audioGolden.audio, fixtures)).toString('base64')
 
   const dir = mkdtempSync(join(tmpdir(), 'inl-node-live-mm-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
@@ -104,6 +106,8 @@ test('Daemon serves EmbeddingGemma 2 image + text embeddings that match the refe
     kind: 'multimodal',
     model: 'google/embeddinggemma-2',
     dtype: 'f32',
+    // Video left out: its modality must be refused.
+    modalities: ['text', 'image', 'audio'],
     ...(device ? { device } : {}),
   }
   const daemon = await Daemon.spawn(engine, { stateDir: dir })
@@ -116,7 +120,7 @@ test('Daemon serves EmbeddingGemma 2 image + text embeddings that match the refe
   })
   const health = daemon.health()
   assert.equal(health.kind, 'multimodal')
-  assert.deepEqual(health.modalities, ['text', 'image', 'video'])
+  assert.deepEqual(health.modalities, ['text', 'image', 'audio'])
 
   const response = await fetch(`${daemon.url()}/embed_multimodal`, {
     method: 'POST',
@@ -141,7 +145,22 @@ test('Daemon serves EmbeddingGemma 2 image + text embeddings that match the refe
   const audio = await fetch(`${daemon.url()}/embed_multimodal`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ inputs: [{ audios: [image] }] }),
+    body: JSON.stringify({
+      inputs: [{ audios: [clip] }, { text: audioGolden.interleaved_text, audios: [clip] }],
+    }),
   })
-  assert.equal(audio.status, 422)
+  assert.equal(audio.status, 200)
+  const heard = (await audio.json()).embeddings
+  const audioCosine = cosine(heard[0], audioGolden.embedding)
+  const spokenCosine = cosine(heard[1], audioGolden.interleaved_embedding)
+  t.diagnostic(`audio cosine ${audioCosine.toFixed(8)}, text+audio cosine ${spokenCosine.toFixed(8)}`)
+  assert.ok(audioCosine > 0.9999, `audio embedding drifted: ${audioCosine}`)
+  assert.ok(spokenCosine > 0.9999, `text+audio embedding drifted: ${spokenCosine}`)
+
+  const video = await fetch(`${daemon.url()}/embed_multimodal`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ inputs: [{ videos: [image] }] }),
+  })
+  assert.equal(video.status, 422)
 })

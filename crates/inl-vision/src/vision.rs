@@ -209,8 +209,8 @@ impl AttentionImpl {
 
 /// `softmax(q k^T + mask) v` with scaling 1.0 over `q, k, v: [B, H, T, D]`.
 ///
-/// The additive `mask` keeps padding keys out of every real row; rows of
-/// padding queries are unspecified (the pooler strips them).
+/// The additive key `mask` (`[B, 1, 1, T]`) keeps padding keys out of every
+/// real row; rows of padding queries are unspecified (the pooler strips them).
 fn masked_attention(
     q: &Tensor,
     k: &Tensor,
@@ -232,8 +232,7 @@ fn masked_attention(
                 let rows = ATTENTION_TILE.min(seq - start);
                 let q_tile = q.narrow(2, start, rows)?.contiguous()?;
                 let scores = q_tile.matmul(&kt)?;
-                let mask_tile = mask.narrow(2, start, rows)?;
-                let weights = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask_tile)?)?;
+                let weights = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(mask)?)?;
                 blocks.push(weights.matmul(v)?);
                 start += rows;
             }
@@ -486,102 +485,71 @@ impl VisionTower {
         &self.cfg
     }
 
-    fn position_embeddings(&self, position_ids: &Tensor, padding: &Tensor) -> Result<Tensor> {
-        let (batch, patches, _) = position_ids.dims3()?;
-        let ids: Vec<i64> = position_ids.flatten_all()?.to_vec1()?;
-        let mut x_idx = Vec::with_capacity(batch * patches);
-        let mut y_idx = Vec::with_capacity(batch * patches);
-        for row in 0..batch * patches {
-            x_idx.push(ids[row * 2].max(0) as u32);
-            y_idx.push(ids[row * 2 + 1].max(0) as u32);
-        }
-        let x = Tensor::from_vec(x_idx, batch * patches, &self.device)?;
-        let y = Tensor::from_vec(y_idx, batch * patches, &self.device)?;
+    /// `x` and `y` position tables summed per patch, zero on padding rows.
+    /// `positions` is `position_ids` as f32; `keep` is `1 - padding`,
+    /// `[batch, patches, 1]` in the model dtype.
+    fn position_embeddings(&self, positions: &Tensor, keep: &Tensor) -> Result<Tensor> {
+        let (batch, patches, _) = positions.dims3()?;
+        // Padding rows are (-1, -1): clamp them onto row 0; `keep` zeroes them.
+        let index = |axis: usize| -> Result<Tensor> {
+            positions
+                .narrow(2, axis, 1)?
+                .flatten_all()?
+                .relu()?
+                .to_dtype(DType::U32)
+        };
         let x_table = self.position_table.narrow(0, 0, 1)?.squeeze(0)?;
         let y_table = self.position_table.narrow(0, 1, 1)?.squeeze(0)?;
-        let x_emb = x_table
-            .index_select(&x, 0)?
-            .reshape((batch, patches, self.cfg.hidden_size))?;
-        let y_emb = y_table
-            .index_select(&y, 0)?
-            .reshape((batch, patches, self.cfg.hidden_size))?;
-        let positions = (x_emb + y_emb)?;
-
-        let pad: Vec<f32> = padding.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        let keep: Vec<f32> = pad.iter().map(|&p| 1.0 - p).collect();
-        let keep = Tensor::from_vec(keep, (batch, patches, 1), &self.device)?
-            .to_dtype(self.dtype)?
-            .broadcast_as((batch, patches, self.cfg.hidden_size))?;
-        positions.broadcast_mul(&keep)
+        let x_emb = x_table.index_select(&index(0)?, 0)?;
+        let y_emb = y_table.index_select(&index(1)?, 0)?;
+        (x_emb + y_emb)?
+            .reshape((batch, patches, self.cfg.hidden_size))?
+            .broadcast_mul(keep)
     }
 
-    fn rope(&self, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
-        let dim = self.cfg.head_dim;
-        let spatial = dim / 2;
+    /// Axial RoPE tables `[batch, seq, head_dim]` from f32 `positions`, laid
+    /// out `[freq_x, freq_x, freq_y, freq_y]`.
+    fn rope(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+        let spatial = self.cfg.head_dim / 2;
         let theta = self.cfg.rope_parameters.rope_theta as f32;
         let inv_freq: Vec<f32> = (0..spatial / 2)
-            .map(|i| {
-                let exponent = (2 * i) as f32 / spatial as f32;
-                1.0f32 / theta.powf(exponent)
-            })
+            .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / spatial as f32))
             .collect();
         let freq = inv_freq.len();
-
-        let (batch, seq, _) = position_ids.dims3()?;
-        let ids: Vec<i64> = position_ids.flatten_all()?.to_vec1()?;
-        let mut cos = vec![0f32; batch * seq * dim];
-        let mut sin = vec![0f32; batch * seq * dim];
-        for row in 0..batch * seq {
-            let x = ids[row * 2] as f32;
-            let y = ids[row * 2 + 1] as f32;
-            let base = row * dim;
-            for j in 0..freq {
-                let cx = x * inv_freq[j];
-                let cy = y * inv_freq[j];
-                // [freq_h, freq_h, freq_w, freq_w] recomposition.
-                cos[base + j] = cx.cos();
-                cos[base + freq + j] = cx.cos();
-                cos[base + 2 * freq + j] = cy.cos();
-                cos[base + 3 * freq + j] = cy.cos();
-                sin[base + j] = cx.sin();
-                sin[base + freq + j] = cx.sin();
-                sin[base + 2 * freq + j] = cy.sin();
-                sin[base + 3 * freq + j] = cy.sin();
-            }
-        }
-        let cos = Tensor::from_vec(cos, (batch, seq, dim), &self.device)?.to_dtype(self.dtype)?;
-        let sin = Tensor::from_vec(sin, (batch, seq, dim), &self.device)?.to_dtype(self.dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, 1, freq), positions.device())?;
+        let x = positions.narrow(2, 0, 1)?.broadcast_mul(&inv_freq)?;
+        let y = positions.narrow(2, 1, 1)?.broadcast_mul(&inv_freq)?;
+        let (x_cos, x_sin, y_cos, y_sin) = (x.cos()?, x.sin()?, y.cos()?, y.sin()?);
+        let cos = Tensor::cat(&[&x_cos, &x_cos, &y_cos, &y_cos], 2)?.to_dtype(self.dtype)?;
+        let sin = Tensor::cat(&[&x_sin, &x_sin, &y_sin, &y_sin], 2)?.to_dtype(self.dtype)?;
         Ok((cos, sin))
     }
 
+    /// Additive key mask `[batch, 1, 1, seq]`: `MASKED` on padding keys.
     fn attention_mask(&self, padding: &Tensor) -> Result<Tensor> {
         let (batch, seq) = padding.dims2()?;
-        let pad: Vec<f32> = padding.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        let mut mask = vec![0f32; batch * seq * seq];
-        for row in 0..batch {
-            for key in 0..seq {
-                let value = if pad[row * seq + key] != 0.0 {
-                    MASKED
-                } else {
-                    0.0
-                };
-                let base = row * seq * seq + key;
-                for query in 0..seq {
-                    mask[base + query * seq] = value;
-                }
-            }
-        }
-        Tensor::from_vec(mask, (batch, 1, seq, seq), &self.device)?.to_dtype(self.dtype)
+        padding
+            .to_dtype(DType::F32)?
+            .affine(MASKED as f64, 0.0)?
+            .reshape((batch, 1, 1, seq))?
+            .to_dtype(self.dtype)
     }
 
     /// Run the encoder and pooler, then `embed_vision`.
     pub fn forward(&self, batch: VisionBatch<'_>) -> Result<VisionOutput> {
         let (batch_size, patches, _) = batch.pixel_values.dims3()?;
+        let positions = batch.position_ids.to_dtype(DType::F32)?;
+        let keep = batch
+            .padding
+            .to_dtype(DType::F32)?
+            .affine(-1.0, 1.0)?
+            .unsqueeze(2)?
+            .to_dtype(self.dtype)?;
         let scaled = batch.pixel_values.affine(2.0, -1.0)?;
         let mut hidden = scaled.apply(&self.patch_input_proj)?;
-        hidden = (hidden + self.position_embeddings(batch.position_ids, batch.padding)?)?;
+        hidden = (hidden + self.position_embeddings(&positions, &keep)?)?;
 
-        let (cos, sin) = self.rope(batch.position_ids)?;
+        let (cos, sin) = self.rope(&positions)?;
         let mask = self.attention_mask(batch.padding)?;
         for layer in &self.layers {
             hidden = layer.forward(&hidden, (&cos, &sin), &mask, self.attention)?;
@@ -609,6 +577,10 @@ impl VisionTower {
         normalized.apply(&self.embed_projection)
     }
 
+    /// Average each `k x k` block of patches into one soft token, scale by
+    /// `sqrt(hidden_size)` and keep the tokens that received patches. The slot
+    /// layout comes from the (small) position ids on the host; the hidden
+    /// states stay on the device (`index_add` + `index_select`).
     fn pool(
         &self,
         hidden: &Tensor,
@@ -621,11 +593,13 @@ impl VisionTower {
         let dim = self.cfg.hidden_size;
         let k = self.cfg.pooling_kernel_size;
 
-        let hidden_host: Vec<f32> = hidden.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let pad_host: Vec<f32> = padding.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let pos_host: Vec<i64> = position_ids.flatten_all()?.to_vec1()?;
 
-        let mut pooled = vec![0f32; batch * output_length * dim];
+        // Target slot of every patch; padding and out-of-budget patches go to
+        // a trailing discard slot.
+        let discard = (batch * output_length) as u32;
+        let mut slots = Vec::with_capacity(batch * patches);
         let mut counts = vec![0u32; batch * output_length];
         for row in 0..batch {
             let mut max_x = 0i64;
@@ -638,49 +612,44 @@ impl VisionTower {
                 let y = pos_host[(row * patches + p) * 2 + 1].max(0) as usize;
                 let idx = (x / k) + ncols * (y / k);
                 if idx >= output_length {
+                    slots.push(discard);
                     continue;
                 }
                 counts[row * output_length + idx] += 1;
-                // Padding rows carry zero hidden state already; skip their add.
-                if pad_host[row * patches + p] != 0.0 {
-                    continue;
-                }
-                let src = (row * patches + p) * dim;
-                let dst = (row * output_length + idx) * dim;
-                for c in 0..dim {
-                    pooled[dst + c] += hidden_host[src + c] / (k * k) as f32;
-                }
+                slots.push(if pad_host[row * patches + p] != 0.0 {
+                    discard
+                } else {
+                    (row * output_length + idx) as u32
+                });
             }
         }
-
-        // Scale by sqrt(hidden_size) in float32, then strip per-row by mask.
-        let scale = self.root_hidden_size as f32;
-        let mut rows = Vec::with_capacity(batch);
+        let mut selected = Vec::new();
         let mut tokens_per_row = Vec::with_capacity(batch);
         for row in 0..batch {
-            let mut tokens = 0usize;
+            let before = selected.len();
             for idx in 0..output_length {
                 if counts[row * output_length + idx] > 0 {
-                    tokens += 1;
+                    selected.push((row * output_length + idx) as u32);
                 }
             }
-            let mut selected = Vec::with_capacity(tokens * dim);
-            for idx in 0..output_length {
-                if counts[row * output_length + idx] > 0 {
-                    let base = (row * output_length + idx) * dim;
-                    selected.extend(pooled[base..base + dim].iter().map(|v| v * scale));
-                }
-            }
-            tokens_per_row.push(tokens);
-            rows.push(Tensor::from_vec(selected, (tokens, dim), &self.device)?);
+            tokens_per_row.push(selected.len() - before);
         }
-        let stacked = if rows.len() == 1 {
-            rows.pop().unwrap()
-        } else {
-            Tensor::cat(&rows, 0)?
-        };
+
+        let device = hidden.device();
+        let slots = Tensor::from_vec(slots, batch * patches, device)?;
+        let selected_len = selected.len();
+        let selected = Tensor::from_vec(selected, selected_len, device)?;
+        let sums = Tensor::zeros((batch * output_length + 1, dim), DType::F32, device)?.index_add(
+            &slots,
+            &hidden
+                .to_dtype(DType::F32)?
+                .reshape((batch * patches, dim))?,
+            0,
+        )?;
+        let scale = self.root_hidden_size / (k * k) as f64;
+        let tensor = sums.index_select(&selected, 0)?.affine(scale, 0.0)?;
         Ok(PooledOutput {
-            tensor: stacked,
+            tensor,
             tokens_per_row,
         })
     }
@@ -742,13 +711,9 @@ mod tests {
     ) -> (Tensor, Tensor, Tensor, Tensor) {
         let (heads, dim) = (4, 64);
         let mk = || Tensor::randn(0f32, 1f32, (1, heads, seq, dim), device).unwrap();
-        let mut mask = vec![0f32; seq * seq];
-        for query in 0..seq {
-            for key in real..seq {
-                mask[query * seq + key] = MASKED;
-            }
-        }
-        let mask = Tensor::from_vec(mask, (1, 1, seq, seq), device).unwrap();
+        let mut mask = vec![0f32; seq];
+        mask[real..].fill(MASKED);
+        let mask = Tensor::from_vec(mask, (1, 1, 1, seq), device).unwrap();
         (mk(), mk(), mk(), mask)
     }
 

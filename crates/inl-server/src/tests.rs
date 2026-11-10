@@ -918,6 +918,8 @@ fn sparse_instance_key_differs_from_a_dense_one_and_tracks_vector_inputs() {
 // ---- multimodal engine: POST /embed_multimodal -------------------------------
 
 /// Embeds each input as `[text len, image count, 1]`; records what it saw.
+/// An image whose bytes are `bad` is refused as the real engine refuses media
+/// it cannot decode.
 #[derive(Default)]
 struct FakeMultimodal {
     seen: StdMutex<Vec<Vec<MultimodalInput>>>,
@@ -958,6 +960,12 @@ impl MultimodalEngine for FakeMultimodal {
     async fn embed(&self, inputs: Vec<MultimodalInput>) -> Result<Vec<Vec<f32>>> {
         if self.timeout.load(Ordering::SeqCst) {
             return Err(InlError::Timeout("native multimodal batch stuck".into()));
+        }
+        if inputs
+            .iter()
+            .any(|input| input.images.iter().any(|image| image.bytes == b"bad"))
+        {
+            return Err(InlError::InvalidInput("could not decode the image".into()));
         }
         self.seen.lock().unwrap().push(inputs.clone());
         Ok(inputs
@@ -1129,6 +1137,28 @@ async fn openai_embeddings_accept_media_items_on_a_multimodal_server() {
     .await;
     assert_eq!(status, 400, "{body}");
     assert!(body["error"]["message"].as_str().unwrap().contains("video"));
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn media_the_engine_cannot_decode_is_a_client_error() {
+    let h = spawn_multimodal(FakeMultimodal::text_and_image()).await;
+    let (status, body) = post(
+        &format!("{}/embed_multimodal", h.url),
+        json!({"inputs": [{"images": [b64(b"bad")]}]}),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["error_type"], "Validation");
+    assert!(body["error"].as_str().unwrap().contains("decode"));
+
+    let (status, body) = post(
+        &format!("{}/v1/embeddings", h.url),
+        json!({"model": "Fake/Multimodal-1", "input": [{"type": "image", "data": b64(b"bad")}]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
     h.shutdown().await;
 }
 
