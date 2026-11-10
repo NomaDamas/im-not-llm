@@ -109,6 +109,25 @@ The model side is device-independent but worth knowing on CUDA:
   `cpu_fwd` and `metal_fwd` at this revision, so `Auto` resolves to `Tiled` on
   CUDA. `candle-flash-attn` would be a new dependency with its own kernels.
 
+### Registry releases and shared daemon state
+
+`inl-core`, `inl-text`, `inl-sparse`, `inl-vision` 0.1.0 and `inl-server`
+0.1.1 are published on crates.io. Each upload ran Cargo's packaged-source
+verification. A registry-only Rust consumer ran real Qwen3 inference with
+`accelerate` (two finite unit-length 1024-d vectors); `cuda`, `accelerate`
+and `mkl` resolve through all four text/daemon crates to candle. The daemon
+library's active feature graph excludes `inl-vision` when default features
+are disabled.
+
+MinSync's extraction branch, with git dependencies replaced by registry
+versions and its candle patch removed, passed `cargo publish --dry-run`.
+Manual shared-state QA found that the CLI omitted the default context from
+its instance identity while MinSync included it. `inl-server` 0.1.1 includes
+the actual engine default, so `minsync serve` adopts `inl serve`'s PID, URL
+and default `~/.cache/im-not-llm/serve/<instance>` directory. The adopted
+daemon successfully served a 1024-d embedding request.
+
+
 ## windows — Windows 11, TITAN Xp (sm_61), CUDA toolkit 11.8
 
 CPU builds and tests use the default `stable-x86_64-pc-windows-gnu` toolchain:
