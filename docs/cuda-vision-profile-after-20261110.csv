@@ -1,0 +1,49 @@
+Generating SQLite file /tmp/inl-vision-after.sqlite from /tmp/inl-vision-after.nsys-rep
+Processing [/tmp/inl-vision-after.sqlite] with [/tmp/cuda-12.9/nsight-systems-2025.1.3/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+26.5,144794940,726,199442.1,90800.5,1760,3180774,489665.1,badd_f32
+23.6,128702274,392,328322.1,187344.0,62560,2062084,449485.7,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x256_8x4_tn_align1>(T1::Params)
+12.6,68650185,480,143021.2,44704.5,20640,2986342,384618.7,"void magma_sgemmEx_kernel<float, float, float, (bool)0, (bool)0, (int)6, (int)3, (int)5, (int)3, (int)3>(int, int, int, Tensor, int, Tensor, int, Tensor, int, Tensor, int, int, int, const T1 *, const T1 *, T1, T1, int, cublasLtEpilogue_t, int, const void *, long)"
+12.1,66157633,528,125298.5,47904.0,2752,2432548,322150.3,softmax_f32
+11.6,63206909,480,131681.1,103616.0,100768,1177891,133236.5,void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_nn_align1>(T1::Params)
+3.0,16286173,265,61457.3,46048.0,37952,1193666,97180.5,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x128_8x4_tn_align1>(T1::Params)
+2.7,14987423,1118,13405.6,9248.0,1920,1513475,46652.9,ucopy_f32
+2.3,12539994,727,17249.0,8256.0,4096,1173187,56371.2,rmsnorm_f32
+1.5,8190709,1376,5952.6,1152.0,1024,1103459,30628.0,cast_bf16_f32
+0.8,4449483,201,22136.7,6752.0,2528,170529,43490.5,bmul_f32
+0.7,3764969,3,1254989.7,717698.0,716354,2330917,931780.6,ia_u32_f32
+0.6,3053672,144,21206.1,5552.0,1152,119777,33909.3,ugelu_f32
+0.5,2828772,896,3157.1,2464.0,1088,10752,2354.6,copy2d_f32
+0.5,2682217,98,27369.6,27264.0,26784,31904,667.0,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_tn_align1>(T1::Params)
+0.4,2135972,96,22249.7,22592.0,11776,61568,12232.8,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_nn_align1>(T1::Params)
+0.3,1379969,192,7187.3,5120.0,4256,14080,3570.2,rope_thd_f32
+0.2,959361,20,47968.1,47968.0,47616,48513,246.2,void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_tn_align1>(T1::Params)
+0.0,264803,96,2758.4,2704.0,1504,7904,1463.4,rope_f32
+0.0,172065,11,15642.3,15008.0,2944,42528,14105.9,is_u32_f32
+0.0,150112,42,3574.1,1056.0,1024,43072,8077.0,affine_f32
+0.0,112896,1,112896.0,112896.0,112896,112896,0.0,void cutlass::Kernel2<cutlass_80_simt_sgemm_256x128_8x4_tn_align1>(T1::Params)
+0.0,100512,12,8376.0,8048.0,7936,11168,906.3,"void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)6, (int)7, (bool)0, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>>(cublasGemmSmallNParams<T9, T10, T11, T1>)"
+0.0,72160,76,949.5,928.0,864,1408,75.1,const_set_f32
+0.0,13088,12,1090.7,1088.0,1056,1120,16.5,ulog_f32
+0.0,12864,12,1072.0,1088.0,1024,1088,21.6,uexp_f32
+0.0,7552,6,1258.7,1264.0,1216,1280,26.1,ucos_f32
+0.0,7392,6,1232.0,1232.0,1184,1280,52.6,usin_f32
+0.0,7264,6,1210.7,1216.0,1088,1376,102.0,cast_f32_u32
+0.0,7104,6,1184.0,1152.0,1024,1376,135.8,urelu_f32
+0.0,4896,2,2448.0,2448.0,2368,2528,113.1,bdiv_f32
+0.0,4288,1,4288.0,4288.0,4288,4288,0.0,"void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)4, (int)4, (bool)1, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>>(cublasGemmSmallNParams<T9, T10, T11, T1>)"
+0.0,4128,3,1376.0,1408.0,1280,1440,84.7,cast_i64_f32
+0.0,4032,1,4032.0,4032.0,4032,4032,0.0,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, float, float, float, float, (bool)0, (bool)1, (bool)0, (bool)0, (int)9, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13)"
+0.0,3904,2,1952.0,1952.0,1920,1984,45.3,fast_sum_f32
+0.0,3840,1,3840.0,3840.0,3840,3840,0.0,"void gemv2T_kernel_val<int, int, float, float, float, float, (int)128, (int)16, (int)2, (int)2, (bool)0, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13, T6, T6)"
+0.0,2720,1,2720.0,2720.0,2720,2720,0.0,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, float, float, float, float, (bool)0, (bool)1, (bool)0, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13)"
+0.0,2208,2,1104.0,1104.0,1088,1120,22.6,usqrt_f32
+0.0,2144,2,1072.0,1072.0,1056,1088,22.6,usqr_f32
+
+Processing [/tmp/inl-vision-after.sqlite] with [/tmp/cuda-12.9/nsight-systems-2025.1.3/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+Time (%),Total Time (ns),Count,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Operation
+99.7,2646025361,3121,847813.3,704.0,288,496949816,9358433.5,[CUDA memcpy Host-to-Device]
+0.3,7028655,487,14432.6,384.0,352,4148649,202639.9,[CUDA memcpy Device-to-Host]
+0.0,1242945,664,1871.9,1232.0,288,76448,4134.0,[CUDA memset]
+0.0,7808,3,2602.7,1344.0,1312,5152,2207.8,[CUDA memcpy Device-to-Device]
+

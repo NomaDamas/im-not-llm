@@ -280,6 +280,60 @@ faster than f32 throughout this after-build text sweep, reversing the earlier
 small-corpus result. Keep f32's TF32 accumulation opt-in: throughput alone
 does not justify changing the numerical default. No tolerance was relaxed.
 
+TF32 numeric check on the same card: Gemma2's two text goldens and Qwen3's
+CPU/CUDA comparison passed (Qwen3 cosines 0.9999989 / 0.9999991). KURE-Sparse
+**failed** the existing golden and padding-invariance tests: query weight
+error 0.0025709867 exceeds the unchanged 0.002 tolerance, one sparse term
+changed, and doc 0's selected indices differed when padded. The normal
+`bf16,f16` accumulation setting passed all three sparse correctness tests.
+Decision: do not enable TF32 by default; it is not reference-safe for sparse
+retrieval. This failed opt-in experiment is expected evidence, not a passing
+suite and not a reason to relax tolerances.
+
+### CUDA vision optimization and profile
+
+The before binary uses the pre-optimization vision path at `bb37000`; after
+includes the fused axial RoPE and host-retained pooling metadata from
+`023ab1d` (same candle 0.11.1). Position lookup and padding masks already run
+on-device; invariant RoPE frequencies now upload once per tower. Pool hidden
+states stay on-device via `index_add`/`index_select`; the pooler borrows the
+preprocessor's positions/padding rather than downloading their device copies.
+Metal keeps its fused SDPA path. CUDA retains portable tiled attention, so
+Pascal does not gain a flash-attention dependency it cannot run.
+
+Physical card 2, three interleaved repeats (reverse order on repeat 2),
+`bench_vision --device cuda --n 16 --size 320x240 --budget 280`, one warmup
+image before timing. Median images/s:
+
+| dtype | before, tile 256 | after 128 | after 256 | after 512 | after 1024 | after 2048 |
+| --- | --- | --- | --- | --- | --- | --- |
+| f32 | 6.569 | 5.355 | 7.065 | 5.181 | 4.999 | 5.372 |
+| bf16 | 7.590 | 10.227 | 7.650 | 7.860 | 7.627 | 9.049 |
+
+Keep the 256-row default: larger tiles did not consistently improve f32,
+and bf16's best tile differed. The f32 default median improved 7.6%; bf16
+was essentially unchanged (+0.8%). Shared-host variation is large (after
+f32 tile 256: 4.760–7.729 images/s); do not claim a universal speedup.
+The per-tower Rust option and `INL_VISION_ATTENTION_TILE` permit explicit
+tuning. Raw samples: `docs/cuda-vision-ab-20261110.jsonl`.
+
+`nsys profile --trace=cuda,nvtx --sample=none` over a warmup plus four f32
+images confirmed 192 fused `rope_thd_f32` calls replacing the axial arithmetic
+chain: `bmul_f32` launches 585 → 201, `badd_f32` 918 → 726, and `uneg_f32`
+192 → 0. H2D copies fell 3507 → 3121 and D2H 493 → 487; remaining copies
+include model load, final outputs and the existing multimodal text merge.
+GEMMs, broadcast-add and softmax still dominate GPU time. Absolute profiler
+times include startup and tracing overhead and are not inference-only
+speedups. Reports: `docs/cuda-vision-profile-{before,after}-20261110.csv`;
+full `.nsys-rep` and SQLite exports remain under `/tmp/inl-vision-*` on gpu01.
+
+Validation: optimized image and interleaved/video goldens passed on gpu01
+(minimum cosine 0.99999982), Windows CUDA (0.99999988), and Metal. Fused axial
+RoPE equivalence tests passed on CPU, Metal and CUDA; the default tile and
+alternate tile partitioning preserve attention results. Manual Metal HTTP
+QA is recorded above. Existing golden tolerances were not changed.
+
+
 ### windows, Ryzen 5 3600 (6 cores), CPU f32
 
 | model | batch 8 | batch 32 | batch 64 | batch 128 |
