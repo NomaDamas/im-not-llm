@@ -97,8 +97,11 @@ impl VisionConfig {
         if self.pooling_kernel_size != POOLING_KERNEL {
             return invalid(format!("pooling_kernel_size {}", self.pooling_kernel_size));
         }
-        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
-            return invalid(format!("head_dim {}", self.head_dim));
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(4) {
+            return invalid(format!(
+                "head_dim {} (must be a multiple of 4: the axial RoPE rotates each head half)",
+                self.head_dim
+            ));
         }
         if self.num_attention_heads == 0
             || self.num_key_value_heads == 0
@@ -815,18 +818,21 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 16);
     }
 
-    /// Random q/k/v over `seq` tokens whose last `seq - real` keys are padding.
+    /// q/k/v over `seq` tokens whose last `seq - real` keys are padding,
+    /// deterministic (`ramp`) so a failure reproduces across runs and devices.
     fn attention_case(
         device: &Device,
         seq: usize,
         real: usize,
     ) -> (Tensor, Tensor, Tensor, Tensor) {
         let (heads, dim) = (4, 64);
-        let mk = || Tensor::randn(0f32, 1f32, (1, heads, seq, dim), device).unwrap();
+        let len = heads * seq * dim;
+        let mk =
+            |seed: u64| Tensor::from_vec(ramp(len, seed), (1, heads, seq, dim), device).unwrap();
         let mut mask = vec![0f32; seq];
         mask[real..].fill(MASKED);
         let mask = Tensor::from_vec(mask, (1, 1, 1, seq), device).unwrap();
-        (mk(), mk(), mk(), mask)
+        (mk(1), mk(2), mk(3), mask)
     }
 
     fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
@@ -930,18 +936,39 @@ mod tests {
             .collect()
     }
 
-    fn test_config() -> VisionConfig {
-        VisionConfig::parse(
-            br#"{"vision_config": {
+    /// The checkpoint config JSON with a chosen `head_dim` (everything else
+    /// fixed), for config-validation boundary tests.
+    fn config_json(head_dim: usize) -> String {
+        format!(
+            r#"{{"vision_config": {{
                 "hidden_size": 768, "intermediate_size": 3072, "num_hidden_layers": 16,
-                "num_attention_heads": 12, "num_key_value_heads": 12, "head_dim": 64,
+                "num_attention_heads": 12, "num_key_value_heads": 12, "head_dim": {head_dim},
                 "hidden_activation": "gelu_pytorch_tanh", "rms_norm_eps": 1e-6,
                 "patch_size": 16, "pooling_kernel_size": 3, "position_embedding_size": 10240,
-                "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"},
+                "rope_parameters": {{"rope_theta": 100.0, "rope_type": "axial"}},
                 "standardize": false, "use_clipped_linears": false
-            }}"#,
+            }}}}"#
         )
-        .unwrap()
+    }
+
+    fn test_config() -> VisionConfig {
+        VisionConfig::parse(config_json(64).as_bytes()).unwrap()
+    }
+
+    /// The axial RoPE rotates each head half, so `head_dim` must be a multiple
+    /// of 4; a `4n+2` head used to fail deep in the forward pass with a shape
+    /// error and is now rejected when the config is parsed.
+    #[test]
+    fn vision_config_requires_head_dim_multiple_of_four() {
+        assert!(VisionConfig::parse(config_json(64).as_bytes()).is_ok());
+        assert!(VisionConfig::parse(config_json(68).as_bytes()).is_ok());
+        for head_dim in [2usize, 6, 66] {
+            let err = VisionConfig::parse(config_json(head_dim).as_bytes()).unwrap_err();
+            assert!(
+                err.to_string().contains("head_dim"),
+                "head_dim {head_dim}: {err}"
+            );
+        }
     }
 
     /// The rotation the reference spelling implements: rotate the first and the

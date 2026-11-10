@@ -3,10 +3,10 @@
 How to build and run im-not-llm on the machines it is exercised on, with the
 exact commands, environment variables and the issues each setup hits.
 
-Verified 2026-11-09 against `main` @ `ce93d66` for
-`crates/{inl-core,inl-text,inl-sparse,inl-server}`. `crates/inl-vision` and
-`bindings/node` are developed separately; they are workspace members now, so a
-`cargo build -p inl-server` pulls `inl-vision` in.
+Registry dependencies use candle 0.11.1 (no workspace git patch). Verified
+2026-11-10 on macOS (CPU/Metal), Windows (GNU CPU and MSVC CUDA), and gpu01
+(CUDA). `inl-server` enables its CLI/vision dependencies by default;
+`default-features = false` keeps only the daemon library and engine traits.
 
 ## Env vars, once
 
@@ -20,6 +20,7 @@ Verified 2026-11-09 against `main` @ `ce93d66` for
 | `INL_TEST_DEVICE` | `cpu`/`metal`/`cuda` for the ignored live tests (`gemma2_live`, `qwen3_live`, `sparse_live`, `inl-vision`'s `live`). |
 | `INL_CACHE_DIR` | Model cache when `HF_HOME` is not set (`~/.cache/im-not-llm/models` by default). |
 | `INL_CUDA_REDUCED_PRECISION` | Which CUDA GEMMs may use reduced-precision (tensor-core) accumulation: a comma-separated list of `f32`, `f16`, `bf16`, or `none`. Default `bf16,f16`; `f32` (TF32) is off because it rounds the default path's operands to 10 mantissa bits. |
+| `INL_VISION_ATTENTION_TILE` | positive query tile size for vision tiled attention; default 256, overridden by `MultimodalOptions::with_vision_attention_tile`; Metal SDPA ignores it. |
 
 Feature flags: `cuda` (NVIDIA), `cudnn` (implies `cuda`; needs cuDNN),
 `accelerate` (macOS CPU BLAS), `mkl` (x86 CPU BLAS).
@@ -168,6 +169,14 @@ cosines >= 0.9999998, audio tower max abs diff 5.6e-4 over 44.9).
 
 Audio on gpu01 (`cuda:0` = card 2, `@ 5ae814e`): `inl-vision --test audio`
 5/5 (embedding cosines >= 0.9999998), `--test engine` 1/1.
+
+After upgrading to candle 0.11.1, the Windows CPU suite and full CUDA suite
+(including live text/sparse/audio/image/video goldens) passed. The macOS
+offline suite and all ignored Metal goldens also passed. The optimized vision
+path passed 9 Mac unit tests, 8 Windows unit tests, and image/video goldens on
+both Metal and Pascal CUDA. Manual Metal HTTP QA embedded an image, interleaved
+text/video, and text in one request: three finite 768-d unit vectors; the image
+alone versus batched cosine was 0.9999999999996.
 
 ## Video
 
