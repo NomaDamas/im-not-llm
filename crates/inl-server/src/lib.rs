@@ -834,7 +834,9 @@ fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
         EngineKind::Dense => routes
             .route("/embed", post(tei_embed))
             .route("/v1/embeddings", post(openai_embeddings)),
-        EngineKind::Sparse => routes.route("/embed_sparse", post(tei_embed_sparse)),
+        EngineKind::Sparse => routes
+            .route("/embed_sparse", post(tei_embed_sparse))
+            .route("/v1/embeddings", post(openai_embeddings)),
         EngineKind::Multimodal => routes
             .route("/embed", post(tei_embed))
             .route("/embed_multimodal", post(embed_multimodal))
@@ -1280,6 +1282,20 @@ fn multimodal_inputs_from_texts(
         .collect()
 }
 
+/// The per-request result of `/v1/embeddings`: dense float vectors (dense and
+/// multimodal engines) or learned-sparse `{index, value}` rows (sparse engines).
+enum OpenAiEmbedded {
+    Dense {
+        vectors: Vec<Vec<f32>>,
+        tokens: usize,
+        base64: bool,
+    },
+    Sparse {
+        vectors: Vec<SparseVector>,
+        tokens: usize,
+    },
+}
+
 async fn openai_embeddings(
     State(app): State<BodyLimited>,
     body: std::result::Result<Bytes, BytesRejection>,
@@ -1324,7 +1340,7 @@ async fn openai_embeddings(
         let embedded = match state.engine {
             Engine::Dense(_) => {
                 let texts = input_texts(request.input, "input")?;
-                embed_inputs(
+                let Embedded { vectors, tokens } = embed_inputs(
                     state,
                     texts,
                     request.input_type,
@@ -1332,7 +1348,12 @@ async fn openai_embeddings(
                     true,
                     Protocol::OpenAi,
                 )
-                .await?
+                .await?;
+                OpenAiEmbedded::Dense {
+                    vectors,
+                    tokens,
+                    base64,
+                }
             }
             Engine::Multimodal(_) => {
                 let inputs = openai_multimodal_inputs(state, request.input, request.input_type)?;
@@ -1341,39 +1362,87 @@ async fn openai_embeddings(
                     .embed_multimodal(inputs)
                     .await
                     .map_err(|error| engine_error(state, error))?;
-                Embedded { vectors, tokens: 0 }
+                OpenAiEmbedded::Dense {
+                    vectors,
+                    tokens: 0,
+                    base64,
+                }
             }
             Engine::Sparse(_) => {
-                return Err(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "this server serves sparse vectors; use /embed_sparse",
-                ))
+                if base64 {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "`encoding_format: \"base64\"` is not supported for sparse embeddings; \
+                         they are returned as `{index, value}` pairs",
+                    ));
+                }
+                let texts = input_texts(request.input, "input")?;
+                let Checked { texts, tokens } = checked_inputs_counting(
+                    state,
+                    texts,
+                    request.input_type,
+                    false,
+                    true,
+                    Protocol::OpenAi,
+                )
+                .await?;
+                let vectors = state
+                    .engine
+                    .encode_sparse(texts)
+                    .await
+                    .map_err(|error| engine_error(state, error))?;
+                OpenAiEmbedded::Sparse { vectors, tokens }
             }
         };
-        Ok((embedded, base64))
+        Ok(embedded)
     }
     .await;
     match result {
-        Ok((embedded, base64)) => {
-            let data: Vec<serde_json::Value> = embedded
-                .vectors
-                .into_iter()
-                .enumerate()
-                .map(|(index, vector)| {
-                    let embedding = if base64 {
-                        let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        json!(base64::engine::general_purpose::STANDARD.encode(bytes))
-                    } else {
-                        json!(vector)
-                    };
-                    json!({ "object": "embedding", "index": index, "embedding": embedding })
-                })
-                .collect();
+        Ok(embedded) => {
+            let (data, tokens) = match embedded {
+                OpenAiEmbedded::Dense {
+                    vectors,
+                    tokens,
+                    base64,
+                } => {
+                    let data: Vec<serde_json::Value> = vectors
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, vector)| {
+                            let embedding = if base64 {
+                                let bytes: Vec<u8> =
+                                    vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                json!(base64::engine::general_purpose::STANDARD.encode(bytes))
+                            } else {
+                                json!(vector)
+                            };
+                            json!({ "object": "embedding", "index": index, "embedding": embedding })
+                        })
+                        .collect();
+                    (data, tokens)
+                }
+                OpenAiEmbedded::Sparse { vectors, tokens } => {
+                    let data: Vec<serde_json::Value> = vectors
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, vector)| {
+                            let embedding: Vec<SparseValue> = vector
+                                .indices()
+                                .iter()
+                                .zip(vector.values())
+                                .map(|(&index, &value)| SparseValue { index, value })
+                                .collect();
+                            json!({ "object": "embedding", "index": index, "embedding": embedding })
+                        })
+                        .collect();
+                    (data, tokens)
+                }
+            };
             Json(json!({
                 "object": "list",
                 "data": data,
                 "model": state.info.model_id,
-                "usage": { "prompt_tokens": embedded.tokens, "total_tokens": embedded.tokens },
+                "usage": { "prompt_tokens": tokens, "total_tokens": tokens },
             }))
             .into_response()
         }

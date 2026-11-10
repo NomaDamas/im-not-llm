@@ -839,7 +839,7 @@ async fn a_sparse_server_does_not_serve_dense_routes_and_reports_its_kind() {
     assert_eq!(health["status"], "ok");
     assert_eq!(health["kind"], "sparse");
     assert_eq!(health["model_id"], "Fake/Sparse-1");
-    for route in ["/embed", "/v1/embeddings", "/embed_multimodal"] {
+    for route in ["/embed", "/embed_multimodal"] {
         let response = client
             .post(format!("{}{route}", h.url))
             .json(&json!({"inputs": ["a"], "input": ["a"]}))
@@ -848,6 +848,48 @@ async fn a_sparse_server_does_not_serve_dense_routes_and_reports_its_kind() {
             .unwrap();
         assert_eq!(response.status().as_u16(), 404, "{route}");
     }
+}
+
+#[tokio::test]
+async fn a_sparse_server_serves_openai_embeddings_as_sparse_index_value_rows() {
+    let h = spawn_sparse(FakeSparse::default()).await;
+    let url = format!("{}/v1/embeddings", h.url);
+    let (status, body) = post(
+        &url,
+        json!({"model": "Fake/Sparse-1", "input": ["ab", "b"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Same vectors as /embed_sparse, wrapped in the OpenAI envelope; two one-word
+    // inputs, so usage counts two prompt tokens.
+    assert_eq!(
+        body,
+        json!({
+            "object": "list",
+            "data": [
+                {"object": "embedding", "index": 0,
+                 "embedding": [{"index": 97, "value": 1.0}, {"index": 98, "value": 2.0}]},
+                {"object": "embedding", "index": 1,
+                 "embedding": [{"index": 98, "value": 1.0}]},
+            ],
+            "model": "Fake/Sparse-1",
+            "usage": {"prompt_tokens": 2, "total_tokens": 2},
+        })
+    );
+    // base64 packs a dense float vector; there is none for sparse rows.
+    let (status, body) = post(
+        &url,
+        json!({"model": "Fake/Sparse-1", "input": "a", "encoding_format": "base64"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    // A model that is not the one served is still rejected.
+    let (status, _) = post(
+        &url,
+        json!({"model": "text-embedding-3-small", "input": "a"}),
+    )
+    .await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]
