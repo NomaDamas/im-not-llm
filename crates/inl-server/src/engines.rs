@@ -49,7 +49,11 @@ impl EngineArgs {
             device: self.device.clone(),
             dtype: self.dtype.clone(),
             attention: None,
-            max_length: None,
+            max_length: Some(match kind {
+                EngineKind::Dense => inl_text::TextOptions::default().max_length,
+                EngineKind::Sparse => inl_sparse::SparseOptions::default().max_length,
+                EngineKind::Multimodal => inl_vision::MultimodalOptions::default().max_length,
+            }),
             kind,
         })
     }

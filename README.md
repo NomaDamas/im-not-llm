@@ -15,9 +15,9 @@ Use it three ways, all backed by the same engines:
 ## Install
 
 ```sh
-cargo install inl-server --version 0.1.0
+cargo install inl-server --version 0.1.1
 # NVIDIA host with the CUDA toolkit installed:
-cargo install inl-server --version 0.1.0 --features cuda
+cargo install inl-server --version 0.1.1 --features cuda
 ```
 
 For Rust applications:
@@ -27,7 +27,7 @@ For Rust applications:
 inl-text = "0.1.0"
 inl-sparse = "0.1.0"
 inl-vision = "0.1.0"
-inl-server = { version = "0.1.0", default-features = false }
+inl-server = { version = "0.1.1", default-features = false }
 ```
 
 `inl-server` without default features exposes the daemon library without its

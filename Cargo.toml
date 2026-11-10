@@ -20,7 +20,7 @@ inl-core = { path = "crates/inl-core", version = "0.1.0" }
 inl-text = { path = "crates/inl-text", version = "0.1.0" }
 inl-sparse = { path = "crates/inl-sparse", version = "0.1.0" }
 inl-vision = { path = "crates/inl-vision", version = "0.1.0" }
-inl-server = { path = "crates/inl-server", version = "0.1.0", default-features = false }
+inl-server = { path = "crates/inl-server", version = "0.1.1", default-features = false }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
