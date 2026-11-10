@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -15,8 +19,8 @@ accelerate = ["inl-core/accelerate", "inl-text/accelerate"]
 mkl = ["inl-core/mkl", "inl-text/mkl"]
 
 [dependencies]
-inl-core = { path = "../inl-core" }
-inl-text = { path = "../inl-text" }
+inl-core.workspace = true
+inl-text.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

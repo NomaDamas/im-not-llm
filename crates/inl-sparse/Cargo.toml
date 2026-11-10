@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -15,7 +19,7 @@ accelerate = ["inl-core/accelerate"]
 mkl = ["inl-core/mkl"]
 
 [dependencies]
-inl-core = { path = "../inl-core" }
+inl-core.workspace = true
 async-trait.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true

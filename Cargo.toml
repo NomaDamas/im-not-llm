@@ -9,14 +9,26 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NomaDamas/im-not-llm"
 authors = ["NomaDamas"]
+readme = "README.md"
+homepage = "https://github.com/NomaDamas/im-not-llm"
+keywords = ["embeddings", "inference", "candle", "splade", "multimodal"]
+categories = ["science", "text-processing", "multimedia"]
 
 [workspace.dependencies]
+# Path for the workspace, version for crates.io; publish in this order.
+inl-core = { path = "crates/inl-core", version = "0.1.0" }
+inl-text = { path = "crates/inl-text", version = "0.1.0" }
+inl-sparse = { path = "crates/inl-sparse", version = "0.1.0" }
+inl-vision = { path = "crates/inl-vision", version = "0.1.0" }
+inl-server = { path = "crates/inl-server", version = "0.1.0", default-features = false }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
+# 0.11.1 is the first release that builds on rustc 1.93 aarch64
+# (huggingface/candle#3845); published crates cannot rely on a `[patch]`.
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -28,11 +40,3 @@ thiserror = "2"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
 tracing = "0.1"
-
-# candle-core 0.11.0 does not compile on rustc 1.93 aarch64: neon.rs uses
-# float16x8_t which now requires the unstable stdarch_neon_f16 feature.
-# huggingface/candle#3845 gates those types behind target_feature="fp16".
-[patch.crates-io]
-candle-core = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "7b59bb97817beb527a1afcf9c11cd4aff1898bc2" }

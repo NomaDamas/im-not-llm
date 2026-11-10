@@ -20,11 +20,11 @@ mkl = ["inl-core/mkl"]
 crate-type = ["cdylib"]
 
 [dependencies]
-inl-core = { path = "../../crates/inl-core" }
-inl-text = { path = "../../crates/inl-text" }
-inl-sparse = { path = "../../crates/inl-sparse" }
-inl-vision = { path = "../../crates/inl-vision" }
-inl-server = { path = "../../crates/inl-server", default-features = false }
+inl-core.workspace = true
+inl-text.workspace = true
+inl-sparse.workspace = true
+inl-vision.workspace = true
+inl-server.workspace = true
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 tokio.workspace = true
