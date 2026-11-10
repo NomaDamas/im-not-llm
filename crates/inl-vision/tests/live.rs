@@ -16,9 +16,14 @@ fn media() -> MediaBytes {
 }
 
 async fn embed_on(device: DeviceSpec) -> Option<Vec<f32>> {
-    let options = MultimodalOptions::default()
+    let mut options = MultimodalOptions::default()
         .with_id("google/embeddinggemma-2")
         .with_device(device);
+    // The CPU reference pass takes minutes on a slow or shared host; the
+    // engine's default deadline is sized for serving, not for this check.
+    if device == DeviceSpec::Cpu {
+        options.timeout_seconds = 3600;
+    }
     let embedder = MultimodalEmbedder::new(options);
     match embedder
         .embed(vec![MultimodalInput {

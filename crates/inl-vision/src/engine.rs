@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use inl_core::attention::AttentionRequest;
-use inl_core::device::{device_label, dtype_name, resolve_device, DeviceSpec, DtypeSpec, LoadSlot};
+use inl_core::device::{
+    device_label, dtype_name, model_cache_dir, resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
+};
 use inl_core::engine::{EngineInfo, MediaBytes, Modality, MultimodalEngine, MultimodalInput};
 use inl_core::hub::ModelSource;
 use inl_core::{InlError, Result};
@@ -264,13 +266,13 @@ impl Loaded {
                     .to_string(),
             ));
         }
-        let cache = options.cache_dir.clone().unwrap_or_else(std::env::temp_dir);
-        let source = ModelSource::resolve(&options.id, cache)?;
+        let cache = model_cache_dir(options.cache_dir.as_deref());
+        let source = ModelSource::resolve(&options.id, cache.clone())?;
 
         // Text tower: reuse inl-text's loader (same weights, same lifecycle).
         let text = inl_text::Gemma2Embedder::from_hf(&inl_text::LoadOptions {
             repo_id: &options.id,
-            default_cache_dir: options.cache_dir.clone().unwrap_or_else(std::env::temp_dir),
+            default_cache_dir: cache,
             device: &device,
             dtype,
             max_length: options.max_length,

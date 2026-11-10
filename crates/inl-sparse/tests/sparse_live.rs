@@ -196,20 +196,29 @@ async fn half_precision_on_the_default_device_keeps_scores_and_ranking() {
 }
 
 #[tokio::test]
-#[ignore = "live benchmark: prints throughput for cpu/f32, metal/f32, metal/f16"]
+#[ignore = "live benchmark: prints throughput on INL_TEST_DEVICE (default cpu) per dtype"]
 async fn throughput_by_device_and_dtype() {
+    let device = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into());
     let unit = "세종대왕은 1443년에 훈민정음을 창제하고 1446년에 이를 반포하였다. 김치는 배추나 무를 소금에 절인 뒤 고춧가루와 젓갈을 넣어 발효시킨 음식이다. ";
-    // 128 chunks of ~900 chars, the size MinSync's recursive chunker emits.
-    let chunks: Vec<String> = (0..128)
+    // Chunks of ~900 chars, the size MinSync's recursive chunker emits: 128 on
+    // an accelerator, 16 on the CPU, which a shared host runs at ~0.1 chunk/s.
+    let count = if device == "cpu" { 16 } else { 128 };
+    let chunks: Vec<String> = (0..count)
         .map(|i| format!("{i} {}", unit.repeat(5 + i % 3)))
         .collect();
-    for (device, dtype) in [("cpu", "f32"), ("metal", "f32"), ("metal", "f16")] {
+    let dtypes: &[&str] = if device == "cpu" {
+        &["f32"]
+    } else {
+        &["f32", "f16", "bf16"]
+    };
+    for &dtype in dtypes {
         let options = SparseOptions {
-            device: Some(device.to_string()),
+            device: Some(device.clone()),
             dtype: Some(dtype.to_string()),
             ..SparseOptions::default()
         };
         let Ok(encoder) = SparseEncoder::new(options) else {
+            println!("{device}/{dtype}: unavailable");
             continue;
         };
         if encoder.identity().await.is_err() {

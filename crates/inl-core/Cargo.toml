@@ -29,6 +29,8 @@ tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+# Same major as hf-hub's, only to tell a 404 apart in its errors.
+ureq = { version = "3", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }

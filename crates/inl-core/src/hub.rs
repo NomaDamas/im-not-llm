@@ -20,14 +20,30 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct HubError {
     message: String,
-    damaged: bool,
+    kind: HubErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HubErrorKind {
+    /// The Hub answered 404: the repo has no such file.
+    Missing,
+    /// The file arrived but does not match the hash the Hub published for it.
+    Damaged,
+    /// Anything else: network, server error, local I/O, a held lock.
+    Unavailable,
 }
 
 impl HubError {
     /// The file arrived but does not match the hash the Hub published for it,
     /// as opposed to not arriving at all.
     pub fn is_damaged(&self) -> bool {
-        self.damaged
+        self.kind == HubErrorKind::Damaged
+    }
+
+    /// The Hub says the repo has no such file (HTTP 404), as opposed to the
+    /// file being unreachable for now.
+    pub fn is_missing(&self) -> bool {
+        self.kind == HubErrorKind::Missing
     }
 }
 
@@ -88,7 +104,16 @@ impl HubRepo {
     }
 
     /// The local path of `name`, downloading it first when it is not cached.
+    ///
+    /// Downloads of one file into one cache are serialised across threads and
+    /// processes by a lock file, and whoever waited on the lock reads the file
+    /// the holder brought instead of downloading it again. (`hf-hub`'s own
+    /// blob lock gives up after five seconds, which a weights download outlasts.)
     pub fn get(&self, name: &str) -> std::result::Result<PathBuf, HubError> {
+        if let Some(path) = self.cache.get(name) {
+            return Ok(path);
+        }
+        let _lock = self.download_lock(name)?;
         if let Some(path) = self.cache.get(name) {
             return Ok(path);
         }
@@ -129,7 +154,36 @@ impl HubRepo {
         format!("models--{}", self.id.replace('/', "--"))
     }
 
-    fn download_failed(&self, name: &str, source: &dyn std::fmt::Display) -> HubError {
+    /// An exclusive lock on downloading `name` into this cache, held until the
+    /// returned file is dropped. Blocks while another thread or process holds it.
+    fn download_lock(&self, name: &str) -> std::result::Result<std::fs::File, HubError> {
+        let dir = self.cache_dir.join(self.folder()).join(".inl-locks");
+        let path = dir.join(format!("{}.lock", name.replace(['/', '\\'], "--")));
+        let locked = std::fs::create_dir_all(&dir)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+            })
+            .and_then(|file| file.lock().map(|()| file));
+        locked.map_err(|error| HubError {
+            message: format!(
+                "could not lock {} to download {name} of {}: {error}",
+                path.display(),
+                self.id
+            ),
+            kind: HubErrorKind::Unavailable,
+        })
+    }
+
+    fn download_failed(&self, name: &str, source: &hf_hub::api::sync::ApiError) -> HubError {
+        let missing = matches!(
+            source,
+            hf_hub::api::sync::ApiError::RequestError(error)
+                if matches!(**error, ureq::Error::StatusCode(404))
+        );
         HubError {
             message: format!(
                 "{name} of {} could not be downloaded from {}: {source}. Check the network, \
@@ -140,7 +194,11 @@ impl HubRepo {
                 self.folder(),
                 self.cache_dir.display()
             ),
-            damaged: false,
+            kind: if missing {
+                HubErrorKind::Missing
+            } else {
+                HubErrorKind::Unavailable
+            },
         }
     }
 
@@ -153,7 +211,7 @@ impl HubRepo {
             Ok(_) => Ok(None),
             Err(error) => Err(HubError {
                 message: format!("could not read {name} of {} to check it: {error}", self.id),
-                damaged: false,
+                kind: HubErrorKind::Unavailable,
             }),
         };
         let Some((expected, actual)) = damage(&path)? else {
@@ -184,7 +242,7 @@ impl HubRepo {
                         self.folder(),
                         self.cache_dir.display()
                     ),
-                    damaged: true,
+                    kind: HubErrorKind::Damaged,
                 })
             }
         }
@@ -251,11 +309,10 @@ pub fn safetensors_weight_files(repo: &HubRepo) -> Result<Vec<PathBuf>> {
     const INDEX_FILE: &str = "model.safetensors.index.json";
     match repo.get(SINGLE_FILE) {
         Ok(path) => return Ok(vec![path]),
-        // A damaged download is not evidence that the checkpoint is sharded.
-        Err(error) if error.is_damaged() => {
-            return Err(InlError::Inference(format!("native model {error}")))
-        }
-        Err(_) => {}
+        // Only a 404 says the checkpoint is sharded; a damaged or unreachable
+        // single file must be reported as itself, not as a missing index.
+        Err(error) if error.is_missing() => {}
+        Err(error) => return Err(InlError::Inference(format!("native model {error}"))),
     }
     let fetch = |file: &str| {
         repo.get(file).map_err(|e| {
@@ -347,12 +404,14 @@ mod tests {
 
     /// The two requests `hf-hub` makes per file: a `Range: bytes=0-0` probe for
     /// the headers, then a ranged GET for the body. The first `bad_bodies`
-    /// bodies are corrupted copies of the same length.
+    /// bodies are corrupted copies of the same length; every body takes
+    /// `body_delay` to arrive.
     struct FakeHub {
         good: Vec<u8>,
         bad: Vec<u8>,
         bad_bodies: usize,
         bodies: Arc<AtomicUsize>,
+        body_delay: std::time::Duration,
     }
 
     impl Respond for FakeHub {
@@ -382,6 +441,11 @@ mod tests {
                     format!("bytes {start}-{}/{}", end - 1, self.good.len()),
                 )
                 .set_body_bytes(source[start..end].to_vec())
+                .set_delay(if range == "bytes=0-0" {
+                    std::time::Duration::ZERO
+                } else {
+                    self.body_delay
+                })
         }
     }
 
@@ -394,6 +458,10 @@ mod tests {
     }
 
     async fn fixture(bad_bodies: usize) -> Fixture {
+        fixture_with(bad_bodies, std::time::Duration::ZERO).await
+    }
+
+    async fn fixture_with(bad_bodies: usize, body_delay: std::time::Duration) -> Fixture {
         let good: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let mut bad = good.clone();
         bad[1000] ^= 0xFF;
@@ -406,6 +474,7 @@ mod tests {
                 bad,
                 bad_bodies,
                 bodies: Arc::clone(&bodies),
+                body_delay,
             })
             .mount(&server)
             .await;
@@ -429,6 +498,54 @@ mod tests {
         tokio::task::spawn_blocking(move || repo.get(name))
             .await
             .expect("join")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_uses_download_the_file_once() {
+        // hf-hub's own lock gives the second caller five one-second retries and
+        // then re-downloads; a slow body makes the callers overlap.
+        let fx = fixture_with(0, std::time::Duration::from_millis(1500)).await;
+        let (a, b) = tokio::join!(
+            fetch(&fx.repo, "model.safetensors"),
+            fetch(&fx.repo, "model.safetensors")
+        );
+        assert_eq!(std::fs::read(a.unwrap()).unwrap(), fx.good);
+        assert_eq!(std::fs::read(b.unwrap()).unwrap(), fx.good);
+        assert_eq!(fx.bodies.load(Ordering::SeqCst), 1);
+    }
+
+    async fn answer(fx: &Fixture, file: &str, status: u16) {
+        Mock::given(method("GET"))
+            .and(path_regex(format!("^/org/model/resolve/main/{file}$")))
+            .respond_with(ResponseTemplate::new(status))
+            .with_priority(1)
+            .mount(&fx.server)
+            .await;
+    }
+
+    async fn weight_files(fx: &Fixture) -> Result<Vec<PathBuf>> {
+        let repo = Arc::clone(&fx.repo);
+        tokio::task::spawn_blocking(move || safetensors_weight_files(&repo))
+            .await
+            .expect("join")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_single_file_is_reported_as_itself_not_as_a_missing_index() {
+        let fx = fixture(0).await;
+        answer(&fx, r"model\.safetensors", 500).await;
+        let text = weight_files(&fx).await.unwrap_err().to_string();
+        assert!(text.contains("model.safetensors of org/model"), "{text}");
+        assert!(!text.contains("index.json"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_single_file_means_a_sharded_checkpoint() {
+        let fx = fixture(0).await;
+        answer(&fx, r"model\.safetensors", 404).await;
+        answer(&fx, r"model\.safetensors\.index\.json", 404).await;
+        let text = weight_files(&fx).await.unwrap_err().to_string();
+        assert!(text.contains("model.safetensors.index.json"), "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
