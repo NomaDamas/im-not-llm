@@ -111,13 +111,15 @@ The model side is device-independent but worth knowing on CUDA:
 
 ### Registry releases and shared daemon state
 
-`inl-core`, `inl-text`, `inl-sparse`, `inl-vision` 0.1.0 and `inl-server`
+`inl-core`, `inl-text`, `inl-sparse` 0.1.0 and `inl-vision`, `inl-server`
 0.1.1 are published on crates.io. Each upload ran Cargo's packaged-source
 verification. A registry-only Rust consumer ran real Qwen3 inference with
 `accelerate` (two finite unit-length 1024-d vectors); `cuda`, `accelerate`
 and `mkl` resolve through all four text/daemon crates to candle. The daemon
 library's active feature graph excludes `inl-vision` when default features
 are disabled.
+Linux registry-consumer `cargo check --features cuda` and
+`cargo check --features mkl` both passed on gpu01.
 
 MinSync's extraction branch, with git dependencies replaced by registry
 versions and its candle patch removed, passed `cargo publish --dry-run`.
