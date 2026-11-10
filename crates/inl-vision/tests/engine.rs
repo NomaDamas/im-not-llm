@@ -88,4 +88,32 @@ async fn multimodal_embeddings_match_the_reference() {
     let cos = cosine(&embedding, &reference);
     eprintln!("text-only vs inl-text cosine = {cos:.8}");
     assert!(cos > 0.9999, "text-only vs inl-text cosine {cos}");
+
+    // All of the above in one call: the images share vision passes and the
+    // differently long sequences share a right-padded text pass, which must
+    // not move any vector off its reference.
+    let mut inputs = vec![MultimodalInput {
+        text: Some(golden.text_image.text.clone()),
+        images: vec![media(&golden.text_image.image)],
+        ..Default::default()
+    }];
+    let mut expected = vec![("text+image", golden.text_image.embedding.clone())];
+    for image in &golden.images {
+        inputs.push(MultimodalInput {
+            images: vec![media(&image.name)],
+            ..Default::default()
+        });
+        expected.push((image.name.as_str(), image.embedding.clone()));
+    }
+    inputs.push(MultimodalInput {
+        text: Some(golden.query.text.clone()),
+        ..Default::default()
+    });
+    expected.push(("query", golden.query.embedding.clone()));
+    let embeddings = embedder.embed(inputs).await.unwrap();
+    for ((name, reference), embedding) in expected.iter().zip(&embeddings) {
+        let cos = cosine(embedding, reference);
+        eprintln!("batched {name} cosine = {cos:.8}");
+        assert!(cos > 0.9999, "batched {name} cosine {cos}");
+    }
 }

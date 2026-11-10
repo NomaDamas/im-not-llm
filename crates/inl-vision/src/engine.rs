@@ -15,10 +15,11 @@ use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use inl_core::attention::AttentionRequest;
+use inl_core::deadline::BatchDeadline;
 use inl_core::device::{
     device_label, dtype_name, model_cache_dir, resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
 };
-use inl_core::engine::{EngineInfo, MediaBytes, Modality, MultimodalEngine, MultimodalInput};
+use inl_core::engine::{EngineInfo, Modality, MultimodalEngine, MultimodalInput};
 use inl_core::hub::ModelSource;
 use inl_core::{InlError, Result};
 use std::path::PathBuf;
@@ -64,11 +65,15 @@ pub struct MultimodalOptions {
     pub video_fps: f64,
     /// Matryoshka output dimension (one of 128, 256, 512, 768).
     pub output_dim: Option<usize>,
-    /// Inputs per forward pass.
+    /// Items per forward pass: inputs per text-tower pass, images/frames per
+    /// vision-tower pass.
     pub batch_size: usize,
-    /// Cap on padded tokens (`inputs x longest input`) per forward pass.
+    /// Cap on padded tokens (`items x longest item`) per forward pass; the
+    /// vision tower counts real patches (up to `9 x` the soft-token budget
+    /// per image). An item over the cap runs alone.
     pub max_batch_tokens: usize,
-    /// Deadline for one forward pass, in seconds.
+    /// Deadline for one forward pass, in seconds. A pass that overruns keeps
+    /// its thread, so every later call fails fast until the process restarts.
     pub timeout_seconds: u64,
     /// Directory for cached model files; `None` uses the shared cache.
     pub cache_dir: Option<PathBuf>,
@@ -320,64 +325,83 @@ impl Loaded {
         })
     }
 
-    /// Soft tokens for one image, projected into text space.
-    fn image_soft_tokens(&self, image: &MediaBytes) -> Result<Vec<Vec<f32>>> {
-        let pre = preprocess::preprocess(&image.bytes, self.options.max_soft_tokens)?;
-        self.run_vision(&[pre], self.options.max_soft_tokens)
-    }
-
-    /// Soft tokens for one video: `(frames, rows)` where `rows` holds the
-    /// per-frame soft tokens concatenated.
-    fn video_soft_tokens(&self, video: &MediaBytes) -> Result<(usize, Vec<Vec<f32>>)> {
-        let budget = self.options.video_max_soft_tokens;
-        let max_frames = (self.options.max_length / (budget + 2)).max(1);
-        let frames = video::extract_frames(&video.bytes, self.options.video_fps, max_frames)?;
-        if frames.is_empty() {
-            return Err(InlError::InvalidInput(
-                "the video decoded to zero frames".to_string(),
-            ));
+    /// Decode every image and video frame of `inputs` (CPU work: image
+    /// decoding, resampling, `ffmpeg`), recording where each input's media sit.
+    fn decode_media(&self, inputs: &[MultimodalInput]) -> Result<(Vec<MediaItem>, Vec<InputMedia>)> {
+        let mut items = Vec::new();
+        let mut layout = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if !input.audios.is_empty() {
+                return Err(InlError::InvalidInput(
+                    "audio is not supported by this build".to_string(),
+                ));
+            }
+            let mut media = InputMedia {
+                images: Vec::with_capacity(input.images.len()),
+                videos: Vec::with_capacity(input.videos.len()),
+            };
+            let budget = self.options.max_soft_tokens;
+            for image in &input.images {
+                media.images.push(items.len());
+                items.push(MediaItem {
+                    pre: preprocess::preprocess(&image.bytes, budget)?,
+                    budget,
+                });
+            }
+            let budget = self.options.video_max_soft_tokens;
+            let max_frames = (self.options.max_length / (budget + 2)).max(1);
+            for video in &input.videos {
+                let frames = video::extract_frames(&video.bytes, self.options.video_fps, max_frames)?;
+                if frames.is_empty() {
+                    return Err(InlError::InvalidInput(
+                        "the video decoded to zero frames".to_string(),
+                    ));
+                }
+                media.videos.push((items.len(), frames.len()));
+                for frame in &frames {
+                    items.push(MediaItem {
+                        pre: preprocess::preprocess_rgb(frame, budget)?,
+                        budget,
+                    });
+                }
+            }
+            layout.push(media);
         }
-        let count = frames.len();
-        let preprocessed = frames
-            .iter()
-            .map(|frame| preprocess::preprocess_rgb(frame, budget))
-            .collect::<Result<Vec<_>>>()?;
-        let rows = self.run_vision(&preprocessed, budget)?;
-        Ok((count, rows))
+        Ok((items, layout))
     }
 
-    /// Run the vision tower over a batch of equally laid-out frames.
+    /// One vision pass over `frames` (all with the same `output_length`),
+    /// padded only to the longest real patch count among them: padding is
+    /// masked out of attention and skipped by the pooler, so trimming it
+    /// changes nothing but the work done.
     fn run_vision(
         &self,
-        frames: &[PreprocessedImage],
+        frames: &[&PreprocessedImage],
         output_length: usize,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<SoftTokens>> {
         let batch = frames.len();
-        let max_patches = frames[0].max_patches;
-        let mut pixels = Vec::with_capacity(batch * max_patches * 768);
-        let mut positions = Vec::with_capacity(batch * max_patches * 2);
-        let mut padding = Vec::with_capacity(batch * max_patches);
+        let patches = frames
+            .iter()
+            .map(|frame| frame.real_patches)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let row = 3 * preprocess::PATCH_SIZE * preprocess::PATCH_SIZE;
+        let mut pixels = Vec::with_capacity(batch * patches * row);
+        let mut positions = Vec::with_capacity(batch * patches * 2);
+        let mut padding = Vec::with_capacity(batch * patches);
         for frame in frames {
-            pixels.extend_from_slice(&frame.pixel_values);
-            positions.extend_from_slice(&frame.position_ids);
-            for p in 0..frame.max_patches {
-                padding.push(if p < frame.real_patches { 0f32 } else { 1f32 });
-            }
+            // Real patches come first; rows past them are padding.
+            pixels.extend_from_slice(&frame.pixel_values[..patches * row]);
+            positions.extend_from_slice(&frame.position_ids[..patches * 2]);
+            padding.extend((0..patches).map(|p| if p < frame.real_patches { 0f32 } else { 1f32 }));
         }
         let pixel_values = infer(
-            Tensor::from_vec(pixels, (batch, max_patches, 768), &self.device)
+            Tensor::from_vec(pixels, (batch, patches, row), &self.device)
                 .and_then(|tensor| tensor.to_dtype(self.dtype)),
         )?;
-        let position_ids = infer(Tensor::from_vec(
-            positions,
-            (batch, max_patches, 2),
-            &self.device,
-        ))?;
-        let padding = infer(Tensor::from_vec(
-            padding,
-            (batch, max_patches),
-            &self.device,
-        ))?;
+        let position_ids = infer(Tensor::from_vec(positions, (batch, patches, 2), &self.device))?;
+        let padding = infer(Tensor::from_vec(padding, (batch, patches), &self.device))?;
         let output = infer(self.vision.forward(VisionBatch {
             pixel_values: &pixel_values,
             position_ids: &position_ids,
@@ -385,41 +409,32 @@ impl Loaded {
             output_length,
         }))?;
         let soft = infer(self.vision.embed_vision(&output.hidden))?;
-        infer(
+        let flat: Vec<f32> = infer(
             soft.to_dtype(DType::F32)
-                .and_then(|tensor| tensor.to_vec2()),
-        )
+                .and_then(|tensor| tensor.flatten_all())
+                .and_then(|tensor| tensor.to_vec1()),
+        )?;
+        let mut offset = 0;
+        Ok(output
+            .tokens_per_row
+            .iter()
+            .map(|&tokens| {
+                let len = tokens * self.text_hidden;
+                let rows = flat[offset..offset + len].to_vec();
+                offset += len;
+                SoftTokens { rows, tokens }
+            })
+            .collect())
     }
 
-    /// Build the merged `inputs_embeds` and run the text tower.
-    fn embed_one(&self, input: &MultimodalInput) -> Result<Vec<f32>> {
-        if !input.audios.is_empty() {
-            return Err(InlError::InvalidInput(
-                "audio is not supported by this build".to_string(),
-            ));
-        }
-
-        // Soft tokens, in order, for images and videos.
-        let image_blocks = input
-            .images
-            .iter()
-            .map(|image| self.image_soft_tokens(image))
-            .collect::<Result<Vec<_>>>()?;
-        let video_blocks = input
-            .videos
-            .iter()
-            .map(|video| self.video_soft_tokens(video))
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut image_features: Vec<Vec<f32>> = Vec::new();
-        for block in &image_blocks {
-            image_features.extend(block.iter().cloned());
-        }
-        let mut video_features: Vec<Vec<f32>> = Vec::new();
-        for (_, block) in &video_blocks {
-            video_features.extend(block.iter().cloned());
-        }
-
+    /// Expand the placeholders of one input for its soft tokens, tokenize it
+    /// and gather the soft-token rows in placeholder order.
+    fn prepare_text(
+        &self,
+        input: &MultimodalInput,
+        media: &InputMedia,
+        soft: &[SoftTokens],
+    ) -> Result<PreparedText> {
         // The text (an image-only input is just the image placeholder).
         let text = match (&input.text, input.images.len(), input.videos.len()) {
             (Some(text), _, _) => text.clone(),
@@ -433,21 +448,19 @@ impl Loaded {
             }
         };
 
-        let image_replacements: Vec<String> = image_blocks
+        let image_replacements: Vec<String> = media
+            .images
             .iter()
-            .map(|block| self.tokens.block(&self.tokens.image, block.len()))
+            .map(|&item| self.tokens.block(&self.tokens.image, soft[item].tokens))
             .collect();
-        let video_replacements: Vec<String> = video_blocks
+        let video_replacements: Vec<String> = media
+            .videos
             .iter()
-            .map(|(frames, block)| {
-                let per_frame = if *frames == 0 {
-                    0
-                } else {
-                    block.len() / frames
-                };
-                self.tokens
-                    .block(&self.tokens.video, per_frame)
-                    .repeat(*frames)
+            .map(|&(first, frames)| {
+                soft[first..first + frames]
+                    .iter()
+                    .map(|frame| self.tokens.block(&self.tokens.video, frame.tokens))
+                    .collect()
             })
             .collect();
         let expanded = expand(
@@ -476,28 +489,52 @@ impl Loaded {
             )));
         }
 
-        let (mut image_seen, mut video_seen) = (0usize, 0usize);
-        for &id in &ids {
-            if id == self.tokens.image_id {
-                image_seen += 1;
-            } else if id == self.tokens.video_id {
-                video_seen += 1;
+        let gather = |items: &mut dyn Iterator<Item = usize>| -> (Vec<f32>, usize) {
+            let mut rows = Vec::new();
+            let mut tokens = 0;
+            for item in items {
+                rows.extend_from_slice(&soft[item].rows);
+                tokens += soft[item].tokens;
             }
-        }
-        if image_seen != image_features.len() {
+            (rows, tokens)
+        };
+        let (image_rows, image_tokens) = gather(&mut media.images.iter().copied());
+        let (video_rows, video_tokens) =
+            gather(&mut media.videos.iter().flat_map(|&(first, frames)| first..first + frames));
+        let image_seen = ids.iter().filter(|&&id| id == self.tokens.image_id).count();
+        let video_seen = ids.iter().filter(|&&id| id == self.tokens.video_id).count();
+        if image_seen != image_tokens {
             return Err(InlError::InvalidInput(format!(
-                "text has {image_seen} image placeholders but the images produced {} soft tokens",
-                image_features.len()
+                "text has {image_seen} image placeholders but the images produced {image_tokens} soft tokens"
             )));
         }
-        if video_seen != video_features.len() {
+        if video_seen != video_tokens {
             return Err(InlError::InvalidInput(format!(
-                "text has {video_seen} video placeholders but the videos produced {} soft tokens",
-                video_features.len()
+                "text has {video_seen} video placeholders but the videos produced {video_tokens} soft tokens"
             )));
         }
+        Ok(PreparedText {
+            ids,
+            image_rows,
+            video_rows,
+        })
+    }
 
-        let input_ids = infer(Tensor::from_vec(ids.clone(), (1, seq), &self.device))?;
+    /// One text-tower pass over prepared inputs, right-padded to the longest:
+    /// token embeddings with the placeholder rows overwritten by soft tokens
+    /// (the reference `masked_scatter`), then the pooled embedding per input.
+    fn embed_texts(&self, batch: &[PreparedText]) -> Result<Vec<Vec<f32>>> {
+        let rows = batch.len();
+        let seq = batch.iter().map(|p| p.ids.len()).max().unwrap_or(0);
+        let hidden = self.text_hidden;
+        // Padding positions are masked and excluded from pooling, so any id
+        // works there.
+        let mut ids = Vec::with_capacity(rows * seq);
+        for prepared in batch {
+            ids.extend_from_slice(&prepared.ids);
+            ids.extend(std::iter::repeat_n(0u32, seq - prepared.ids.len()));
+        }
+        let input_ids = infer(Tensor::from_vec(ids, (rows, seq), &self.device))?;
         let mut embeds: Vec<f32> = infer(
             self.text
                 .token_embeddings(&input_ids)
@@ -506,38 +543,102 @@ impl Loaded {
                 .and_then(|tensor| tensor.to_vec1()),
         )?;
 
-        let (mut image_cursor, mut video_cursor) = (0usize, 0usize);
-        for (pos, &id) in ids.iter().enumerate() {
-            let row = if id == self.tokens.image_id {
-                let row = &image_features[image_cursor];
-                image_cursor += 1;
-                Some(row)
-            } else if id == self.tokens.video_id {
-                let row = &video_features[video_cursor];
-                video_cursor += 1;
-                Some(row)
-            } else {
-                None
-            };
-            if let Some(row) = row {
-                let dst = pos * self.text_hidden;
-                embeds[dst..dst + self.text_hidden].copy_from_slice(row);
+        for (row, prepared) in batch.iter().enumerate() {
+            let (mut image_cursor, mut video_cursor) = (0usize, 0usize);
+            for (pos, &id) in prepared.ids.iter().enumerate() {
+                let source = if id == self.tokens.image_id {
+                    image_cursor += hidden;
+                    &prepared.image_rows[image_cursor - hidden..image_cursor]
+                } else if id == self.tokens.video_id {
+                    video_cursor += hidden;
+                    &prepared.video_rows[video_cursor - hidden..video_cursor]
+                } else {
+                    continue;
+                };
+                let dst = (row * seq + pos) * hidden;
+                embeds[dst..dst + hidden].copy_from_slice(source);
             }
         }
 
         let embeds = infer(
-            Tensor::from_vec(embeds, (1, seq, self.text_hidden), &self.device)
+            Tensor::from_vec(embeds, (rows, seq, hidden), &self.device)
                 .and_then(|tensor| tensor.to_dtype(self.dtype)),
         )?;
-        let mut embedding = infer(self.text.embed_from_embeds(&embeds, &[seq]))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| InlError::Inference("text tower returned no embedding".to_string()))?;
+        let lens: Vec<usize> = batch.iter().map(|p| p.ids.len()).collect();
+        let mut embeddings = infer(self.text.embed_from_embeds(&embeds, &lens))?;
         if let Some(dim) = self.options.output_dim {
-            truncate_and_normalize(&mut embedding, dim);
+            for embedding in &mut embeddings {
+                truncate_and_normalize(embedding, dim);
+            }
         }
-        Ok(embedding)
+        Ok(embeddings)
     }
+}
+
+/// One image or video frame waiting for the vision tower.
+struct MediaItem {
+    pre: PreprocessedImage,
+    /// Soft-token budget: the `output_length` of its vision pass.
+    budget: usize,
+}
+
+/// Where one input's media sit in the decoded item list.
+struct InputMedia {
+    images: Vec<usize>,
+    /// `(first item, frames)` per video.
+    videos: Vec<(usize, usize)>,
+}
+
+/// One item's soft tokens in text space, `[tokens, text_hidden]` row-major.
+struct SoftTokens {
+    rows: Vec<f32>,
+    tokens: usize,
+}
+
+/// A tokenized input with its soft-token rows in placeholder order.
+struct PreparedText {
+    ids: Vec<u32>,
+    image_rows: Vec<f32>,
+    video_rows: Vec<f32>,
+}
+
+/// Split `lengths` into passes of at most `max_items` items and at most
+/// `max_tokens` padded tokens (`items x longest`). Items are taken longest
+/// first so each pass pads little; an item longer than `max_tokens` runs
+/// alone. Returns indices into `lengths`.
+fn plan_batches(lengths: &[usize], max_items: usize, max_tokens: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(lengths[i]));
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    for index in order {
+        match batches.last_mut() {
+            Some(batch)
+                if batch.len() < max_items
+                    && (batch.len() + 1) * lengths[batch[0]] <= max_tokens =>
+            {
+                batch.push(index)
+            }
+            _ => batches.push(vec![index]),
+        }
+    }
+    batches
+}
+
+/// Vision passes over `items`: grouped by soft-token budget (one
+/// `output_length` per pass), then split by [`plan_batches`] on real patches.
+fn plan_vision(items: &[MediaItem], max_items: usize, max_tokens: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut budgets: Vec<usize> = items.iter().map(|item| item.budget).collect();
+    budgets.sort_unstable();
+    budgets.dedup();
+    let mut passes = Vec::new();
+    for budget in budgets {
+        let members: Vec<usize> = (0..items.len()).filter(|&i| items[i].budget == budget).collect();
+        let lengths: Vec<usize> = members.iter().map(|&i| items[i].pre.real_patches).collect();
+        for batch in plan_batches(&lengths, max_items, max_tokens) {
+            passes.push((budget, batch.into_iter().map(|j| members[j]).collect()));
+        }
+    }
+    passes
 }
 
 /// Expand the image/video placeholders the way the reference processor does,
@@ -612,17 +713,34 @@ fn infer<T>(result: candle_core::Result<T>) -> Result<T> {
     result.map_err(|error| InlError::Inference(format!("candle: {error}")))
 }
 
+/// CPU-side work (decoding, tokenizing) off the async runtime, without the
+/// forward-pass deadline.
+async fn blocking<T, F>(task: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| InlError::Inference(format!("blocking task failed: {error}")))?
+}
+
 /// An EmbeddingGemma 2 multimodal embedder over text, images and video.
 pub struct MultimodalEmbedder {
     options: MultimodalOptions,
     slot: LoadSlot<Arc<Loaded>>,
+    deadline: BatchDeadline,
 }
+
+/// Names the work in deadline errors.
+const WHAT: &str = "multimodal forward pass";
 
 impl MultimodalEmbedder {
     pub fn new(options: MultimodalOptions) -> Self {
         Self {
             options,
             slot: LoadSlot::new(),
+            deadline: BatchDeadline::new(),
         }
     }
 
@@ -636,27 +754,85 @@ impl MultimodalEmbedder {
         Ok(self.ensure_loaded().await?.info.clone())
     }
 
-    /// Embed inputs, running each on its own blocking task under
-    /// [`MultimodalOptions::timeout_seconds`]. A timed-out pass cannot be
-    /// cancelled; the task keeps running to completion in the background.
+    /// Embed inputs, `batch_size` at a time. Their images and video frames
+    /// run through the vision tower in shared passes, then the merged
+    /// sequences through the text tower in shared passes; each pass holds at
+    /// most `batch_size` items and `max_batch_tokens` padded tokens (patches
+    /// for the vision tower). Every pass runs under
+    /// [`MultimodalOptions::timeout_seconds`]; a pass that overruns cannot be
+    /// cancelled, so after one every later call fails fast with
+    /// [`InlError::Timeout`] until the process restarts.
     pub async fn embed_inputs(&self, inputs: Vec<MultimodalInput>) -> Result<Vec<Vec<f32>>> {
+        self.deadline.ensure_healthy(WHAT)?;
         let loaded = self.ensure_loaded().await?;
-        let timeout = std::time::Duration::from_secs(self.options.timeout_seconds);
+        let budget = std::time::Duration::from_secs(self.options.timeout_seconds);
+        let max_items = self.options.batch_size.max(1);
+        let max_tokens = self.options.max_batch_tokens.max(1);
         let mut out = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let loaded = loaded.clone();
-            let task = tokio::task::spawn_blocking(move || loaded.embed_one(&input));
-            let embedding = match tokio::time::timeout(timeout, task).await {
-                Ok(joined) => joined
-                    .map_err(|e| InlError::Inference(format!("inference task failed: {e}")))??,
-                Err(_) => {
-                    return Err(InlError::Timeout(format!(
-                        "one multimodal forward pass exceeded {}s",
-                        self.options.timeout_seconds
-                    )))
-                }
+        let mut inputs = inputs.into_iter().peekable();
+        while inputs.peek().is_some() {
+            let chunk: Arc<Vec<MultimodalInput>> = Arc::new(inputs.by_ref().take(max_items).collect());
+
+            // Decoding is CPU work (and ffmpeg), not a forward pass.
+            let (items, layout) = {
+                let (loaded, chunk) = (loaded.clone(), chunk.clone());
+                blocking(move || loaded.decode_media(&chunk)).await?
             };
-            out.push(embedding);
+            let items = Arc::new(items);
+            let mut soft: Vec<Option<SoftTokens>> = (0..items.len()).map(|_| None).collect();
+            for (output_length, members) in plan_vision(&items, max_items, max_tokens) {
+                let (loaded, items, pass) = (loaded.clone(), items.clone(), members.clone());
+                let outputs = self
+                    .deadline
+                    .run(WHAT, budget, move || {
+                        let frames: Vec<&PreprocessedImage> =
+                            pass.iter().map(|&i| &items[i].pre).collect();
+                        loaded.run_vision(&frames, output_length)
+                    })
+                    .await?;
+                for (index, output) in members.into_iter().zip(outputs) {
+                    soft[index] = Some(output);
+                }
+            }
+            drop(items);
+            let soft: Vec<SoftTokens> = soft
+                .into_iter()
+                .map(|output| output.expect("every media item is in one vision pass"))
+                .collect();
+
+            let prepared = {
+                let (loaded, chunk) = (loaded.clone(), chunk.clone());
+                blocking(move || {
+                    chunk
+                        .iter()
+                        .zip(&layout)
+                        .map(|(input, media)| loaded.prepare_text(input, media, &soft))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .await?
+            };
+            let lengths: Vec<usize> = prepared.iter().map(|p| p.ids.len()).collect();
+            let mut prepared: Vec<Option<PreparedText>> = prepared.into_iter().map(Some).collect();
+            let mut embeddings: Vec<Option<Vec<f32>>> = (0..lengths.len()).map(|_| None).collect();
+            for members in plan_batches(&lengths, max_items, max_tokens) {
+                let batch: Vec<PreparedText> = members
+                    .iter()
+                    .map(|&i| prepared[i].take().expect("each input is in one text pass"))
+                    .collect();
+                let loaded = loaded.clone();
+                let outputs = self
+                    .deadline
+                    .run(WHAT, budget, move || loaded.embed_texts(&batch))
+                    .await?;
+                for (index, output) in members.into_iter().zip(outputs) {
+                    embeddings[index] = Some(output);
+                }
+            }
+            out.extend(
+                embeddings
+                    .into_iter()
+                    .map(|output| output.expect("every input is embedded")),
+            );
         }
         Ok(out)
     }
@@ -743,5 +919,22 @@ mod tests {
         assert_eq!(vector.len(), 2);
         assert!((vector[0] - 0.6).abs() < 1e-6);
         assert!((vector[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn batches_respect_the_item_and_padded_token_caps() {
+        // Longest first; 3 x 100 fits 300 tokens, a fourth would not.
+        let batches = plan_batches(&[50, 100, 80, 100, 10], 8, 300);
+        assert_eq!(batches, vec![vec![1, 3, 2], vec![0, 4]]);
+        // The item cap binds before the token cap.
+        let batches = plan_batches(&[1, 1, 1, 1, 1], 2, 1000);
+        assert_eq!(batches, vec![vec![0, 1], vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn an_item_over_the_token_cap_runs_alone() {
+        let batches = plan_batches(&[5000, 10, 10], 8, 100);
+        assert_eq!(batches, vec![vec![0], vec![1, 2]]);
+        assert!(plan_batches(&[], 8, 100).is_empty());
     }
 }
