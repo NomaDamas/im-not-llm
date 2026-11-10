@@ -26,7 +26,7 @@ For Rust applications:
 [dependencies]
 inl-text = "0.1.0"
 inl-sparse = "0.1.0"
-inl-vision = "0.1.0"
+inl-vision = "0.1.1"
 inl-server = { version = "0.1.1", default-features = false }
 ```
 
