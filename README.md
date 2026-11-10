@@ -95,8 +95,10 @@ placeholders, consumed in order:
 
 An input with media and no text is embedded as its items alone (one
 placeholder per item, images then videos then audio, as the reference
-processor joins them). Video is decoded with `ffmpeg` (on `PATH`, or
-`INL_FFMPEG`) at 1 frame per second; audio (WAV, MP3, FLAC, ... anything
+processor joins them). Video is decoded with `ffmpeg` + `ffprobe` (on `PATH`, or
+`INL_FFMPEG`) and sampled as the reference processor does: 1 frame per second
+(`video_fps`), at most 32 frames per video (longer clips are resampled
+uniformly), fewer if the frames would not fit the 8192-token context. Audio (WAV, MP3, FLAC, ... anything
 `ffmpeg` reads) is resampled to 16 kHz mono and cut at 30 s (750 soft tokens,
 one per 40 ms). Image token budget (70 / 140 / 280 / 560 / 1120) trades speed
 for detail. `--modalities` (Node: `modalities`) skips loading the vision tower

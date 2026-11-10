@@ -437,7 +437,10 @@ impl Loaded {
                 });
             }
             let budget = self.options.video_max_soft_tokens;
-            let max_frames = (self.options.max_length / (budget + 2)).max(1);
+            // The reference cap of 32 frames, lowered further when that many
+            // frame blocks would not fit the context.
+            let max_frames =
+                (self.options.max_length / (budget + 2)).clamp(1, video::DEFAULT_MAX_FRAMES);
             for video in &input.videos {
                 let frames =
                     video::extract_frames(&video.bytes, self.options.video_fps, max_frames)?;

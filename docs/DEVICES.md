@@ -169,6 +169,22 @@ cosines >= 0.9999998, audio tower max abs diff 5.6e-4 over 44.9).
 Audio on gpu01 (`cuda:0` = card 2, `@ 5ae814e`): `inl-vision --test audio`
 5/5 (embedding cosines >= 0.9999998), `--test engine` 1/1.
 
+## Video
+
+`inl-vision --test video` (four cases: video-only, interleaved text + video,
+`video_fps` 2 with 70 tokens/frame, and a 40 s clip resampled to 32 frames)
+passes with `INL_TEST_DEVICE` set, cosines vs the reference >= 0.9999998:
+Mac CPU and Metal (ffmpeg 9.0), gpu01 CUDA (`INL_FFMPEG=/data/home/jeffrey/bin/ffmpeg`,
+ffmpeg 7.0 static) and windows CUDA (`C:\ffmpeg\bin` on `PATH`, 2025 nightly).
+Frames are converted with `scale=flags=bitexact+accurate_rnd+full_chroma_int`;
+without it ffmpeg 7 and 9 produce different RGB for the same clip (cosine
+0.9991 on gpu01). `ffprobe` must sit next to `ffmpeg`.
+
+Memory: the whole golden run on Mac CPU peaks at 4.9 GB RSS (f32 weights plus
+the 32-frame, 4226-token sequence batched with two short ones). A 120 s
+640x480 30 fps clip through `inl serve --multimodal --device metal` returns in
+3.9 s, capped at 32 frames.
+
 ## Model cache and `INL_TEST_DEVICE`
 
 The engines cache models under `HF_HOME` when set, else

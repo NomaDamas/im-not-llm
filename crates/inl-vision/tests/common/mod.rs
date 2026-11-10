@@ -66,14 +66,22 @@ pub struct Golden {
     pub query: QueryGolden,
 }
 
+/// One reference video embedding; see `scripts/gen_video_golden.py`.
+#[derive(Deserialize, Clone)]
+pub struct VideoCase {
+    pub name: String,
+    pub video: String,
+    pub text: Option<String>,
+    pub fps: f64,
+    pub max_soft_tokens: usize,
+    /// Frames the reference sampler kept.
+    pub frames: usize,
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Deserialize)]
 pub struct VideoGolden {
-    pub video: String,
-    pub frames: usize,
-    pub width: usize,
-    pub height: usize,
-    pub max_soft_tokens: usize,
-    pub embedding: Vec<f32>,
+    pub cases: Vec<VideoCase>,
 }
 
 pub fn video_golden() -> VideoGolden {
