@@ -22,19 +22,20 @@ pub fn load_tower(device: &Device, dtype: DType) -> VisionTower {
     VisionTower::new(cfg, 512, vb).unwrap()
 }
 
-/// Build the `[1, max_patches, ...]` input tensors for one image.
-pub fn inputs(pre: &PreprocessedImage, device: &Device) -> (Tensor, Tensor, Tensor) {
-    let pixels = Tensor::from_vec(pre.pixel_values.clone(), (1, pre.max_patches, 768), device)
+/// Build the `[1, max_patches, ...]` input tensors for one image, plus the host
+/// padding flags the pooler now reads. The host `(x, y)` positions are already
+/// owned by the `PreprocessedImage`, so the caller borrows those.
+pub fn inputs(pre: &PreprocessedImage, device: &Device) -> (Tensor, Tensor, Tensor, Vec<f32>) {
+    let pixels = Tensor::from_slice(&pre.pixel_values, (1, pre.max_patches, 768), device)
         .unwrap()
         .to_dtype(DType::F32)
         .unwrap();
-    let positions =
-        Tensor::from_vec(pre.position_ids.clone(), (1, pre.max_patches, 2), device).unwrap();
-    let padding: Vec<f32> = (0..pre.max_patches)
+    let positions = Tensor::from_slice(&pre.position_ids, (1, pre.max_patches, 2), device).unwrap();
+    let padding_host: Vec<f32> = (0..pre.max_patches)
         .map(|p| if p < pre.real_patches { 0.0 } else { 1.0 })
         .collect();
-    let padding = Tensor::from_vec(padding, (1, pre.max_patches), device).unwrap();
-    (pixels, positions, padding)
+    let padding = Tensor::from_slice(&padding_host, (1, pre.max_patches), device).unwrap();
+    (pixels, positions, padding, padding_host)
 }
 
 #[test]
@@ -45,12 +46,14 @@ fn vision_tower_matches_the_reference() {
     let tower = load_tower(&device, DType::F32);
     for image in &golden.images {
         let pre = preprocess::preprocess(&image_bytes(&image.name), 280).unwrap();
-        let (pixels, positions, padding) = inputs(&pre, &device);
+        let (pixels, positions, padding, padding_host) = inputs(&pre, &device);
         let output = tower
             .forward(VisionBatch {
                 pixel_values: &pixels,
                 position_ids: &positions,
                 padding: &padding,
+                pool_positions: &pre.position_ids,
+                pool_padding: &padding_host,
                 output_length: 280,
             })
             .unwrap();

@@ -57,6 +57,10 @@ pub struct MultimodalOptions {
     /// Weight precision; only `f32` and `bf16` are accepted.
     pub dtype: Option<DtypeSpec>,
     pub attention: AttentionRequest,
+    /// Query rows per tiled-attention block for the vision tower. `None` takes
+    /// the `INL_VISION_ATTENTION_TILE` environment override or the default
+    /// (`256`). Only the tiled path reads it; the Metal fused path ignores it.
+    pub vision_attention_tile: Option<usize>,
     /// Model context length in tokens.
     pub max_length: usize,
     /// Soft-token budget per image (one of 70, 140, 280, 560, 1120).
@@ -93,6 +97,7 @@ impl Default for MultimodalOptions {
             device: DeviceSpec::Auto,
             dtype: None,
             attention: AttentionRequest::Auto,
+            vision_attention_tile: None,
             max_length: DEFAULT_MAX_LENGTH,
             max_soft_tokens: DEFAULT_MAX_SOFT_TOKENS,
             video_max_soft_tokens: DEFAULT_VIDEO_MAX_SOFT_TOKENS,
@@ -125,6 +130,13 @@ impl MultimodalOptions {
 
     pub fn with_attention(mut self, attention: AttentionRequest) -> Self {
         self.attention = attention;
+        self
+    }
+
+    /// Set the vision tower's tiled-attention query tile (ignored by the Metal
+    /// fused path). Must be positive.
+    pub fn with_vision_attention_tile(mut self, tile: usize) -> Self {
+        self.vision_attention_tile = Some(tile);
         self
     }
 
@@ -341,11 +353,13 @@ impl Loaded {
                 .map_err(|e| InlError::Inference(format!("media weight load failed: {e}")))?;
             if wants_vision {
                 let config = VisionConfig::parse(&config_bytes)?;
-                vision = Some(
-                    VisionTower::new(config, text_hidden, vb.clone())
-                        .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?
-                        .with_attention(options.attention)?,
-                );
+                let mut tower = VisionTower::new(config, text_hidden, vb.clone())
+                    .map_err(|e| InlError::Inference(format!("vision build failed: {e}")))?
+                    .with_attention(options.attention)?;
+                if let Some(tile) = options.vision_attention_tile {
+                    tower = tower.with_attention_tile(tile)?;
+                }
+                vision = Some(tower);
             }
             if let Some(config) = audio_config {
                 audio = Some(
@@ -502,16 +516,18 @@ impl Loaded {
             Tensor::from_vec(pixels, (batch, patches, row), &self.device)
                 .and_then(|tensor| tensor.to_dtype(self.dtype)),
         )?;
-        let position_ids = infer(Tensor::from_vec(
-            positions,
+        let position_ids = infer(Tensor::from_slice(
+            &positions,
             (batch, patches, 2),
             &self.device,
         ))?;
-        let padding = infer(Tensor::from_vec(padding, (batch, patches), &self.device))?;
+        let padding_tensor = infer(Tensor::from_slice(&padding, (batch, patches), &self.device))?;
         let output = infer(vision.forward(VisionBatch {
             pixel_values: &pixel_values,
             position_ids: &position_ids,
-            padding: &padding,
+            padding: &padding_tensor,
+            pool_positions: &positions,
+            pool_padding: &padding,
             output_length,
         }))?;
         let soft = infer(vision.embed_vision(&output.hidden))?;

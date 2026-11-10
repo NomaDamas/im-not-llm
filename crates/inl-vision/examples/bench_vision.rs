@@ -3,6 +3,10 @@
 //! `cargo run -p inl-vision --release --example bench_vision -- \
 //!      --device metal --dtype f32 --n 16 --size 320x240 --budget 280`
 //!
+//! `--tile N` overrides the tiled-attention query tile (CUDA sweeps it; the
+//! Metal fused path ignores it). It is equivalent to setting
+//! `INL_VISION_ATTENTION_TILE=N`.
+//!
 //! Prints one JSON line with the device, its effective dtype, the number of
 //! images, total seconds and images per second.
 
@@ -19,6 +23,7 @@ struct Args {
     width: u32,
     height: u32,
     budget: usize,
+    tile: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -29,6 +34,7 @@ fn parse_args() -> Args {
         width: 320,
         height: 240,
         budget: 280,
+        tile: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -44,6 +50,7 @@ fn parse_args() -> Args {
                 args.height = h.parse().expect("height");
             }
             "--budget" => args.budget = value().parse().expect("--budget"),
+            "--tile" => args.tile = Some(value().parse().expect("--tile")),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -82,6 +89,10 @@ async fn main() {
         .with_device(device)
         .with_dtype(dtype)
         .with_max_soft_tokens(args.budget);
+    let options = match args.tile {
+        Some(tile) => options.with_vision_attention_tile(tile),
+        None => options,
+    };
     let embedder = MultimodalEmbedder::new(options);
     let info = embedder.load().await.expect("load");
 

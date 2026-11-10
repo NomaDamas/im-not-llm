@@ -12,6 +12,30 @@ Use it three ways, all backed by the same engines:
 | **In-process TypeScript** | the Node-API addon in `bindings/node` |
 | **Daemon** | `inl serve` — loopback HTTP with `/health`, plus a programmatic lifecycle API |
 
+## Install
+
+```sh
+cargo install inl-server --version 0.1.0
+# NVIDIA host with the CUDA toolkit installed:
+cargo install inl-server --version 0.1.0 --features cuda
+```
+
+For Rust applications:
+
+```toml
+[dependencies]
+inl-text = "0.1.0"
+inl-sparse = "0.1.0"
+inl-vision = "0.1.0"
+inl-server = { version = "0.1.0", default-features = false }
+```
+
+`inl-server` without default features exposes the daemon library without its
+CLI or vision dependency. The crates use the registry release candle 0.11.1;
+downstream applications do not need a candle git patch. `cuda`, `accelerate`
+and `mkl` forward to the engine dependencies. Pascal CUDA builds need the
+kernel compatibility patch described in `docs/DEVICES.md`.
+
 ## Models
 
 | Model | Crate | Output | Notes |
@@ -104,6 +128,13 @@ one per 40 ms). Image token budget (70 / 140 / 280 / 560 / 1120) trades speed
 for detail. `--modalities` (Node: `modalities`) skips loading the vision tower
 (no `image`, no `video`) or the audio tower (no `audio`) and their memory.
 
+The vision tower keeps position lookup, padding masks and pooled hidden states
+on the device. Axial RoPE uses fused rotary kernels; its frequency table is
+cached per tower. Tiled attention uses 256 query rows by default; set
+`MultimodalOptions::with_vision_attention_tile(n)` or
+`INL_VISION_ATTENTION_TILE` to trade score-buffer memory for fewer matmuls.
+Metal's automatic fused attention path ignores this tile setting.
+
 ## Programmatic lifecycle
 
 Rust (`inl-server`):
@@ -168,6 +199,7 @@ bindings/node       Node-API addon
 | `INL_CACHE_DIR` | model cache when `HF_HOME` is unset (`~/.cache/im-not-llm/models`) |
 | `INL_FFMPEG` | `ffmpeg` binary for video and audio |
 | `INL_TEST_DEVICE` | `cpu` / `metal` / `cuda` for the ignored live tests |
+| `INL_VISION_ATTENTION_TILE` | positive query tile size for vision tiled attention; default 256, overridden by the Rust option |
 
 ## Tests
 

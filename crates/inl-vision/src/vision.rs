@@ -16,7 +16,8 @@
 //! (`.linear.weight`); with `use_clipped_linears = false` the clamps are the
 //! identity, so plain bias-free linears are equivalent.
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::rotary_emb::rope_thd as fused_rope;
 use candle_nn::{linear_no_bias, Activation, Linear, VarBuilder};
 use inl_core::{InlError, Result as InlResult};
 use serde::Deserialize;
@@ -27,8 +28,16 @@ use crate::preprocess::{PATCH_SIZE, POOLING_KERNEL};
 /// finite; padding query rows are discarded downstream anyway.
 const MASKED: f32 = -1e9;
 
-/// Vision tensor rows processed per attention block (bounds the score matrix).
-const ATTENTION_TILE: usize = 256;
+/// Query rows processed per attention block by the tiled path (bounds the score
+/// matrix). A larger tile trades memory for fewer, wider matmuls; the CUDA
+/// benchmark sweeps it via [`ATTENTION_TILE_ENV`] or
+/// [`VisionTower::with_attention_tile`].
+const DEFAULT_ATTENTION_TILE: usize = 256;
+
+/// Environment override for the vision attention query tile (a positive
+/// integer). Read when a [`VisionTower`] is built; [`VisionTower::with_attention_tile`]
+/// overrides it. Lets the benchmark sweep the tile without rebuilding.
+pub const ATTENTION_TILE_ENV: &str = "INL_VISION_ATTENTION_TILE";
 
 #[derive(Deserialize, Debug, Clone)]
 struct RopeParameters {
@@ -217,6 +226,7 @@ fn masked_attention(
     v: &Tensor,
     mask: &Tensor,
     kind: AttentionImpl,
+    tile: usize,
 ) -> Result<Tensor> {
     let (_, heads, seq, _) = q.dims4()?;
     match kind {
@@ -226,10 +236,10 @@ fn masked_attention(
         }
         AttentionImpl::Tiled => {
             let kt = k.transpose(2, 3)?.contiguous()?;
-            let mut blocks = Vec::with_capacity(seq.div_ceil(ATTENTION_TILE));
+            let mut blocks = Vec::with_capacity(seq.div_ceil(tile));
             let mut start = 0;
             while start < seq {
-                let rows = ATTENTION_TILE.min(seq - start);
+                let rows = tile.min(seq - start);
                 let q_tile = q.narrow(2, start, rows)?.contiguous()?;
                 let scores = q_tile.matmul(&kt)?;
                 let weights = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(mask)?)?;
@@ -279,9 +289,10 @@ impl Attention {
     fn forward(
         &self,
         hidden: &Tensor,
-        rope: (&Tensor, &Tensor),
+        rope: &RopeTables,
         mask: &Tensor,
         kind: AttentionImpl,
+        tile: usize,
     ) -> Result<Tensor> {
         let (batch, seq, _) = hidden.dims3()?;
         let dim = self.head_dim;
@@ -289,12 +300,12 @@ impl Attention {
             .apply(&self.q_proj)?
             .reshape((batch, seq, self.heads, dim))?;
         let q = self.q_norm.forward(&q)?;
-        let q = apply_multidimensional_rope(&q, rope.0, rope.1)?.transpose(1, 2)?;
+        let q = axial_rope(&q, rope)?.transpose(1, 2)?;
         let k = hidden
             .apply(&self.k_proj)?
             .reshape((batch, seq, self.kv_heads, dim))?;
         let k = self.k_norm.forward(&k)?;
-        let k = apply_multidimensional_rope(&k, rope.0, rope.1)?.transpose(1, 2)?;
+        let k = axial_rope(&k, rope)?.transpose(1, 2)?;
         let v = hidden
             .apply(&self.v_proj)?
             .reshape((batch, seq, self.kv_heads, dim))?;
@@ -310,7 +321,7 @@ impl Attention {
         };
         let (k, v) = (repeat(&k)?.contiguous()?, repeat(&v)?.contiguous()?);
 
-        let attn = masked_attention(&q, &k, &v, mask, kind)?;
+        let attn = masked_attention(&q, &k, &v, mask, kind, tile)?;
         attn.transpose(1, 2)?
             .reshape((batch, seq, self.heads * dim))?
             .apply(&self.o_proj)
@@ -374,13 +385,14 @@ impl EncoderLayer {
     fn forward(
         &self,
         hidden: &Tensor,
-        rope: (&Tensor, &Tensor),
+        rope: &RopeTables,
         mask: &Tensor,
         kind: AttentionImpl,
+        tile: usize,
     ) -> Result<Tensor> {
         let residual = hidden;
         let h = self.input_layernorm.forward(hidden)?;
-        let h = self.attention.forward(&h, rope, mask, kind)?;
+        let h = self.attention.forward(&h, rope, mask, kind, tile)?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let hidden = (residual + h)?;
         let h = self.pre_feedforward_layernorm.forward(&hidden)?;
@@ -408,6 +420,13 @@ pub struct VisionBatch<'a> {
     pub position_ids: &'a Tensor,
     /// `[batch, max_patches]`, 1 for a padding patch.
     pub padding: &'a Tensor,
+    /// `position_ids` on the host, `[batch * max_patches, 2]` row-major: the
+    /// same `(x, y)` values as [`Self::position_ids`]. The pooler derives its
+    /// slot layout from here, so it never copies the tensor back to the host.
+    pub pool_positions: &'a [i64],
+    /// `padding` on the host, `batch * max_patches`, `1.0` for a padding patch:
+    /// the same values as [`Self::padding`], kept for the pooler.
+    pub pool_padding: &'a [f32],
     /// Soft tokens the pooler should produce per image (the token budget).
     pub output_length: usize,
 }
@@ -423,6 +442,12 @@ pub struct VisionTower {
     device: Device,
     dtype: DType,
     attention: AttentionImpl,
+    /// Axial RoPE `1 / theta^(2i/spatial)` for `i in 0..spatial/2`, `[1, 1, f]`
+    /// f32. Constant across forwards, so it is built once at load rather than
+    /// rebuilt and re-uploaded every pass.
+    rope_inv_freq: Tensor,
+    /// Query rows per tiled-attention block.
+    attention_tile: usize,
 }
 
 impl VisionTower {
@@ -452,6 +477,7 @@ impl VisionTower {
         )?;
         let embed_norm =
             RmsNorm::weightless(cfg.hidden_size, cfg.rms_norm_eps as f32, &device, dtype);
+        let rope_inv_freq = RopeTables::build_inv_freq(&cfg, &device)?;
         Ok(Self {
             patch_input_proj,
             position_table,
@@ -463,7 +489,26 @@ impl VisionTower {
             cfg,
             device,
             dtype,
+            rope_inv_freq,
+            attention_tile: attention_tile_from_env(),
         })
+    }
+
+    /// Override the tiled-attention query tile (overrides [`ATTENTION_TILE_ENV`]).
+    /// A zero tile is rejected; the tiled path would never advance.
+    pub fn with_attention_tile(mut self, tile: usize) -> inl_core::Result<Self> {
+        if tile == 0 {
+            return Err(inl_core::InlError::Config(
+                "vision attention tile must be positive".to_string(),
+            ));
+        }
+        self.attention_tile = tile;
+        Ok(self)
+    }
+
+    /// The tiled-attention query tile this tower was built with.
+    pub fn attention_tile(&self) -> usize {
+        self.attention_tile
     }
 
     /// Choose the attention implementation. A tower starts on the tiled
@@ -507,22 +552,12 @@ impl VisionTower {
             .broadcast_mul(keep)
     }
 
-    /// Axial RoPE tables `[batch, seq, head_dim]` from f32 `positions`, laid
-    /// out `[freq_x, freq_x, freq_y, freq_y]`.
-    fn rope(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
-        let spatial = self.cfg.head_dim / 2;
-        let theta = self.cfg.rope_parameters.rope_theta as f32;
-        let inv_freq: Vec<f32> = (0..spatial / 2)
-            .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / spatial as f32))
-            .collect();
-        let freq = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, 1, freq), positions.device())?;
-        let x = positions.narrow(2, 0, 1)?.broadcast_mul(&inv_freq)?;
-        let y = positions.narrow(2, 1, 1)?.broadcast_mul(&inv_freq)?;
-        let (x_cos, x_sin, y_cos, y_sin) = (x.cos()?, x.sin()?, y.cos()?, y.sin()?);
-        let cos = Tensor::cat(&[&x_cos, &x_cos, &y_cos, &y_cos], 2)?.to_dtype(self.dtype)?;
-        let sin = Tensor::cat(&[&x_sin, &x_sin, &y_sin, &y_sin], 2)?.to_dtype(self.dtype)?;
-        Ok((cos, sin))
+    /// Axial RoPE tables from f32 `positions` `[batch, seq, 2]`: the x- and
+    /// y-half frequencies as separate `cos`/`sin` `[batch, seq, head_dim/4]`
+    /// tables. Kept split so each half can be rotated by candle's fused rotary
+    /// kernel ([`axial_rope`]) without rebuilding the doubled table.
+    fn rope(&self, positions: &Tensor) -> Result<RopeTables> {
+        RopeTables::new(&self.rope_inv_freq, positions, self.dtype)
     }
 
     /// Additive key mask `[batch, 1, 1, seq]`: `MASKED` on padding keys.
@@ -549,16 +584,16 @@ impl VisionTower {
         let mut hidden = scaled.apply(&self.patch_input_proj)?;
         hidden = (hidden + self.position_embeddings(&positions, &keep)?)?;
 
-        let (cos, sin) = self.rope(&positions)?;
+        let rope = self.rope(&positions)?;
         let mask = self.attention_mask(batch.padding)?;
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, (&cos, &sin), &mask, self.attention)?;
+            hidden = layer.forward(&hidden, &rope, &mask, self.attention, self.attention_tile)?;
         }
 
         let pooled = self.pool(
             &hidden,
-            batch.position_ids,
-            batch.padding,
+            batch.pool_positions,
+            batch.pool_padding,
             batch.output_length,
             batch_size,
             patches,
@@ -579,61 +614,26 @@ impl VisionTower {
 
     /// Average each `k x k` block of patches into one soft token, scale by
     /// `sqrt(hidden_size)` and keep the tokens that received patches. The slot
-    /// layout comes from the (small) position ids on the host; the hidden
-    /// states stay on the device (`index_add` + `index_select`).
+    /// layout comes from the host `(x, y)` positions and padding flags the
+    /// caller already has (the preprocessed image), so nothing is copied back
+    /// from the device; only the slot tables go up. The hidden states stay on
+    /// the device (`index_add` + `index_select`).
     fn pool(
         &self,
         hidden: &Tensor,
-        position_ids: &Tensor,
-        padding: &Tensor,
+        positions: &[i64],
+        padding: &[f32],
         output_length: usize,
         batch: usize,
         patches: usize,
     ) -> Result<PooledOutput> {
         let dim = self.cfg.hidden_size;
         let k = self.cfg.pooling_kernel_size;
-
-        let pad_host: Vec<f32> = padding.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        let pos_host: Vec<i64> = position_ids.flatten_all()?.to_vec1()?;
-
-        // Target slot of every patch; padding and out-of-budget patches go to
-        // a trailing discard slot.
-        let discard = (batch * output_length) as u32;
-        let mut slots = Vec::with_capacity(batch * patches);
-        let mut counts = vec![0u32; batch * output_length];
-        for row in 0..batch {
-            let mut max_x = 0i64;
-            for p in 0..patches {
-                max_x = max_x.max(pos_host[(row * patches + p) * 2].max(0));
-            }
-            let ncols = ((max_x + 1) / k as i64) as usize;
-            for p in 0..patches {
-                let x = pos_host[(row * patches + p) * 2].max(0) as usize;
-                let y = pos_host[(row * patches + p) * 2 + 1].max(0) as usize;
-                let idx = (x / k) + ncols * (y / k);
-                if idx >= output_length {
-                    slots.push(discard);
-                    continue;
-                }
-                counts[row * output_length + idx] += 1;
-                slots.push(if pad_host[row * patches + p] != 0.0 {
-                    discard
-                } else {
-                    (row * output_length + idx) as u32
-                });
-            }
-        }
-        let mut selected = Vec::new();
-        let mut tokens_per_row = Vec::with_capacity(batch);
-        for row in 0..batch {
-            let before = selected.len();
-            for idx in 0..output_length {
-                if counts[row * output_length + idx] > 0 {
-                    selected.push((row * output_length + idx) as u32);
-                }
-            }
-            tokens_per_row.push(selected.len() - before);
-        }
+        let PoolLayout {
+            slots,
+            selected,
+            tokens_per_row,
+        } = pool_layout(positions, padding, output_length, batch, patches, k)?;
 
         let device = hidden.device();
         let slots = Tensor::from_vec(slots, batch * patches, device)?;
@@ -660,28 +660,140 @@ struct PooledOutput {
     tokens_per_row: Vec<usize>,
 }
 
-/// Apply the axial 2-D RoPE: split the head into two halves (x-part, y-part),
-/// rotate each with its own frequencies, and concatenate.
-fn apply_multidimensional_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dim = x.dim(D::Minus1)?;
-    let part = dim / 2;
-    let x0 = x.narrow(D::Minus1, 0, part)?;
-    let x1 = x.narrow(D::Minus1, part, part)?;
-    let c0 = cos.narrow(D::Minus1, 0, part)?.unsqueeze(2)?;
-    let s0 = sin.narrow(D::Minus1, 0, part)?.unsqueeze(2)?;
-    let c1 = cos.narrow(D::Minus1, part, part)?.unsqueeze(2)?;
-    let s1 = sin.narrow(D::Minus1, part, part)?.unsqueeze(2)?;
-    let y0 = apply_rotary(&x0, &c0, &s0)?;
-    let y1 = apply_rotary(&x1, &c1, &s1)?;
-    Tensor::cat(&[y0, y1], D::Minus1)
+/// The host-side pool layout: each patch's target slot (`discard` for padding
+/// and out-of-budget patches) and the kept slots in row-major order.
+struct PoolLayout {
+    slots: Vec<u32>,
+    selected: Vec<u32>,
+    tokens_per_row: Vec<usize>,
 }
 
-fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
-    x.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?
+/// Map each patch to its pooling slot from the host `(x, y)` positions and
+/// padding flags, in patch order within each row. A patch lands in the discard
+/// slot when it is padding or its `(x, y)` block is past `output_length`.
+fn pool_layout(
+    positions: &[i64],
+    padding: &[f32],
+    output_length: usize,
+    batch: usize,
+    patches: usize,
+    kernel: usize,
+) -> Result<PoolLayout> {
+    if positions.len() != batch * patches * 2 || padding.len() != batch * patches {
+        candle_core::bail!(
+            "pool metadata shape mismatch: positions {} padding {} for {batch}x{patches} patches",
+            positions.len(),
+            padding.len()
+        );
+    }
+    // Target slot of every patch; padding and out-of-budget patches go to
+    // a trailing discard slot.
+    let discard = (batch * output_length) as u32;
+    let mut slots = Vec::with_capacity(batch * patches);
+    let mut counts = vec![0u32; batch * output_length];
+    for row in 0..batch {
+        let mut max_x = 0i64;
+        for p in 0..patches {
+            max_x = max_x.max(positions[(row * patches + p) * 2].max(0));
+        }
+        let ncols = ((max_x + 1) / kernel as i64) as usize;
+        for p in 0..patches {
+            let x = positions[(row * patches + p) * 2].max(0) as usize;
+            let y = positions[(row * patches + p) * 2 + 1].max(0) as usize;
+            let idx = (x / kernel) + ncols * (y / kernel);
+            if idx >= output_length {
+                slots.push(discard);
+                continue;
+            }
+            counts[row * output_length + idx] += 1;
+            slots.push(if padding[row * patches + p] != 0.0 {
+                discard
+            } else {
+                (row * output_length + idx) as u32
+            });
+        }
+    }
+    let mut selected = Vec::new();
+    let mut tokens_per_row = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let before = selected.len();
+        for idx in 0..output_length {
+            if counts[row * output_length + idx] > 0 {
+                selected.push((row * output_length + idx) as u32);
+            }
+        }
+        tokens_per_row.push(selected.len() - before);
+    }
+    Ok(PoolLayout {
+        slots,
+        selected,
+        tokens_per_row,
+    })
+}
+
+/// The tiled-attention query tile: [`ATTENTION_TILE_ENV`] when set to a positive
+/// integer, else [`DEFAULT_ATTENTION_TILE`].
+fn attention_tile_from_env() -> usize {
+    std::env::var(ATTENTION_TILE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&tile| tile > 0)
+        .unwrap_or(DEFAULT_ATTENTION_TILE)
+}
+
+/// Axial RoPE frequencies for one forward, with the x- and y-half tables kept
+/// separate so each half can be fed to candle's fused rotary kernel.
+struct RopeTables {
+    cos_x: Tensor,
+    sin_x: Tensor,
+    cos_y: Tensor,
+    sin_y: Tensor,
+}
+
+impl RopeTables {
+    /// The constant `1 / theta^(2i/spatial)` table `[1, 1, head_dim/4]` f32,
+    /// where `spatial = head_dim/2`. Independent of the positions, so it is
+    /// built once at load.
+    fn build_inv_freq(cfg: &VisionConfig, device: &Device) -> Result<Tensor> {
+        let spatial = cfg.head_dim / 2;
+        let theta = cfg.rope_parameters.rope_theta as f32;
+        let inv_freq: Vec<f32> = (0..spatial / 2)
+            .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / spatial as f32))
+            .collect();
+        Tensor::from_vec(inv_freq, (1, 1, spatial / 2), device)
+    }
+
+    /// The x- and y-half tables `[batch, seq, head_dim/4]` for `positions`
+    /// `[batch, seq, 2]` (f32), in the model `dtype`.
+    fn new(inv_freq: &Tensor, positions: &Tensor, dtype: DType) -> Result<Self> {
+        let x = positions.narrow(2, 0, 1)?.broadcast_mul(inv_freq)?;
+        let y = positions.narrow(2, 1, 1)?.broadcast_mul(inv_freq)?;
+        Ok(Self {
+            cos_x: x.cos()?.to_dtype(dtype)?,
+            sin_x: x.sin()?.to_dtype(dtype)?,
+            cos_y: y.cos()?.to_dtype(dtype)?,
+            sin_y: y.sin()?.to_dtype(dtype)?,
+        })
+    }
+}
+
+/// Rotate `x` `[batch, seq, heads, head_dim]` by the axial 2-D RoPE in place
+/// and return the same layout.
+///
+/// The head splits into an x-half and a y-half, each rotated independently with
+/// its own frequencies. Each half is exactly candle's fused rotary kernel
+/// (`candle_nn::rotary_emb::rope_thd`: `[b, t, h, d]` with a `[b, t, d/2]`
+/// table), so the rotation is two kernels over the halves instead of the
+/// `narrow`/`cat`/`mul`/`add` chain the reference spelling needed, and the
+/// `[batch, seq, heads, head_dim]` layout is kept (the caller transposes).
+fn axial_rope(x: &Tensor, rope: &RopeTables) -> Result<Tensor> {
+    let dim = x.dim(3)?;
+    let half = dim / 2;
+    let lo = x.narrow(3, 0, half)?.contiguous()?;
+    let hi = x.narrow(3, half, half)?.contiguous()?;
+    let lo = fused_rope(&lo, &rope.cos_x, &rope.sin_x)?;
+    let hi = fused_rope(&hi, &rope.cos_y, &rope.sin_y)?;
+    Tensor::cat(&[lo, hi], 3)
 }
 
 #[cfg(test)]
@@ -732,7 +844,15 @@ mod tests {
     fn tiled_attention_ignores_padding_keys() {
         let device = Device::Cpu;
         let (q, k, v, mask) = attention_case(&device, 40, 31);
-        let tiled = masked_attention(&q, &k, &v, &mask, AttentionImpl::Tiled).unwrap();
+        let tiled = masked_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            AttentionImpl::Tiled,
+            DEFAULT_ATTENTION_TILE,
+        )
+        .unwrap();
         // Same result when the padding keys are physically removed.
         let kr = k.narrow(2, 0, 31).unwrap().contiguous().unwrap();
         let vr = v.narrow(2, 0, 31).unwrap().contiguous().unwrap();
@@ -756,8 +876,24 @@ mod tests {
             return;
         };
         let (q, k, v, mask) = attention_case(&device, 300, 211);
-        let tiled = masked_attention(&q, &k, &v, &mask, AttentionImpl::Tiled).unwrap();
-        let fused = masked_attention(&q, &k, &v, &mask, AttentionImpl::MetalSdpa).unwrap();
+        let tiled = masked_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            AttentionImpl::Tiled,
+            DEFAULT_ATTENTION_TILE,
+        )
+        .unwrap();
+        let fused = masked_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            AttentionImpl::MetalSdpa,
+            DEFAULT_ATTENTION_TILE,
+        )
+        .unwrap();
         let diff = max_diff(
             &tiled.narrow(2, 0, 211).unwrap(),
             &fused.narrow(2, 0, 211).unwrap(),
@@ -779,5 +915,182 @@ mod tests {
             "eager keeps the reference tiled path"
         );
         assert!(AttentionImpl::resolve(AttentionRequest::Fused, &cpu, 64).is_err());
+    }
+
+    /// Deterministic pseudo-random f32 in `[-1, 1]` (`len` values, `seed`ed).
+    fn ramp(len: usize, seed: u64) -> Vec<f32> {
+        const A: u64 = 6364136223846793005;
+        const C: u64 = 1442695040888963407;
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(A).wrapping_add(C);
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    fn test_config() -> VisionConfig {
+        VisionConfig::parse(
+            br#"{"vision_config": {
+                "hidden_size": 768, "intermediate_size": 3072, "num_hidden_layers": 16,
+                "num_attention_heads": 12, "num_key_value_heads": 12, "head_dim": 64,
+                "hidden_activation": "gelu_pytorch_tanh", "rms_norm_eps": 1e-6,
+                "patch_size": 16, "pooling_kernel_size": 3, "position_embedding_size": 10240,
+                "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"},
+                "standardize": false, "use_clipped_linears": false
+            }}"#,
+        )
+        .unwrap()
+    }
+
+    /// The rotation the reference spelling implements: rotate the first and the
+    /// second half of the head separately and concatenate.
+    fn reference_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let half = x.dim(3)? / 2;
+        let a = x.narrow(3, 0, half)?;
+        let b = x.narrow(3, half, half)?;
+        let rotated = Tensor::cat(&[&b.neg()?, &a], 3)?;
+        x.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?
+    }
+
+    fn reference_axial_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let part = x.dim(3)? / 2;
+        let x0 = x.narrow(3, 0, part)?;
+        let x1 = x.narrow(3, part, part)?;
+        let c0 = cos.narrow(2, 0, part)?.unsqueeze(2)?;
+        let s0 = sin.narrow(2, 0, part)?.unsqueeze(2)?;
+        let c1 = cos.narrow(2, part, part)?.unsqueeze(2)?;
+        let s1 = sin.narrow(2, part, part)?.unsqueeze(2)?;
+        let y0 = reference_rotary(&x0, &c0, &s0)?;
+        let y1 = reference_rotary(&x1, &c1, &s1)?;
+        Tensor::cat(&[y0, y1], 3)
+    }
+
+    /// The fused `axial_rope` must equal the reference spelling of the axial
+    /// rotation: a split into an x-half and a y-half, each rotated with its own
+    /// frequencies.
+    fn rope_equivalence(device: &Device, dtype: DType, tolerance: f32) {
+        let cfg = test_config();
+        let (batch, seq, heads, dim) = (2, 5, 2, cfg.head_dim);
+        let positions = ramp(batch * seq * 2, 7)
+            .into_iter()
+            .map(|v| (v * 4.0).round())
+            .collect::<Vec<f32>>();
+        let positions = Tensor::from_vec(positions, (batch, seq, 2), device).unwrap();
+        let inv_freq = RopeTables::build_inv_freq(&cfg, device).unwrap();
+        let tables = RopeTables::new(&inv_freq, &positions, dtype).unwrap();
+
+        let x = ramp(batch * seq * heads * dim, 11);
+        let x = Tensor::from_vec(x, (batch, seq, heads, dim), device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let got = axial_rope(&x, &tables).unwrap();
+
+        let cos = Tensor::cat(
+            &[&tables.cos_x, &tables.cos_x, &tables.cos_y, &tables.cos_y],
+            2,
+        )
+        .unwrap();
+        let sin = Tensor::cat(
+            &[&tables.sin_x, &tables.sin_x, &tables.sin_y, &tables.sin_y],
+            2,
+        )
+        .unwrap();
+        let want = reference_axial_rope(&x, &cos, &sin).unwrap();
+
+        assert_eq!(got.dims(), want.dims());
+        let got = got.to_dtype(DType::F32).unwrap();
+        let want = want.to_dtype(DType::F32).unwrap();
+        let diff = max_diff(&got, &want);
+        assert!(
+            diff <= tolerance,
+            "fused rope differs from reference by {diff}"
+        );
+    }
+
+    #[test]
+    fn fused_axial_rope_matches_the_reference_on_cpu() {
+        rope_equivalence(&Device::Cpu, DType::F32, 1e-4);
+        rope_equivalence(&Device::Cpu, DType::BF16, 1e-1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_axial_rope_matches_the_reference_on_metal() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        rope_equivalence(&device, DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fused_axial_rope_matches_the_reference_on_cuda() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        rope_equivalence(&device, DType::F32, 1e-3);
+    }
+
+    /// The tile only partitions the query rows; the result is unchanged.
+    #[test]
+    fn attention_tile_partition_does_not_change_the_result() {
+        let device = Device::Cpu;
+        let (q, k, v, mask) = attention_case(&device, 300, 211);
+        let want = masked_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            AttentionImpl::Tiled,
+            DEFAULT_ATTENTION_TILE,
+        )
+        .unwrap();
+        assert_eq!(want.dims(), &[1usize, 4, 300, 64]);
+        for tile in [1usize, 7, 64, 128, 1_000] {
+            let got = masked_attention(&q, &k, &v, &mask, AttentionImpl::Tiled, tile).unwrap();
+            assert_eq!(got.dims(), want.dims(), "tile {tile}");
+            let diff = max_diff(&got, &want);
+            assert!(diff < 1e-4, "tile {tile} changed the result by {diff}");
+        }
+    }
+
+    /// The pooler plans its slots from the host `(x, y)` and padding flags, not
+    /// from the device tensors.
+    #[test]
+    fn pool_layout_maps_patches_from_host_metadata() {
+        // One row: six patches along x, a 3-wide pooling kernel -> 2 columns,
+        // slots [0,0,0,1,1,1].
+        let positions: Vec<i64> = (0..6i64).flat_map(|x| [x, 0]).collect();
+        let layout = pool_layout(&positions, &[0.0; 6], 2, 1, 6, 3).unwrap();
+        assert_eq!(layout.slots, vec![0, 0, 0, 1, 1, 1]);
+        assert_eq!(layout.selected, vec![0, 1]);
+        assert_eq!(layout.tokens_per_row, vec![2]);
+
+        // A padding patch drops out of its slot but the slot stays selected.
+        let padding = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let layout = pool_layout(&positions, &padding, 2, 1, 6, 3).unwrap();
+        assert_eq!(layout.slots, vec![0, 0, 0, 1, 1, 2]);
+        assert_eq!(layout.tokens_per_row, vec![2]);
+
+        // A patch past the token budget lands in the discard slot.
+        let layout = pool_layout(&positions, &[0.0; 6], 1, 1, 6, 3).unwrap();
+        assert_eq!(layout.slots, vec![0, 0, 0, 1, 1, 1]);
+        assert_eq!(layout.selected, vec![0]);
+        assert_eq!(layout.tokens_per_row, vec![1]);
+        assert_eq!(layout.slots[3], 1, "slot 1 is the discard slot here");
+    }
+
+    #[test]
+    fn pool_layout_rejects_mismatched_host_metadata() {
+        // batch 1 x patches 1 needs 2 positions and 1 padding flag.
+        assert!(pool_layout(&[0, 0, 0], &[0.0], 1, 1, 1, 3).is_err());
+        assert!(pool_layout(&[0, 0], &[0.0, 0.0], 1, 1, 1, 3).is_err());
+        assert!(pool_layout(&[0, 0], &[0.0], 1, 1, 1, 3).is_ok());
     }
 }
