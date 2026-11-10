@@ -92,7 +92,7 @@ Windows). The server binds loopback only: it has no authentication.
 |---|---|---|
 | `GET /health` | all | — |
 | `POST /embed` | dense, multimodal (text only) | TEI: `{"inputs": [...], "input_type": "query"\|"passage"}` → `[[f32]]` |
-| `POST /v1/embeddings` | dense, multimodal | OpenAI: `{"input": [...]}`; multimodal accepts items `{"type": "image", "data": "<base64>"}` |
+| `POST /v1/embeddings` | dense, multimodal, sparse | OpenAI: `{"input": [...]}`; multimodal accepts items `{"type": "image", "data": "<base64>"}`; sparse returns each `embedding` as `[{"index", "value"}]` rows (no `base64` encoding) |
 | `POST /embed_sparse` | sparse | TEI sparse: → `[[{"index", "value"}]]` |
 | `POST /embed_multimodal` | multimodal | `{"inputs": [{"text"?, "images"?, "videos"?, "audios"?}]}` (media base64) → `{"embeddings", "model", "dimensions"}` |
 | `POST /admin/unload`, `POST /admin/shutdown` | all | loopback only |
