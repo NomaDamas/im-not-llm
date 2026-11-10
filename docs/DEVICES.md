@@ -163,7 +163,11 @@ bf16 kernels (`CUDA_ERROR_NOT_FOUND, named symbol not found`).
 Live goldens with `INL_TEST_DEVICE=cuda` (2026-11-10): `gemma2_live` 2/2,
 `qwen3_live` 1/1 (cosine CPU vs CUDA 1.0000002 / 0.99999964), `sparse_live`
 4/4 (CUDA f32 16.4 chunks/s, f16 1.5, bf16 unavailable), `inl-vision --test
-engine` 1/1 (cosines >= 0.9999997).
+engine` 1/1 (cosines >= 0.9999997), `inl-vision --test audio` 5/5 (embedding
+cosines >= 0.9999998, audio tower max abs diff 5.6e-4 over 44.9).
+
+Audio on gpu01 (`cuda:0` = card 2, `@ 5ae814e`): `inl-vision --test audio`
+5/5 (embedding cosines >= 0.9999998), `--test engine` 1/1.
 
 ## Model cache and `INL_TEST_DEVICE`
 
