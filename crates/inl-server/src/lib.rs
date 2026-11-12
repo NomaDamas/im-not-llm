@@ -12,7 +12,11 @@
 //! * `dense` serves `/embed` and `/v1/embeddings`;
 //! * `sparse` (a learned-sparse SPLADE encoder) serves `/embed_sparse`;
 //! * `multimodal` serves `/embed_multimodal`, `/v1/embeddings` (items may be
-//!   media) and `/embed` (text only).
+//!   media) and `/embed` (text only);
+//! * `late` (a late-interaction multi-vector encoder) serves `/embed`
+//!   `{ "model"?, "dimensions"?, "inputs": [{ "kind", "role", "value" }] }` ->
+//!   `{ "model", "dimensions", "embeddings": [[[f32]]] }` (one vector per
+//!   token, the ClawGallery VDR protocol).
 //!
 //! A server that does not serve a route answers 404 there.
 //!
@@ -41,6 +45,7 @@ use inl_core::{
     DenseEngine, EngineInfo, InlError, MediaBytes, Modality, MultimodalEngine, MultimodalInput,
     Result,
 };
+use inl_late::{LateEngine, MultiVector, Task};
 use inl_sparse::{SparseEngine, SparseVector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -85,6 +90,7 @@ pub enum EngineKind {
     Dense,
     Sparse,
     Multimodal,
+    Late,
 }
 
 impl EngineKind {
@@ -93,17 +99,20 @@ impl EngineKind {
             Self::Dense => "dense",
             Self::Sparse => "sparse",
             Self::Multimodal => "multimodal",
+            Self::Late => "late",
         }
     }
 }
 
-/// The engine behind one server. Dense, learned-sparse and multimodal engines
-/// are driven through this one enum so a server's shape is decided at start.
+/// The engine behind one server. Dense, learned-sparse, multimodal and
+/// late-interaction engines are driven through this one enum so a server's
+/// shape is decided at start.
 #[derive(Clone)]
 pub enum Engine {
     Dense(Arc<dyn DenseEngine>),
     Sparse(Arc<dyn SparseEngine>),
     Multimodal(Arc<dyn MultimodalEngine>),
+    Late(Arc<dyn LateEngine>),
 }
 
 impl Engine {
@@ -119,11 +128,16 @@ impl Engine {
         Self::Multimodal(engine)
     }
 
+    pub fn late(engine: Arc<dyn LateEngine>) -> Self {
+        Self::Late(engine)
+    }
+
     pub fn kind(&self) -> EngineKind {
         match self {
             Self::Dense(_) => EngineKind::Dense,
             Self::Sparse(_) => EngineKind::Sparse,
             Self::Multimodal(_) => EngineKind::Multimodal,
+            Self::Late(_) => EngineKind::Late,
         }
     }
 
@@ -132,6 +146,7 @@ impl Engine {
             Self::Dense(engine) => engine.load().await,
             Self::Sparse(engine) => engine.load().await,
             Self::Multimodal(engine) => engine.load().await,
+            Self::Late(engine) => engine.load().await,
         }
     }
 
@@ -139,9 +154,10 @@ impl Engine {
         match self {
             Self::Dense(engine) => engine.token_counts(texts).await,
             Self::Sparse(engine) => engine.token_counts(texts).await,
-            Self::Multimodal(_) => Err(InlError::Config(
-                "token counts are not available for a multimodal engine".to_string(),
-            )),
+            Self::Multimodal(_) | Self::Late(_) => Err(InlError::Config(format!(
+                "token counts are not available for a {} engine",
+                self.kind().as_str()
+            ))),
         }
     }
 
@@ -172,12 +188,22 @@ impl Engine {
         }
     }
 
+    async fn encode_late(&self, texts: Vec<String>, task: Task) -> Result<Vec<MultiVector>> {
+        match self {
+            Self::Late(engine) => engine.encode(texts, task).await,
+            _ => Err(InlError::Config(
+                "this server has no late-interaction engine".to_string(),
+            )),
+        }
+    }
+
     /// Release the weights; the next request reloads.
     pub async fn unload(&self) -> bool {
         match self {
             Self::Dense(engine) => engine.unload().await,
             Self::Sparse(engine) => engine.unload().await,
             Self::Multimodal(engine) => engine.unload().await,
+            Self::Late(engine) => engine.unload().await,
         }
     }
 
@@ -186,6 +212,7 @@ impl Engine {
             Self::Dense(engine) => engine.is_loaded(),
             Self::Sparse(engine) => engine.is_loaded(),
             Self::Multimodal(engine) => engine.is_loaded(),
+            Self::Late(engine) => engine.is_loaded(),
         }
     }
 }
@@ -275,7 +302,7 @@ fn dense_kind() -> String {
 pub struct Health {
     /// `loading`, `ok` or `stopping`.
     pub status: String,
-    /// `dense`, `sparse` or `multimodal`.
+    /// `dense`, `sparse`, `multimodal` or `late`.
     #[serde(default = "dense_kind")]
     pub kind: String,
     pub model_id: String,
@@ -479,6 +506,7 @@ pub fn instance_key(key: &InstanceKey) -> Result<String> {
         EngineKind::Dense => "",
         EngineKind::Sparse => "-sparse",
         EngineKind::Multimodal => "-multimodal",
+        EngineKind::Late => "-late",
     };
     Ok(format!("{name}{infix}-{}", &digest[..12]))
 }
@@ -578,6 +606,12 @@ pub async fn start_multimodal(
     options: ServeOptions,
 ) -> Result<Started> {
     start_engine(Engine::multimodal(engine), options).await
+}
+
+/// Like [`start`], for a late-interaction engine: serves the multi-vector
+/// `POST /embed`.
+pub async fn start_late(engine: Arc<dyn LateEngine>, options: ServeOptions) -> Result<Started> {
+    start_engine(Engine::late(engine), options).await
 }
 
 async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> {
@@ -841,6 +875,7 @@ fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
             .route("/embed", post(tei_embed))
             .route("/embed_multimodal", post(embed_multimodal))
             .route("/v1/embeddings", post(openai_embeddings)),
+        EngineKind::Late => routes.route("/embed", post(late_embed)),
     };
     routes
         .layer(DefaultBodyLimit::max(max_request_bytes))
@@ -1251,6 +1286,11 @@ async fn tei_embed(
                 StatusCode::NOT_FOUND,
                 "this server serves sparse vectors; use /embed_sparse",
             )),
+            // `/embed` on a late server is `late_embed`; this arm is unrouted.
+            Engine::Late(_) => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "this server serves token vectors; send `{kind, role, value}` inputs",
+            )),
         }
     }
     .await;
@@ -1367,6 +1407,12 @@ async fn openai_embeddings(
                     tokens: 0,
                     base64,
                 }
+            }
+            Engine::Late(_) => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "this server serves token vectors (late interaction); use /embed",
+                ))
             }
             Engine::Sparse(_) => {
                 if base64 {
@@ -1721,6 +1767,121 @@ async fn embed_multimodal(
             "embeddings": vectors,
             "model": state.info.model_id,
             "dimensions": state.info.dimension,
+        }))
+    }
+    .await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error.render(Protocol::Tei),
+    }
+}
+
+/// One input of the late-interaction `POST /embed` (the ClawGallery VDR
+/// protocol). `kind` is `text` or `caption` (both plain text); `role` is
+/// `query` or `document`.
+#[derive(Deserialize)]
+struct LateItem {
+    kind: String,
+    role: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct LateRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    dimensions: Option<usize>,
+    inputs: Vec<LateItem>,
+}
+
+/// `POST /embed` on a late-interaction server: every input becomes one
+/// vector per token, encoded with its role's prompt, context and skiplist.
+/// A `model` or `dimensions` other than the served ones is refused, so a
+/// caller never mixes vector spaces in one index.
+async fn late_embed(
+    State(app): State<BodyLimited>,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> Response {
+    let state = &app.state;
+    let _busy = state.busy();
+    let result = async {
+        let request: LateRequest = parse_body(body, app.max_request_bytes)?;
+        if let Some(model) = &request.model {
+            if !state.serves_model(model) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "the model `{model}` is not served here; this server serves `{}`",
+                        state.info.model_id
+                    ),
+                ));
+            }
+        }
+        if let Some(dimensions) = request.dimensions {
+            if dimensions != state.info.dimension {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "`dimensions` {dimensions} is not supported; this model returns {}",
+                        state.info.dimension
+                    ),
+                ));
+            }
+        }
+        if request.inputs.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "`inputs` cannot be empty",
+            ));
+        }
+        if request.inputs.len() > state.max_inputs {
+            return Err(batch_too_large(request.inputs.len(), state.max_inputs));
+        }
+        let invalid = |message: String| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message);
+        let count = request.inputs.len();
+        let mut groups: [(Task, Vec<usize>, Vec<String>); 2] = [
+            (Task::Query, Vec::new(), Vec::new()),
+            (Task::Document, Vec::new(), Vec::new()),
+        ];
+        for (index, item) in request.inputs.into_iter().enumerate() {
+            if !matches!(item.kind.as_str(), "text" | "caption") {
+                return Err(invalid(format!(
+                    "input {index}: kind `{}` is not supported; this text encoder accepts \
+                     `text` and `caption`",
+                    item.kind
+                )));
+            }
+            let group = match item.role.as_str() {
+                "query" => &mut groups[0],
+                "document" => &mut groups[1],
+                other => {
+                    return Err(invalid(format!(
+                        "input {index}: role `{other}` must be `query` or `document`"
+                    )))
+                }
+            };
+            group.1.push(index);
+            group.2.push(item.value);
+        }
+        let mut embeddings: Vec<MultiVector> = vec![Vec::new(); count];
+        for (task, indices, texts) in groups {
+            if texts.is_empty() {
+                continue;
+            }
+            let vectors = state
+                .engine
+                .encode_late(texts, task)
+                .await
+                .map_err(|error| engine_error(state, error))?;
+            for (index, vector) in indices.into_iter().zip(vectors) {
+                embeddings[index] = vector;
+            }
+        }
+        Ok(json!({
+            "model": state.info.model_id,
+            "dimensions": state.info.dimension,
+            "embeddings": embeddings,
         }))
     }
     .await;

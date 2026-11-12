@@ -1,8 +1,8 @@
 //! `inl`: the im-not-llm daemon and lifecycle CLI.
 //!
 //! * `inl serve`  — run an engine behind loopback HTTP (TEI / OpenAI / sparse
-//!   / multimodal routes), adopting a server already running for the same
-//!   instance.
+//!   / multimodal / late-interaction routes), adopting a server already
+//!   running for the same instance.
 //! * `inl health` — print the served instance's `/health` JSON; exit 0 only
 //!   when its status is `ok`.
 //! * `inl stop`   — ask a running server to drain and exit.
@@ -80,8 +80,8 @@ struct ServeArgs {
     #[arg(long)]
     dtype: Option<String>,
     /// Serve the learned-sparse (SPLADE) encoder. Optional: without a kind
-    /// flag the kind follows `--model` (a ModernBERT checkpoint is sparse,
-    /// anything else dense), and the same routes answer either way.
+    /// flag the kind follows `--model` (a ModernBERT checkpoint is sparse, a
+    /// Qwen3.5 checkpoint late interaction, anything else dense).
     #[arg(long)]
     sparse: bool,
     /// Serve a multimodal embedder: `POST /embed_multimodal` and media items
@@ -89,6 +89,10 @@ struct ServeArgs {
     /// can also serve dense text.
     #[arg(long)]
     multimodal: bool,
+    /// Serve a late-interaction (multi-vector) encoder: `POST /embed` returns
+    /// one vector per token. Optional, like `--sparse`.
+    #[arg(long)]
+    late: bool,
     /// With `--multimodal`: the towers to load, comma-separated from `text`,
     /// `image`, `video` and `audio` (default: every tower the checkpoint has).
     /// A modality left out is not loaded and is refused with 422.
@@ -98,7 +102,7 @@ struct ServeArgs {
 
 impl ServeArgs {
     fn kind(&self) -> Result<EngineKind> {
-        match kind_flag(self.sparse, self.multimodal)? {
+        match kind_flag(self.sparse, self.multimodal, self.late)? {
             Some(kind) => Ok(kind),
             None => engines::detect_kind(&self.engine_args()),
         }
@@ -137,6 +141,9 @@ struct DiscoverArgs {
     /// Only look for a multimodal embedder.
     #[arg(long)]
     multimodal: bool,
+    /// Only look for a late-interaction encoder.
+    #[arg(long)]
+    late: bool,
 }
 
 impl DiscoverArgs {
@@ -146,7 +153,7 @@ impl DiscoverArgs {
     /// they were started with. More than one match is an error that lists
     /// them, because stopping the wrong server is worse than asking.
     async fn client(&self) -> Result<Option<DaemonClient>> {
-        let kinds = match kind_flag(self.sparse, self.multimodal)? {
+        let kinds = match kind_flag(self.sparse, self.multimodal, self.late)? {
             Some(kind) => vec![kind],
             // Like `serve`: no model and no kind flag is the dense default.
             None if self.model.as_deref().is_none_or(str::is_empty) => vec![EngineKind::Dense],
@@ -154,6 +161,7 @@ impl DiscoverArgs {
                 EngineKind::Dense,
                 EngineKind::Sparse,
                 EngineKind::Multimodal,
+                EngineKind::Late,
             ],
         };
         let engine_args = EngineArgs {
@@ -196,15 +204,16 @@ impl DiscoverArgs {
 
 const NO_SERVER: &str = "inl: no running server found (start one with `inl serve`)";
 
-/// The kind a flag names; `None` when neither flag is given.
-fn kind_flag(sparse: bool, multimodal: bool) -> Result<Option<EngineKind>> {
-    match (sparse, multimodal) {
-        (true, true) => Err(InlError::Config(
-            "`--sparse` and `--multimodal` are mutually exclusive".to_string(),
+/// The kind a flag names; `None` when no kind flag is given.
+fn kind_flag(sparse: bool, multimodal: bool, late: bool) -> Result<Option<EngineKind>> {
+    match (sparse, multimodal, late) {
+        (false, false, false) => Ok(None),
+        (true, false, false) => Ok(Some(EngineKind::Sparse)),
+        (false, true, false) => Ok(Some(EngineKind::Multimodal)),
+        (false, false, true) => Ok(Some(EngineKind::Late)),
+        _ => Err(InlError::Config(
+            "`--sparse`, `--multimodal` and `--late` are mutually exclusive".to_string(),
         )),
-        (true, false) => Ok(Some(EngineKind::Sparse)),
-        (false, true) => Ok(Some(EngineKind::Multimodal)),
-        (false, false) => Ok(None),
     }
 }
 

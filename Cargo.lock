@@ -1684,10 +1684,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inl-late"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "candle-core",
+ "candle-nn",
+ "inl-core",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "inl-node"
 version = "0.1.0"
 dependencies = [
  "inl-core",
+ "inl-late",
  "inl-server",
  "inl-sparse",
  "inl-text",
@@ -1708,6 +1724,7 @@ dependencies = [
  "clap",
  "fs2",
  "inl-core",
+ "inl-late",
  "inl-sparse",
  "inl-text",
  "inl-vision",

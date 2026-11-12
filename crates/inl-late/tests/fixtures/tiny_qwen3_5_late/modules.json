@@ -1,0 +1,26 @@
+[
+ {
+  "idx": 0,
+  "name": "0",
+  "path": "",
+  "type": "sentence_transformers.base.modules.transformer.Transformer"
+ },
+ {
+  "idx": 1,
+  "name": "1",
+  "path": "1_Dense",
+  "type": "sentence_transformers.base.modules.dense.Dense"
+ },
+ {
+  "idx": 2,
+  "name": "2",
+  "path": "2_MultiVectorMask",
+  "type": "sentence_transformers.multi_vector_encoder.modules.MultiVectorMask"
+ },
+ {
+  "idx": 3,
+  "name": "3",
+  "path": "3_Normalize",
+  "type": "sentence_transformers.base.modules.Normalize"
+ }
+]

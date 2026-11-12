@@ -1,14 +1,15 @@
 # im-not-llm
 
 On-device inference for models that are **not** LLMs: dense text embeddings,
-learned-sparse (SPLADE) encoders, and multimodal (image / video / audio) embeddings.
+learned-sparse (SPLADE) encoders, late-interaction (multi-vector) text
+encoders, and multimodal (image / video / audio) embeddings.
 Rust on [candle](https://github.com/huggingface/candle), CPU / Metal / CUDA.
 
 Use it three ways, all backed by the same engines:
 
 | | How |
 |---|---|
-| **In-process Rust** | depend on `inl-text`, `inl-sparse`, `inl-vision` |
+| **In-process Rust** | depend on `inl-text`, `inl-sparse`, `inl-late`, `inl-vision` |
 | **In-process TypeScript** | the Node-API addon in `bindings/node` |
 | **Daemon** | `inl serve` — loopback HTTP with `/health`, plus a programmatic lifecycle API |
 
@@ -68,6 +69,7 @@ inl serve                         # Qwen3-Embedding-0.6B, dense
 inl serve --model nlpai-lab/KURE-Sparse-nano   # sparse: the kind follows the model
 inl serve --sparse                # KURE-Sparse-nano, the sparse default
 inl serve --multimodal            # EmbeddingGemma 2: text + image + video + audio
+inl serve --model perplexity-ai/pplx-embed-v2-late-0.6b   # late interaction: one vector per token
 inl serve --multimodal --modalities text,audio   # load only the towers listed
 inl serve --model <repo-or-dir> --device cuda --dtype bf16
 
@@ -77,9 +79,10 @@ inl stop   --multimodal           # drain and exit
 inl devices                       # cpu / metal / cuda availability of this build
 ```
 
-Without `--sparse` / `--multimodal`, `serve` picks the kind from the model's
-`config.json`: a ModernBERT checkpoint is a SPLADE encoder, anything else a
-dense text encoder. Both serve OpenAI `POST /v1/embeddings` (sparse rows are
+Without `--sparse` / `--multimodal` / `--late`, `serve` picks the kind from the
+model's `config.json`: a ModernBERT checkpoint is a SPLADE encoder, a Qwen3.5
+checkpoint a late-interaction encoder, anything else a dense text encoder.
+Dense and sparse both serve OpenAI `POST /v1/embeddings` (sparse rows are
 `[{index, value}]`) next to TEI's `/embed` / `/embed_sparse`, so switching
 between dense and sparse is only a `--model` change.
 Multimodal is always explicit, because EmbeddingGemma 2 also serves dense text.
@@ -100,6 +103,7 @@ Windows). The server binds loopback only: it has no authentication.
 |---|---|---|
 | `GET /health` | all | — |
 | `POST /embed` | dense, multimodal (text only) | TEI: `{"inputs": [...], "input_type": "query"\|"passage"}` → `[[f32]]` |
+| `POST /embed` | late | `{"model"?, "dimensions"?, "inputs": [{"kind": "text"\|"caption", "role": "query"\|"document", "value"}]}` → `{"model", "dimensions", "embeddings": [[[f32]]]}` (one L2-normalised vector per token; the ClawGallery VDR protocol). A `model`/`dimensions` other than the served one is a 400 |
 | `POST /v1/embeddings` | dense, multimodal, sparse | OpenAI: `{"input": [...]}`; multimodal accepts items `{"type": "image", "data": "<base64>"}`; sparse returns each `embedding` as `[{"index", "value"}]` rows (no `base64` encoding) |
 | `POST /embed_sparse` | sparse | TEI sparse: → `[[{"index", "value"}]]` |
 | `POST /embed_multimodal` | multimodal | `{"inputs": [{"text"?, "images"?, "videos"?, "audios"?}]}` (media base64) → `{"embeddings", "model", "dimensions"}` |
@@ -194,6 +198,7 @@ after a timeout every later call in that process fails fast: restart the process
 crates/inl-core     device/dtype selection, Hugging Face hub client, attention, deadlines, engine traits
 crates/inl-text     Qwen3-Embedding, EmbeddingGemma 2 text
 crates/inl-sparse   ModernBERT + SPLADE pooling (KURE-Sparse-nano)
+crates/inl-late     Qwen3.5 text tower + multi-vector heads (pplx-embed-v2-late)
 crates/inl-vision   EmbeddingGemma 2 vision + audio towers, image/video/audio preprocessing, multimodal merge
 crates/inl-server   daemon library, `inl` CLI, lifecycle client
 bindings/node       Node-API addon

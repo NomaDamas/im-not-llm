@@ -1,0 +1,9 @@
+{
+ "model_type": "MultiVectorEncoder",
+ "prompts": {
+  "query": "[Q] ",
+  "document": "[D] "
+ },
+ "default_prompt_name": null,
+ "similarity_fn_name": "maxsim"
+}

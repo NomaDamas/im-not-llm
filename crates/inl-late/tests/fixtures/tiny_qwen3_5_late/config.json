@@ -1,0 +1,45 @@
+{
+ "architectures": [
+  "Qwen3_5Model"
+ ],
+ "model_type": "qwen3_5",
+ "text_config": {
+  "model_type": "qwen3_5_text",
+  "vocab_size": 64,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 4,
+  "linear_key_head_dim": 8,
+  "linear_value_head_dim": 8,
+  "linear_conv_kernel_dim": 4,
+  "layer_types": [
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "hidden_act": "silu",
+  "rms_norm_eps": 1e-06,
+  "attn_output_gate": true,
+  "attention_bias": false,
+  "is_causal": false,
+  "rope_parameters": {
+   "rope_type": "default",
+   "rope_theta": 10000.0,
+   "partial_rotary_factor": 0.25,
+   "mrope_section": [
+    1,
+    1,
+    0
+   ],
+   "mrope_interleaved": true
+  },
+  "max_position_embeddings": 4096,
+  "tie_word_embeddings": true
+ }
+}

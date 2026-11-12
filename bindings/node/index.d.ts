@@ -156,8 +156,8 @@ export class SparseEncoder {
 
 /** Which engine a daemon serves and how it is built. */
 export interface EngineOptions {
-  /** `dense` (default), `sparse` or `multimodal`. */
-  kind?: 'dense' | 'sparse' | 'multimodal'
+  /** `dense` (default), `sparse`, `multimodal` or `late` (multi-vector `POST /embed`). */
+  kind?: 'dense' | 'sparse' | 'multimodal' | 'late'
   /** Hub repo id or local directory; omitted uses the kind's default. */
   model?: string
   /** `auto` (default), `cpu`, `metal` or `cuda`. */
@@ -198,8 +198,8 @@ export interface ServerOptions {
 export interface DiscoverOptions {
   /** Hub repo id or local directory; omitted uses the kind's default. */
   model?: string
-  /** `dense` (default), `sparse` or `multimodal`. */
-  kind?: 'dense' | 'sparse' | 'multimodal'
+  /** `dense` (default), `sparse`, `multimodal` or `late`. */
+  kind?: 'dense' | 'sparse' | 'multimodal' | 'late'
   /** `auto` (default), `cpu`, `metal` or `cuda`. */
   device?: string
   /** `auto` (default), `f32`, `f16` or `bf16`. */

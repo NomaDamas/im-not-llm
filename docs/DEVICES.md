@@ -215,6 +215,28 @@ the 32-frame, 4226-token sequence batched with two short ones). A 120 s
 640x480 30 fps clip through `inl serve --multimodal --device metal` returns in
 3.9 s, capped at 32 frames.
 
+## Late interaction (pplx-embed-v2-late)
+
+`inl-late --test late_live -- --ignored` compares every token vector of
+`perplexity-ai/pplx-embed-v2-late-0.6b` against Sentence-Transformers, alone
+and batched (batch 1 and 8): max |diff| <= 2.3e-7 on Mac CPU and Metal,
+<= 3.5e-7 on gpu01 CUDA (`CUDA_VISIBLE_DEVICES=2`), all f32.
+
+The checkpoint's full-attention heads are 256 wide. candle instantiates the
+Metal SDPA kernel for f32 at 256, but its tile does not fit the 32 KiB of
+threadgroup memory, so creating the pipeline fails at the first forward
+("Failed to create pipeline"). f32 therefore uses the tiled attention on Metal
+(`/health` `attention: "tiled"`); bf16 keeps the fused kernel (`"fused"`, token
+vectors within 1.3e-3 of f32, same MaxSim ranking).
+
+`inl serve --model perplexity-ai/pplx-embed-v2-late-0.6b` detects the kind from
+`config.json` (`model_type: qwen3_5`) on Metal and gpu01 CUDA; `inl health`,
+`inl stop` with `--late` find it. ClawGallery's own VDR library
+(`clawgallery-vdr`, `embedding_search` and `late_interaction_score`) works
+against it for queries and captions. Its `sync` also sends every image as
+`kind: "image"`, which this text-only encoder refuses with 422, so a
+ClawGallery index of images still needs an image-capable server.
+
 ## Model cache and `INL_TEST_DEVICE`
 
 The engines cache models under `HF_HOME` when set, else

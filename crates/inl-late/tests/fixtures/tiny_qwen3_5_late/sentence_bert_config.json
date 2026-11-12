@@ -1,0 +1,5 @@
+{
+ "query_length": 24,
+ "document_length": 160,
+ "module_output_name": "token_embeddings"
+}
