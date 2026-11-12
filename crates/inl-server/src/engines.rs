@@ -67,6 +67,28 @@ pub fn default_model(kind: EngineKind) -> &'static str {
     }
 }
 
+/// The engine kind a `--model` serves when no kind flag is given, read from
+/// its `config.json`: a ModernBERT checkpoint is a SPLADE encoder (the only
+/// ModernBERT engine), anything else a dense text encoder. Multimodal stays
+/// opt-in because the same EmbeddingGemma 2 checkpoint also serves dense.
+/// No `--model` is the dense default and reads nothing.
+pub fn detect_kind(args: &EngineArgs) -> Result<EngineKind> {
+    let Some(model) = args.model.as_deref().filter(|model| !model.is_empty()) else {
+        return Ok(EngineKind::Dense);
+    };
+    let cache = inl_core::device::model_cache_dir(args.cache_dir.as_deref());
+    let path = inl_core::hub::ModelSource::resolve(model, cache)?.fetch("config.json")?;
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|error| inl_core::InlError::Config(format!("{model}: config.json: {error}")))?;
+    Ok(
+        if config["model_type"] == inl_sparse::modernbert::MODEL_TYPE {
+            EngineKind::Sparse
+        } else {
+            EngineKind::Dense
+        },
+    )
+}
+
 /// The query/passage prefixes a server applies when the caller sends
 /// `input_type`: the checkpoint's own markers, absent for the dense text
 /// encoders (their prompts are caller-supplied).
@@ -121,5 +143,55 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
                 inl_vision::MultimodalEmbedder::new(options),
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind_of_config(config: &str) -> EngineKind {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        detect_kind(&EngineArgs {
+            model: Some(dir.path().display().to_string()),
+            ..EngineArgs::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_model_config_decides_between_sparse_and_dense() {
+        assert_eq!(
+            kind_of_config(r#"{"model_type":"modernbert"}"#),
+            EngineKind::Sparse
+        );
+        assert_eq!(
+            kind_of_config(r#"{"model_type":"qwen3"}"#),
+            EngineKind::Dense
+        );
+        assert_eq!(
+            kind_of_config(r#"{"model_type":"embedding_gemma2"}"#),
+            EngineKind::Dense
+        );
+    }
+
+    #[test]
+    fn no_model_is_the_dense_default_without_reading_anything() {
+        assert_eq!(
+            detect_kind(&EngineArgs::default()).unwrap(),
+            EngineKind::Dense
+        );
+    }
+
+    #[test]
+    fn a_model_without_a_config_is_an_error_not_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = detect_kind(&EngineArgs {
+            model: Some(dir.path().display().to_string()),
+            ..EngineArgs::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("config.json"), "{error}");
     }
 }

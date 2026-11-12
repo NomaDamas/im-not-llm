@@ -65,7 +65,8 @@ throughput and the known problems per machine.
 cargo build --release -p inl-server --bin inl
 
 inl serve                         # Qwen3-Embedding-0.6B, dense
-inl serve --sparse                # KURE-Sparse-nano
+inl serve --model nlpai-lab/KURE-Sparse-nano   # sparse: the kind follows the model
+inl serve --sparse                # KURE-Sparse-nano, the sparse default
 inl serve --multimodal            # EmbeddingGemma 2: text + image + video + audio
 inl serve --multimodal --modalities text,audio   # load only the towers listed
 inl serve --model <repo-or-dir> --device cuda --dtype bf16
@@ -76,10 +77,17 @@ inl stop   --multimodal           # drain and exit
 inl devices                       # cpu / metal / cuda availability of this build
 ```
 
-`health`, `stop` and `unload` find the running server by **model and kind**
-(`--sparse` / `--multimodal`); they do not need the device or dtype it was
-started with. If several servers run the same model, they refuse and list them
-— pass `--state-dir` to pick one.
+Without `--sparse` / `--multimodal`, `serve` picks the kind from the model's
+`config.json`: a ModernBERT checkpoint is a SPLADE encoder, anything else a
+dense text encoder. Both serve OpenAI `POST /v1/embeddings` (sparse rows are
+`[{index, value}]`) next to TEI's `/embed` / `/embed_sparse`, so switching
+between dense and sparse is only a `--model` change.
+Multimodal is always explicit, because EmbeddingGemma 2 also serves dense text.
+
+`health`, `stop` and `unload` find the running server by **model** (a kind
+flag only narrows the search); they do not need the device or dtype it was
+started with. If several servers match, they refuse and list them — pass
+`--state-dir` to pick one.
 
 One model instance is served once: a second `inl serve` for the same instance
 adopts the running server instead of loading another copy. State lives in

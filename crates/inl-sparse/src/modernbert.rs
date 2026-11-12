@@ -20,6 +20,9 @@ use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 use inl_core::{InlError, Result};
 use serde::Deserialize;
 
+/// `model_type` of the checkpoint's `config.json`.
+pub const MODEL_TYPE: &str = "modernbert";
+
 /// `config.json` of a ModernBERT checkpoint (the fields the forward pass uses).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModernBertConfig {
