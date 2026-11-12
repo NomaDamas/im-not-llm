@@ -79,11 +79,14 @@ struct ServeArgs {
     /// `auto`, `f32`, `f16` or `bf16`.
     #[arg(long)]
     dtype: Option<String>,
-    /// Serve the learned-sparse (SPLADE) encoder: TEI's `POST /embed_sparse`.
+    /// Serve the learned-sparse (SPLADE) encoder. Optional: without a kind
+    /// flag the kind follows `--model` (a ModernBERT checkpoint is sparse,
+    /// anything else dense), and the same routes answer either way.
     #[arg(long)]
     sparse: bool,
     /// Serve a multimodal embedder: `POST /embed_multimodal` and media items
-    /// on `POST /v1/embeddings`.
+    /// on `POST /v1/embeddings`. Never inferred, because the same checkpoint
+    /// can also serve dense text.
     #[arg(long)]
     multimodal: bool,
     /// With `--multimodal`: the towers to load, comma-separated from `text`,
@@ -95,7 +98,10 @@ struct ServeArgs {
 
 impl ServeArgs {
     fn kind(&self) -> Result<EngineKind> {
-        kind_of(self.sparse, self.multimodal)
+        match kind_flag(self.sparse, self.multimodal)? {
+            Some(kind) => Ok(kind),
+            None => engines::detect_kind(&self.engine_args()),
+        }
     }
 
     fn engine_args(&self) -> EngineArgs {
@@ -115,8 +121,8 @@ struct DiscoverArgs {
     /// state directory.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
-    /// Model id the server serves (defaults to the kind's model). Device and
-    /// dtype need not be repeated: the server is found by model and kind.
+    /// Model id the server serves (defaults to the kind's model). Device,
+    /// dtype and kind need not be repeated: the server is found by model.
     #[arg(long)]
     model: Option<String>,
     /// `auto`, `cpu`, `metal` or `cuda`.
@@ -125,22 +131,31 @@ struct DiscoverArgs {
     /// `auto`, `f32`, `f16` or `bf16`.
     #[arg(long)]
     dtype: Option<String>,
-    /// The server serves a sparse encoder.
+    /// Only look for a sparse encoder.
     #[arg(long)]
     sparse: bool,
-    /// The server serves a multimodal embedder.
+    /// Only look for a multimodal embedder.
     #[arg(long)]
     multimodal: bool,
 }
 
 impl DiscoverArgs {
     /// The running server this command talks to. An explicit `--state-dir`
-    /// names it directly; otherwise it is found by model and kind among the
-    /// live servers, whatever device / dtype they were started with. More than
-    /// one match is an error that lists them, because stopping the wrong
-    /// server is worse than asking.
+    /// names it directly; otherwise it is found by model (and kind, when a
+    /// kind flag narrows it) among the live servers, whatever device / dtype
+    /// they were started with. More than one match is an error that lists
+    /// them, because stopping the wrong server is worse than asking.
     async fn client(&self) -> Result<Option<DaemonClient>> {
-        let kind = kind_of(self.sparse, self.multimodal)?;
+        let kinds = match kind_flag(self.sparse, self.multimodal)? {
+            Some(kind) => vec![kind],
+            // Like `serve`: no model and no kind flag is the dense default.
+            None if self.model.as_deref().is_none_or(str::is_empty) => vec![EngineKind::Dense],
+            None => vec![
+                EngineKind::Dense,
+                EngineKind::Sparse,
+                EngineKind::Multimodal,
+            ],
+        };
         let engine_args = EngineArgs {
             model: self.model.clone(),
             device: self.device.clone(),
@@ -151,9 +166,12 @@ impl DiscoverArgs {
         if let Some(state_dir) = &self.state_dir {
             return Ok(DaemonClient::from_state_dir(state_dir));
         }
-        let model = engine_args.model_or_default(kind);
         let serve_root = inl_core::device::cache_root().join("serve");
-        let mut found = inl_server::find_instances(&serve_root, &model, kind).await;
+        let mut found = Vec::new();
+        for kind in kinds {
+            let model = engine_args.model_or_default(kind);
+            found.extend(inl_server::find_instances(&serve_root, &model, kind).await);
+        }
         match found.len() {
             0 => Ok(None),
             1 => {
@@ -161,11 +179,14 @@ impl DiscoverArgs {
                 Ok(DaemonClient::discover(&one.state_dir, &one.instance))
             }
             _ => Err(InlError::Config(format!(
-                "{} servers run {model}: {}; pass --state-dir to pick one",
+                "{} servers match: {}; pass --state-dir to pick one",
                 found.len(),
                 found
                     .iter()
-                    .map(|f| format!("{} ({}, {})", f.health.url, f.health.device, f.health.dtype))
+                    .map(|f| format!(
+                        "{} {} ({}, {})",
+                        f.health.model_id, f.health.url, f.health.device, f.health.dtype
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             ))),
@@ -175,14 +196,15 @@ impl DiscoverArgs {
 
 const NO_SERVER: &str = "inl: no running server found (start one with `inl serve`)";
 
-fn kind_of(sparse: bool, multimodal: bool) -> Result<EngineKind> {
+/// The kind a flag names; `None` when neither flag is given.
+fn kind_flag(sparse: bool, multimodal: bool) -> Result<Option<EngineKind>> {
     match (sparse, multimodal) {
         (true, true) => Err(InlError::Config(
             "`--sparse` and `--multimodal` are mutually exclusive".to_string(),
         )),
-        (true, false) => Ok(EngineKind::Sparse),
-        (false, true) => Ok(EngineKind::Multimodal),
-        (false, false) => Ok(EngineKind::Dense),
+        (true, false) => Ok(Some(EngineKind::Sparse)),
+        (false, true) => Ok(Some(EngineKind::Multimodal)),
+        (false, false) => Ok(None),
     }
 }
 
