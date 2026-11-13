@@ -17,7 +17,7 @@ struct Case {
     vectors: MultiVector,
 }
 
-/// fp32 against fp32 through 28 layers; a wrong mask, rope or recurrence
+/// fp32 against fp32 through the full tower; a wrong mask, rope or recurrence
 /// moves single components by 1e-1 or more.
 const TOLERANCE: f32 = 2e-3;
 
@@ -65,14 +65,24 @@ async fn native_encoder_matches_sentence_transformers_on_the_real_model() {
     for batch_size in [1, 8] {
         let encoder = encoder(batch_size);
         for name in ["query", "document"] {
-            let group: Vec<&Case> = cases.iter().filter(|case| case.task == name).collect();
+            // Exercise an actual eight-input forward, not just a limit of eight.
+            let group: Vec<&Case> = cases
+                .iter()
+                .filter(|case| case.task == name)
+                .cycle()
+                .take(if batch_size == 1 {
+                    cases.iter().filter(|case| case.task == name).count()
+                } else {
+                    8
+                })
+                .collect();
             let texts = group.iter().map(|case| case.text.clone()).collect();
             let ours = encoder.encode(texts, task(name)).await.unwrap();
             for (vectors, case) in ours.iter().zip(&group) {
                 check(
                     vectors,
                     &case.vectors,
-                    &format!("batch {batch_size} {name} {:?}", case.text),
+                    &format!("batch {batch_size} {name} {} bytes", case.text.len()),
                 );
             }
         }

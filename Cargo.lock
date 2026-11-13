@@ -1689,8 +1689,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "inl-core",
+ "objc2",
+ "objc2-metal",
  "serde",
  "serde_json",
  "tokenizers",

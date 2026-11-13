@@ -37,7 +37,7 @@ fn encoder(batch_size: usize) -> LateEncoder {
     LateEncoder::new(
         LateOptions::default()
             .with_id(fixture().to_string_lossy())
-            .with_device("cpu")
+            .with_device(std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into()))
             .with_batch_size(batch_size),
     )
     .unwrap()
@@ -103,7 +103,7 @@ async fn a_shorter_max_length_caps_both_tasks() {
     let encoder = LateEncoder::new(
         LateOptions::default()
             .with_id(fixture().to_string_lossy())
-            .with_device("cpu")
+            .with_device(std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into()))
             .with_max_length(10),
     )
     .unwrap();

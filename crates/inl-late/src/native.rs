@@ -643,7 +643,10 @@ fn encode_batch(loaded: &Loaded, rows: &[Vec<u32>], task: Task) -> Result<Vec<Mu
     let vectors = (|| -> candle_core::Result<Vec<Vec<Vec<f32>>>> {
         let ids = Tensor::from_vec(flat, (rows.len(), seq), device)?;
         let hidden = loaded.model.forward(&ids, &lengths)?.to_dtype(DType::F32)?;
-        let mut projected = hidden.broadcast_matmul(&loaded.projection)?;
+        let mut projected = hidden
+            .reshape((rows.len() * seq, loaded.model.hidden_size()))?
+            .matmul(&loaded.projection)?
+            .reshape((rows.len(), seq, ()))?;
         if let Some(bias) = &loaded.bias {
             projected = projected.broadcast_add(bias)?;
         }

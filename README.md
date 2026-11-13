@@ -87,6 +87,14 @@ Dense and sparse both serve OpenAI `POST /v1/embeddings` (sparse rows are
 between dense and sparse is only a `--model` change.
 Multimodal is always explicit, because EmbeddingGemma 2 also serves dense text.
 
+Late-interaction inference defaults to f32 (including on Metal). Its Metal
+delta-rule, convolution and normalization kernels are fused; bf16 is an
+explicit speed/precision tradeoff, not the default. Run
+`cargo run --release -p inl-late --example bench_late -- --device metal --dtype f32`
+for warm latency/throughput; measured before/after results and precision
+limits are in [the device guide](docs/DEVICES.md#late-interaction-pplx-embed-v2-late).
+For Mac CPU deployments, enable `--features accelerate` at build time.
+
 `health`, `stop` and `unload` find the running server by **model** (a kind
 flag only narrows the search); they do not need the device or dtype it was
 started with. If several servers match, they refuse and list them — pass

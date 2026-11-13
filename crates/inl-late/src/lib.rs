@@ -3,6 +3,7 @@
 //! Sentence-Transformers `MultiVectorEncoder` checkpoints over a Qwen3.5 text
 //! tower (`perplexity-ai/pplx-embed-v2-late-0.6b`) on candle.
 
+mod metal;
 mod native;
 pub mod qwen3_5;
 

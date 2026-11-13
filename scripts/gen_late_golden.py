@@ -28,6 +28,8 @@ cases = {
     "document": [
         "Paris is the capital and largest city of France.",
         "Hello, world! (a test) -- with punctuation.",
+        "Paris is the capital and largest city of France. " * 7,
+        "Paris is the capital and largest city of France. " * 26,
     ],
 }
 golden = []

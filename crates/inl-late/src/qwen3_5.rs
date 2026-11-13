@@ -239,12 +239,13 @@ impl Mlp {
 }
 
 /// Per-row facts of one forward pass shared by every layer.
-pub struct Batch {
+pub struct Batch<'a> {
     /// Additive key mask, `[B, 1, 1, T]` (bidirectional) or `[B, 1, T, T]`
     /// (causal), in the model dtype.
-    mask: Tensor,
+    mask: Option<Tensor>,
     cos: Tensor,
     sin: Tensor,
+    delta: &'a DeltaPlan,
 }
 
 struct FullAttention {
@@ -332,10 +333,14 @@ impl FullAttention {
         let n_rep = self.heads / self.kv_heads;
         let out = match self.backend {
             AttentionBackend::Sdpa if t > 1 => {
-                let mask = batch.mask.broadcast_as((b, self.heads, t, t))?;
-                candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
+                let mask = batch
+                    .mask
+                    .as_ref()
+                    .map(|mask| mask.broadcast_as((b, self.heads, t, t)))
+                    .transpose()?;
+                candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, scale as f32, 1.0)?
             }
-            _ => tiled(&q, &k, &v, &batch.mask, scale, n_rep)?,
+            _ => grouped_tiled(&q, &k, &v, batch.mask.as_ref(), scale, n_rep)?,
         };
         let out = out.transpose(1, 2)?.reshape((b, t, self.heads * hd))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
@@ -343,6 +348,7 @@ impl FullAttention {
     }
 }
 
+#[cfg(test)]
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
@@ -355,32 +361,42 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
 
 /// Attention over blocks of query rows: scratch is bounded by
 /// `B x heads x QUERY_TILE x T`.
-fn tiled(
+fn grouped_tiled(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    mask: &Tensor,
+    mask: Option<&Tensor>,
     scale: f64,
     n_rep: usize,
 ) -> Result<Tensor> {
-    let t = q.dim(2)?;
-    let k = repeat_kv(k, n_rep)?;
-    let v = repeat_kv(v, n_rep)?;
+    let (b, heads, t, d) = q.dims4()?;
+    let kv = k.dim(1)?;
     let kt = k.transpose(2, 3)?.contiguous()?;
     let q = (q * scale)?;
-    let causal = mask.dim(2)? > 1;
+    let causal = mask.is_some_and(|mask| mask.dims()[2] > 1);
     let mut blocks = Vec::with_capacity(t.div_ceil(QUERY_TILE));
     let mut start = 0;
     while start < t {
         let rows = QUERY_TILE.min(t - start);
-        let scores = q.narrow(2, start, rows)?.matmul(&kt)?;
-        let rows_mask = if causal {
-            mask.narrow(2, start, rows)?
+        // Fold query groups into GEMM rows. Keys/values stay at KV-head
+        // count instead of being copied once per query head.
+        let query = q
+            .narrow(2, start, rows)?
+            .reshape((b, kv, n_rep * rows, d))?;
+        let scores = query.matmul(&kt)?.reshape((b, heads, rows, t))?;
+        let scores = if let Some(mask) = mask {
+            let rows_mask = if causal {
+                mask.narrow(2, start, rows)?
+            } else {
+                mask.clone()
+            };
+            scores.broadcast_add(&rows_mask)?
         } else {
-            mask.clone()
+            scores
         };
-        let scores = scores.broadcast_add(&rows_mask)?;
-        blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?);
+        let weights =
+            candle_nn::ops::softmax_last_dim(&scores)?.reshape((b, kv, n_rep * rows, t))?;
+        blocks.push(weights.matmul(v)?.reshape((b, heads, rows, d))?);
         start += rows;
     }
     if blocks.len() == 1 {
@@ -462,7 +478,7 @@ impl GatedDeltaNet {
         out.expect("a kernel has at least one tap").silu()
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, plan: &DeltaPlan) -> Result<Tensor> {
         let (b, t, _) = xs.dims3()?;
         let (nk, nv, dk, dv) = (
             self.key_heads,
@@ -470,12 +486,11 @@ impl GatedDeltaNet {
             self.key_dim,
             self.value_dim,
         );
-        let mixed = self.causal_conv(&self.in_proj_qkv.forward(xs)?)?;
-        let q = mixed.narrow(2, 0, nk * dk)?.reshape((b, t, nk, dk))?;
-        let k = mixed.narrow(2, nk * dk, nk * dk)?.reshape((b, t, nk, dk))?;
-        let v = mixed
-            .narrow(2, 2 * nk * dk, nv * dv)?
-            .reshape((b, t, nv, dv))?;
+        let projected = self.in_proj_qkv.forward(xs)?;
+        let mixed = match &plan.metal {
+            Some(kernels) => crate::metal::causal_conv(&projected, &self.conv, kernels)?,
+            None => self.causal_conv(&projected)?,
+        };
         let beta = candle_nn::ops::sigmoid(&self.in_proj_b.forward(xs)?.to_dtype(DType::F32)?)?;
         let a = self
             .in_proj_a
@@ -483,28 +498,47 @@ impl GatedDeltaNet {
             .to_dtype(DType::F32)?
             .broadcast_add(&self.dt_bias)?;
         let g = softplus(&a)?.broadcast_mul(&self.neg_a)?;
-        let (q, k) = if nv > nk {
-            let rep = nv / nk;
-            let interleave = |x: Tensor| -> Result<Tensor> {
-                x.unsqueeze(3)?
-                    .broadcast_as((b, t, nk, rep, dk))?
-                    .reshape((b, t, nv, dk))
-            };
-            (interleave(q)?, interleave(k)?)
+        let core = if let Some(kernels) = plan
+            .metal
+            .as_ref()
+            .filter(|_| t <= CHUNK && dk <= 128 && dv <= 128)
+        {
+            crate::metal::recurrent_delta(&mixed, &g, &beta, nk, nv, dk, dv, kernels)?
         } else {
-            (q, k)
+            let q = mixed.narrow(2, 0, nk * dk)?.reshape((b, t, nk, dk))?;
+            let k = mixed.narrow(2, nk * dk, nk * dk)?.reshape((b, t, nk, dk))?;
+            let v = mixed
+                .narrow(2, 2 * nk * dk, nv * dv)?
+                .reshape((b, t, nv, dv))?;
+            let (q, k) = if nv > nk {
+                let rep = nv / nk;
+                let interleave = |x: Tensor| -> Result<Tensor> {
+                    x.unsqueeze(3)?
+                        .broadcast_as((b, t, nk, rep, dk))?
+                        .reshape((b, t, nv, dk))
+                };
+                (interleave(q)?, interleave(k)?)
+            } else {
+                (q, k)
+            };
+            chunk_gated_delta_rule(&q, &k, &v, &g, &beta, plan)?
         };
-        let core = chunk_gated_delta_rule(&q, &k, &v, &g, &beta)?;
         // Gated RMSNorm per value head: normalize in f32, scale in the model
         // dtype, gate with silu(z) in f32.
         let dtype = xs.dtype();
         let z = self.in_proj_z.forward(xs)?.reshape((b, t, nv, dv))?;
-        let core = core.to_dtype(dtype)?.to_dtype(DType::F32)?;
-        let variance = core.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = core.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let normed = normed.to_dtype(dtype)?.broadcast_mul(&self.norm_weight)?;
-        let gated = (normed.to_dtype(DType::F32)? * z.to_dtype(DType::F32)?.silu()?)?;
-        let out = gated.to_dtype(dtype)?.reshape((b, t, nv * dv))?;
+        let core = core.to_dtype(dtype)?;
+        let out = if let Some(kernels) = plan.metal.as_ref().filter(|_| dv <= 128) {
+            crate::metal::gated_norm(&core, &z, &self.norm_weight, self.eps, kernels)?
+        } else {
+            let core = core.to_dtype(DType::F32)?;
+            let variance = core.sqr()?.mean_keepdim(D::Minus1)?;
+            let normed = core.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+            let normed = normed.to_dtype(dtype)?.broadcast_mul(&self.norm_weight)?;
+            let gated = (normed.to_dtype(DType::F32)? * z.to_dtype(DType::F32)?.silu()?)?;
+            gated.to_dtype(dtype)?
+        }
+        .reshape((b, t, nv * dv))?;
         self.out_proj.forward(&out)
     }
 }
@@ -519,6 +553,49 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 fn l2norm(x: &Tensor) -> Result<Tensor> {
     let norm = (x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
     x.broadcast_div(&norm)
+}
+
+/// Sequence-only tensors shared by all linear-attention layers of a forward.
+/// Short inputs use a smaller power-of-two chunk without changing the rule.
+struct DeltaPlan {
+    size: usize,
+    lower: Tensor,
+    strictly_lower: Tensor,
+    inverse_indices: Vec<Tensor>,
+    metal: Option<crate::metal::Kernels>,
+}
+
+impl DeltaPlan {
+    fn new(tokens: usize, device: &Device, metal: Option<crate::metal::Kernels>) -> Result<Self> {
+        let size = tokens.clamp(1, CHUNK).next_power_of_two();
+        let positions = Tensor::arange(0u32, size as u32, device)?;
+        let rows = positions.reshape((size, 1))?;
+        let cols = positions.reshape((1, size))?;
+        let mut inverse_indices = Vec::with_capacity(size.ilog2() as usize);
+        let mut width = 1;
+        while metal.is_none() && width < size {
+            let mut indices = Vec::with_capacity(size / 2 * width);
+            for pair in 0..size / (2 * width) {
+                for row in 0..width {
+                    for col in 0..width {
+                        indices.push(
+                            (((2 * pair + 1) * width + row) * size + 2 * pair * width + col) as u32,
+                        );
+                    }
+                }
+            }
+            let len = indices.len();
+            inverse_indices.push(Tensor::from_vec(indices, len, device)?);
+            width *= 2;
+        }
+        Ok(Self {
+            size,
+            lower: rows.broadcast_ge(&cols)?.to_dtype(DType::F32)?,
+            strictly_lower: rows.broadcast_gt(&cols)?.to_dtype(DType::F32)?,
+            inverse_indices,
+            metal,
+        })
+    }
 }
 
 /// The chunked gated delta rule of the reference
@@ -538,10 +615,10 @@ fn chunk_gated_delta_rule(
     v: &Tensor,
     g: &Tensor,
     beta: &Tensor,
+    plan: &DeltaPlan,
 ) -> Result<Tensor> {
     let (b, t, h, dk) = q.dims4()?;
     let dv = v.dim(3)?;
-    let device = q.device();
     let heads_first =
         |x: &Tensor| -> Result<Tensor> { x.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous() };
     let q = (l2norm(&heads_first(q)?)? * (dk as f64).powf(-0.5))?;
@@ -550,9 +627,10 @@ fn chunk_gated_delta_rule(
     let g = heads_first(g)?;
     let beta = heads_first(beta)?;
 
-    let pad = (CHUNK - t % CHUNK) % CHUNK;
+    let c = plan.size;
+    let pad = (c - t % c) % c;
     let padded = t + pad;
-    let chunks = padded / CHUNK;
+    let chunks = padded / c;
     let pad_seq = |x: Tensor| -> Result<Tensor> {
         if pad == 0 {
             Ok(x)
@@ -572,37 +650,47 @@ fn chunk_gated_delta_rule(
     let k_beta = k.broadcast_mul(&beta)?;
     // Batch and heads share one leading dimension: `[B * H, chunks, C, d]`.
     let n = b * h;
-    let blocks = |x: Tensor, d: usize| x.reshape((n, chunks, CHUNK, d));
+    let blocks = |x: Tensor, d: usize| x.reshape((n, chunks, c, d));
     let q = blocks(q, dk)?;
     let k = blocks(k, dk)?;
     let k_beta = blocks(k_beta, dk)?;
     let v_beta = blocks(v_beta, dv)?;
-    let cum = g.reshape((n, chunks, CHUNK))?.cumsum(2)?;
-
-    let positions = Tensor::arange(0u32, CHUNK as u32, device)?;
-    let rows = positions.reshape((CHUNK, 1))?;
-    let cols = positions.reshape((1, CHUNK))?;
-    let lower = rows.broadcast_ge(&cols)?.to_dtype(DType::F32)?;
-    let strictly_lower = rows.broadcast_gt(&cols)?.to_dtype(DType::F32)?;
+    // Flatten the leading dimensions: one GEMM with shared prefix weights,
+    // not a broadcasted copy of the triangular matrix for every head/chunk.
+    let cum = g
+        .reshape((n * chunks, c))?
+        .matmul(&plan.lower.t()?)?
+        .reshape((n, chunks, c))?;
     // exp(cum_i - cum_j) on and below the diagonal, zero above. `cum` falls
     // along a chunk (`g <= 0`), so the kept differences are <= 0; clamping the
     // rest keeps exp from overflowing before the mask zeroes it.
     let diff = cum.unsqueeze(3)?.broadcast_sub(&cum.unsqueeze(2)?)?;
-    let decay = diff.clamp(f64::MIN, 0.0)?.exp()?.broadcast_mul(&lower)?;
+    let decay = diff
+        .clamp(f64::MIN, 0.0)?
+        .exp()?
+        .broadcast_mul(&plan.lower)?;
 
     let kt = k.transpose(2, 3)?.contiguous()?;
     let system = k_beta
         .matmul(&kt)?
         .mul(&decay)?
-        .broadcast_mul(&strictly_lower)?;
-    let inverse = unit_lower_inverse(&system.reshape((n * chunks, CHUNK, CHUNK))?)?
-        .reshape((n, chunks, CHUNK, CHUNK))?;
-    let cum_exp = cum.exp()?.unsqueeze(3)?;
+        .broadcast_mul(&plan.strictly_lower)?;
+    let inverse = unit_lower_inverse(&system.reshape((n * chunks, c, c))?, plan)?
+        .reshape((n, chunks, c, c))?;
     let new_values = inverse.matmul(&v_beta)?;
-    let k_cumdecay = inverse.matmul(&k_beta.broadcast_mul(&cum_exp)?)?;
     let intra = q.matmul(&kt)?.mul(&decay)?;
+    if chunks == 1 {
+        return intra
+            .matmul(&new_values)?
+            .reshape((b, h, padded, dv))?
+            .narrow(2, 0, t)?
+            .transpose(1, 2)?
+            .contiguous();
+    }
+    let cum_exp = cum.exp()?.unsqueeze(3)?;
+    let k_cumdecay = inverse.matmul(&k_beta.broadcast_mul(&cum_exp)?)?;
 
-    let last = cum.narrow(2, CHUNK - 1, 1)?;
+    let last = cum.narrow(2, c - 1, 1)?;
     let q_decayed = q.broadcast_mul(&cum_exp)?;
     let k_decayed = k
         .broadcast_mul(&last.broadcast_sub(&cum)?.exp()?.unsqueeze(3)?)?
@@ -613,7 +701,7 @@ fn chunk_gated_delta_rule(
     let mut state: Option<Tensor> = None;
     let mut outputs = Vec::with_capacity(chunks);
     for chunk in 0..chunks {
-        let at = |x: &Tensor| x.narrow(1, chunk, 1)?.squeeze(1)?.contiguous();
+        let at = |x: &Tensor| x.narrow(1, chunk, 1)?.squeeze(1);
         let values = at(&new_values)?;
         let (v_new, out) = match &state {
             None => {
@@ -650,30 +738,31 @@ fn chunk_gated_delta_rule(
 /// `(I + A)^-1` for strictly lower-triangular `A: [N, S, S]` (`S` a power of
 /// two), by doubling the inverted diagonal blocks:
 /// `[[X11, 0], [L21, X22]]^-1 = [[X11^-1, 0], [-X22^-1 L21 X11^-1, X22^-1]]`.
-fn unit_lower_inverse(a: &Tensor) -> Result<Tensor> {
+fn unit_lower_inverse(a: &Tensor, plan: &DeltaPlan) -> Result<Tensor> {
+    if let Some(kernels) = &plan.metal {
+        return crate::metal::unit_lower_inverse(a, plan.size, kernels);
+    }
     let (n, s, _) = a.dims3()?;
     let device = a.device();
+    let flat = a.reshape((n, s * s))?;
     // Inverted diagonal blocks of size `width`: `[N, S / width, width, width]`.
     let mut inverse = Tensor::ones((n, s, 1, 1), DType::F32, device)?;
     let mut width = 1;
-    while width < s {
-        let count = s / width;
-        // Every `width x width` block of `A`: `[N, count * count, width, width]`.
-        let all = a
-            .reshape((n, count, width, count, width))?
-            .transpose(2, 3)?
-            .contiguous()?
-            .reshape((n, count * count, width, width))?;
-        let pairs = count / 2;
-        let below: Vec<u32> = (0..pairs)
-            .map(|pair| ((2 * pair + 1) * count + 2 * pair) as u32)
-            .collect();
-        let below = Tensor::from_vec(below, pairs, device)?;
-        let l21 = all.index_select(&below, 1)?;
+    for indices in &plan.inverse_indices {
+        let pairs = s / (2 * width);
+        // Gather only the below-diagonal blocks, rather than transposing
+        // every element of the entire system at each doubling level.
+        let l21 = flat
+            .index_select(indices, 1)?
+            .reshape((n, pairs, width, width))?;
         let joined = inverse.reshape((n, pairs, 2, width, width))?;
         let x11 = joined.narrow(2, 0, 1)?.squeeze(2)?;
         let x22 = joined.narrow(2, 1, 1)?.squeeze(2)?;
-        let off = x22.matmul(&l21)?.matmul(&x11)?.neg()?;
+        let off = if width == 1 {
+            l21.neg()?
+        } else {
+            x22.matmul(&l21)?.matmul(&x11)?.neg()?
+        };
         let zeros = Tensor::zeros((n, pairs, width, width), DType::F32, device)?;
         let top = Tensor::cat(&[&x11, &zeros], 3)?;
         let bottom = Tensor::cat(&[&off, &x22], 3)?;
@@ -699,7 +788,7 @@ impl Layer {
     fn forward(&self, xs: &Tensor, batch: &Batch) -> Result<Tensor> {
         let normed = self.input_norm.forward(xs)?;
         let mixed = match &self.mixer {
-            Mixer::Linear(net) => net.forward(&normed)?,
+            Mixer::Linear(net) => net.forward(&normed, batch.delta)?,
             Mixer::Full(attention) => attention.forward(&normed, batch)?,
         };
         let xs = (xs + mixed)?;
@@ -721,6 +810,7 @@ pub struct Qwen35Text {
     device: Device,
     dtype: DType,
     hidden_size: usize,
+    delta_plans: Vec<DeltaPlan>,
 }
 
 impl Qwen35Text {
@@ -760,6 +850,13 @@ impl Qwen35Text {
             .collect::<Result<Vec<_>>>()?;
         let norm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let (cos, sin) = rotary_tables(cfg, positions.max(1), &device, dtype)?;
+        let metal = device
+            .is_metal()
+            .then(|| crate::metal::Kernels::new(&device, dtype))
+            .transpose()?;
+        let delta_plans = (0..=CHUNK.ilog2())
+            .map(|power| DeltaPlan::new(1 << power, &device, metal.clone()))
+            .collect::<Result<_>>()?;
         Ok(Self {
             embed,
             layers,
@@ -771,6 +868,7 @@ impl Qwen35Text {
             device,
             dtype,
             hidden_size: cfg.hidden_size,
+            delta_plans,
         })
     }
 
@@ -795,9 +893,14 @@ impl Qwen35Text {
     pub fn forward(&self, ids: &Tensor, lengths: &[usize]) -> Result<Tensor> {
         let (_, t) = ids.dims2()?;
         let batch = Batch {
-            mask: self.mask(lengths, t)?,
+            mask: if !self.causal && lengths.iter().all(|&length| length == t) {
+                None
+            } else {
+                Some(self.mask(lengths, t)?)
+            },
             cos: self.cos.narrow(0, 0, t)?,
             sin: self.sin.narrow(0, 0, t)?,
+            delta: &self.delta_plans[t.clamp(1, CHUNK).next_power_of_two().ilog2() as usize],
         };
         let mut xs = self.embed.forward(ids)?;
         for layer in &self.layers {
@@ -908,6 +1011,117 @@ mod tests {
     }
 
     #[test]
+    fn grouped_attention_preserves_heads_padding_and_causal_tile_boundaries() {
+        let device = Device::Cpu;
+        let (b, kv, rep, t, d) = (2, 2, 3, QUERY_TILE + 3, 8);
+        let q = Tensor::from_vec(
+            pseudo(b * kv * rep * t * d, 20),
+            (b, kv * rep, t, d),
+            &device,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(pseudo(b * kv * t * d, 21), (b, kv, t, d), &device).unwrap();
+        let v = Tensor::from_vec(pseudo(b * kv * t * d, 22), (b, kv, t, d), &device).unwrap();
+        for causal in [false, true] {
+            let mut mask = vec![0f32; b * t * t];
+            for batch in 0..b {
+                for row in 0..t {
+                    for col in 0..t {
+                        if col >= t - batch - 1 || (causal && col > row) {
+                            mask[(batch * t + row) * t + col] = MASK_VALUE as f32;
+                        }
+                    }
+                }
+            }
+            let mask = Tensor::from_vec(mask, (b, 1, t, t), &device).unwrap();
+            let scale = (d as f64).powf(-0.5);
+            let scores = (q
+                .matmul(&repeat_kv(&k, rep).unwrap().transpose(2, 3).unwrap())
+                .unwrap()
+                * scale)
+                .unwrap()
+                .broadcast_add(&mask)
+                .unwrap();
+            let expected = candle_nn::ops::softmax_last_dim(&scores)
+                .unwrap()
+                .matmul(&repeat_kv(&v, rep).unwrap())
+                .unwrap();
+            let actual = grouped_tiled(&q, &k, &v, Some(&mask), scale, rep).unwrap();
+            let worst = (actual - expected)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(worst < 1e-5, "causal={causal}: {worst}");
+        }
+    }
+
+    #[test]
+    fn delta_rule_preserves_independent_heads_and_short_partial_chunks() {
+        let device = Device::Cpu;
+        for t in [1, 7, 8, 63, 64, 65, 145] {
+            let (b, h, dk, dv) = (2, 3, 4, 3);
+            let q = pseudo(b * t * h * dk, 11);
+            let k = pseudo(b * t * h * dk, 12);
+            let v = pseudo(b * t * h * dv, 13);
+            let g: Vec<f32> = pseudo(b * t * h, 14)
+                .iter()
+                .map(|x| -0.3 * (x + 0.5))
+                .collect();
+            let beta: Vec<f32> = pseudo(b * t * h, 15).iter().map(|x| x + 0.5).collect();
+            let tensor = |data: &[f32], dims: &[usize]| {
+                Tensor::from_vec(data.to_vec(), dims, &device).unwrap()
+            };
+            let plan = DeltaPlan::new(t, &device, None).unwrap();
+            let out = chunk_gated_delta_rule(
+                &tensor(&q, &[b, t, h, dk]),
+                &tensor(&k, &[b, t, h, dk]),
+                &tensor(&v, &[b, t, h, dv]),
+                &tensor(&g, &[b, t, h]),
+                &tensor(&beta, &[b, t, h]),
+                &plan,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            for batch in 0..b {
+                for head in 0..h {
+                    let select = |data: &[f32], dim: usize| -> Vec<f32> {
+                        (0..t)
+                            .flat_map(|i| {
+                                let at = ((batch * t + i) * h + head) * dim;
+                                data[at..at + dim].iter().copied()
+                            })
+                            .collect()
+                    };
+                    let expected = recurrent(
+                        &select(&q, dk),
+                        &select(&k, dk),
+                        &select(&v, dv),
+                        &select(&g, 1),
+                        &select(&beta, 1),
+                        t,
+                        dk,
+                        dv,
+                    );
+                    let actual = select(&out, dv);
+                    let worst = actual
+                        .iter()
+                        .zip(expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(worst < 1e-4, "t={t}, batch={batch}, head={head}: {worst}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chunked_delta_rule_matches_the_per_token_recurrence_across_chunks() {
         let device = Device::Cpu;
         let (t, dk, dv) = (CHUNK * 2 + 17, 8, 6);
@@ -926,6 +1140,7 @@ mod tests {
             &tensor(&v, &[1, t, 1, dv]),
             &tensor(&g, &[1, t, 1]),
             &tensor(&beta, &[1, t, 1]),
+            &DeltaPlan::new(t, &device, None).unwrap(),
         )
         .unwrap()
         .flatten_all()
@@ -959,7 +1174,9 @@ mod tests {
         let a = Tensor::from_vec(values, (2, s, s), &device).unwrap();
         let eye = Tensor::eye(s, DType::F32, &device).unwrap();
         let system = a.broadcast_add(&eye).unwrap();
-        let product = system.matmul(&unit_lower_inverse(&a).unwrap()).unwrap();
+        let product = system
+            .matmul(&unit_lower_inverse(&a, &DeltaPlan::new(s, &device, None).unwrap()).unwrap())
+            .unwrap();
         let worst = product
             .broadcast_sub(&eye)
             .unwrap()
