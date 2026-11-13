@@ -215,6 +215,88 @@ the 32-frame, 4226-token sequence batched with two short ones). A 120 s
 640x480 30 fps clip through `inl serve --multimodal --device metal` returns in
 3.9 s, capped at 32 frames.
 
+## Late interaction (pplx-embed-v2-late)
+
+`inl-late --test late_live -- --ignored` compares every token vector of
+`perplexity-ai/pplx-embed-v2-late-0.6b` against Sentence-Transformers f32.
+The fixture includes short Korean/English queries, punctuation, and documents
+crossing 64-token chunk boundaries. It exercises actual batches of eight,
+not only a batch-size limit of eight. CPU, Metal and gpu01 CUDA pass; CUDA's
+maximum component difference on the extended fixture is 1.03e-6. The tiny
+fixture also honours `INL_TEST_DEVICE` and passes on Metal and CUDA.
+
+The checkpoint's full-attention heads are 256 wide. candle instantiates the
+Metal SDPA kernel for f32 at 256, but its tile does not fit the 32 KiB of
+threadgroup memory, so creating the pipeline fails at the first forward
+("Failed to create pipeline"). f32 therefore uses the tiled attention on Metal
+(`/health` `attention: "tiled"`); bf16 keeps the fused kernel (`"fused"`).
+The default remains f32. In a longer mixed-length reference probe (up to
+1022 input tokens), optimized f32's maximum component difference was 1.33e-6.
+bf16's difference from the f32 reference was 0.00676 (original implementation:
+0.00816); the earlier 1.3e-3 observation covered only short inputs, not general
+retrieval quality. No f32 golden tolerance was relaxed.
+
+`inl serve --model perplexity-ai/pplx-embed-v2-late-0.6b` detects the kind from
+`config.json` (`model_type: qwen3_5`) on Metal and gpu01 CUDA; `inl health`,
+`inl stop` with `--late` find it. ClawGallery's own VDR library
+(`clawgallery-vdr`, `embedding_search` and `late_interaction_score`) works
+against it for queries and captions. Its `sync` also sends every image as
+`kind: "image"`, which this text-only encoder refuses with 422, so a
+ClawGallery index of images still needs an image-capable server.
+
+### Warm inference optimization (2026-11-13)
+
+M4 Max, 64 GiB, release build; one warmup and five measured encodes per case,
+median milliseconds. Includes tokenization, inference and host vectors;
+excludes download, model load and HTTP/JSON. Before is the original late
+encoder from PR #11; after is the optimized encoder, with unchanged dtype,
+batch limit (32) and padded-token budget (8192). Document inputs repeat
+`Paris is the capital and largest city of France. ` 26 or 102 times; these
+synthetic measurements are not a retrieval-quality or mixed-corpus benchmark.
+
+| dtype | input tokens | actual batch | before ms | after ms | speedup |
+|---|---:|---:|---:|---:|---:|
+| f32 | 8 | 1 | 14.87 | 9.40 | 1.58x |
+| f32 | 8 | 8 | 43.88 | 15.66 | 2.80x |
+| f32 | 262 | 1 | 54.57 | 39.96 | 1.37x |
+| f32 | 262 | 8 | 483.65 | 303.38 | 1.59x |
+| f32 | 1022 | 1 | 192.33 | 131.43 | 1.46x |
+| f32 | 1022 | 8 | 1977.79 | 1162.89 | 1.70x |
+| bf16 | 8 | 1 | 12.95 | 7.87 | 1.65x |
+| bf16 | 8 | 8 | 38.52 | 10.24 | 3.76x |
+| bf16 | 262 | 1 | 48.07 | 35.64 | 1.35x |
+| bf16 | 262 | 8 | 442.89 | 287.25 | 1.54x |
+| bf16 | 1022 | 1 | 170.36 | 125.33 | 1.36x |
+| bf16 | 1022 | 8 | 1764.54 | 1108.99 | 1.59x |
+
+Reproduce with `cargo run --release -p inl-late --example bench_late --
+--device metal --dtype f32 --repeats 5`; substitute `bf16` for the other path.
+`--batch-size` sweeps microbatch size; `--document-repeats` and `--only document`
+vary document length. Each output JSON row reports the actual token count.
+
+Changes: cache sequence masks and inverse gather indices per model; smaller
+power-of-two chunks for short inputs; skip unused single-chunk state work;
+use one shared prefix-sum GEMM instead of broadcast copies; remove per-chunk
+contiguous copies; gather only the inverse blocks actually used. Metal uses
+fused triangular inversion, causal depthwise convolution, short-sequence
+delta recurrence, and gated normalization (retaining model-dtype rounding).
+Pipelines belong to the model and are released on unload; only the requested
+dtype's pipelines are built. Full tiled attention folds grouped query heads
+into GEMM rows instead of repeating keys/values. Unpadded bidirectional
+inputs need no attention mask. Output projection is a flattened shared GEMM.
+
+Combining input projections was benchmarked and rejected: the extra layout
+copies made document inference slower. f32 and batching defaults are unchanged.
+Long documents still benefit from microbatch sweeps; no one size wins for both
+short queries and long documents. CPU-only Mac deployments should build with
+`--features accelerate`: optimized CPU query batch eight took 59.57 ms with
+Accelerate versus 122.30 ms without it (three-run medians). CUDA full attention
+remains tiled; gpu01 verifies correctness, not a controlled speedup measurement.
+
+Manual Metal HTTP QA: mixed query/document roles and lengths preserve output
+order; two concurrent requests return identical vectors; unload followed by
+reload reproduces the same vectors and shutdown drains successfully.
+
 ## Model cache and `INL_TEST_DEVICE`
 
 The engines cache models under `HF_HOME` when set, else

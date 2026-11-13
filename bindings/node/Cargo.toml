@@ -11,7 +11,7 @@ publish = false
 [features]
 default = []
 # Documented but not built here: enable with `--features cuda` on a CUDA host.
-cuda = ["inl-text/cuda", "inl-sparse/cuda", "inl-vision/cuda", "inl-core/cuda"]
+cuda = ["inl-text/cuda", "inl-sparse/cuda", "inl-vision/cuda", "inl-late/cuda", "inl-core/cuda"]
 cudnn = ["inl-core/cudnn"]
 accelerate = ["inl-core/accelerate"]
 mkl = ["inl-core/mkl"]
@@ -23,6 +23,7 @@ crate-type = ["cdylib"]
 inl-core.workspace = true
 inl-text.workspace = true
 inl-sparse.workspace = true
+inl-late.workspace = true
 inl-vision.workspace = true
 inl-server.workspace = true
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }

@@ -1,10 +1,10 @@
 //! Wiring the `inl` binary to the concrete engine crates.
 //!
 //! The library (`inl-server`) only knows the [`inl_core::DenseEngine`],
-//! [`inl_core::MultimodalEngine`] and [`inl_sparse::SparseEngine`] traits;
-//! this module is the one place that names the engine crates and turns CLI
-//! flags into an [`Engine`] plus the [`InstanceKey`] that names its state
-//! directory.
+//! [`inl_core::MultimodalEngine`], [`inl_sparse::SparseEngine`] and
+//! [`inl_late::LateEngine`] traits; this module is the one place that names
+//! the engine crates and turns CLI flags into an [`Engine`] plus the
+//! [`InstanceKey`] that names its state directory.
 
 use inl_core::device::{DeviceSpec, DtypeSpec};
 use inl_core::Result;
@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub const DEFAULT_DENSE_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 pub const DEFAULT_SPARSE_MODEL: &str = "nlpai-lab/KURE-Sparse-nano";
 pub const DEFAULT_MULTIMODAL_MODEL: &str = "google/embeddinggemma-2";
+pub const DEFAULT_LATE_MODEL: &str = inl_late::DEFAULT_MODEL_ID;
 
 /// Engine flags shared by `serve`, `health`, `stop` and `unload`.
 #[derive(Debug, Clone, Default)]
@@ -49,11 +50,13 @@ impl EngineArgs {
             device: self.device.clone(),
             dtype: self.dtype.clone(),
             attention: None,
-            max_length: Some(match kind {
-                EngineKind::Dense => inl_text::TextOptions::default().max_length,
-                EngineKind::Sparse => inl_sparse::SparseOptions::default().max_length,
-                EngineKind::Multimodal => inl_vision::MultimodalOptions::default().max_length,
-            }),
+            // The late encoder's context comes from the checkpoint.
+            max_length: match kind {
+                EngineKind::Dense => Some(inl_text::TextOptions::default().max_length),
+                EngineKind::Sparse => Some(inl_sparse::SparseOptions::default().max_length),
+                EngineKind::Multimodal => Some(inl_vision::MultimodalOptions::default().max_length),
+                EngineKind::Late => inl_late::LateOptions::default().max_length,
+            },
             kind,
         })
     }
@@ -64,12 +67,14 @@ pub fn default_model(kind: EngineKind) -> &'static str {
         EngineKind::Dense => DEFAULT_DENSE_MODEL,
         EngineKind::Sparse => DEFAULT_SPARSE_MODEL,
         EngineKind::Multimodal => DEFAULT_MULTIMODAL_MODEL,
+        EngineKind::Late => DEFAULT_LATE_MODEL,
     }
 }
 
 /// The engine kind a `--model` serves when no kind flag is given, read from
 /// its `config.json`: a ModernBERT checkpoint is a SPLADE encoder (the only
-/// ModernBERT engine), anything else a dense text encoder. Multimodal stays
+/// ModernBERT engine), a Qwen3.5 checkpoint a late-interaction encoder (the
+/// only Qwen3.5 engine), anything else a dense text encoder. Multimodal stays
 /// opt-in because the same EmbeddingGemma 2 checkpoint also serves dense.
 /// No `--model` is the dense default and reads nothing.
 pub fn detect_kind(args: &EngineArgs) -> Result<EngineKind> {
@@ -80,22 +85,24 @@ pub fn detect_kind(args: &EngineArgs) -> Result<EngineKind> {
     let path = inl_core::hub::ModelSource::resolve(model, cache)?.fetch("config.json")?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
         .map_err(|error| inl_core::InlError::Config(format!("{model}: config.json: {error}")))?;
-    Ok(
-        if config["model_type"] == inl_sparse::modernbert::MODEL_TYPE {
-            EngineKind::Sparse
-        } else {
-            EngineKind::Dense
-        },
-    )
+    let model_type = &config["model_type"];
+    Ok(if model_type == inl_sparse::modernbert::MODEL_TYPE {
+        EngineKind::Sparse
+    } else if model_type == inl_late::qwen3_5::MODEL_TYPE {
+        EngineKind::Late
+    } else {
+        EngineKind::Dense
+    })
 }
 
 /// The query/passage prefixes a server applies when the caller sends
 /// `input_type`: the checkpoint's own markers, absent for the dense text
-/// encoders (their prompts are caller-supplied).
+/// encoders (their prompts are caller-supplied) and for the late encoder
+/// (it adds its checkpoint's prompts per role).
 pub fn default_prefixes(kind: EngineKind) -> (Option<String>, Option<String>) {
     match kind {
         EngineKind::Sparse => (Some("[Q] ".to_string()), Some("[D] ".to_string())),
-        EngineKind::Dense | EngineKind::Multimodal => (None, None),
+        EngineKind::Dense | EngineKind::Multimodal | EngineKind::Late => (None, None),
     }
 }
 
@@ -143,6 +150,16 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
                 inl_vision::MultimodalEmbedder::new(options),
             )))
         }
+        EngineKind::Late => {
+            let options = inl_late::LateOptions {
+                id: model,
+                device: args.device.clone(),
+                dtype: args.dtype.clone(),
+                cache_dir: args.cache_dir.clone(),
+                ..inl_late::LateOptions::default()
+            };
+            Ok(Engine::late(Arc::new(inl_late::LateEncoder::new(options)?)))
+        }
     }
 }
 
@@ -161,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_config_decides_between_sparse_and_dense() {
+    fn the_model_config_decides_between_sparse_late_and_dense() {
         assert_eq!(
             kind_of_config(r#"{"model_type":"modernbert"}"#),
             EngineKind::Sparse
@@ -169,6 +186,10 @@ mod tests {
         assert_eq!(
             kind_of_config(r#"{"model_type":"qwen3"}"#),
             EngineKind::Dense
+        );
+        assert_eq!(
+            kind_of_config(r#"{"model_type":"qwen3_5"}"#),
+            EngineKind::Late
         );
         assert_eq!(
             kind_of_config(r#"{"model_type":"embedding_gemma2"}"#),

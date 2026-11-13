@@ -17,14 +17,15 @@ default = ["cli"]
 # (`default-features = false`) only needs the engine traits, so a host that
 # brings its own engines (a text-only indexer) does not link the vision stack.
 cli = ["dep:clap", "dep:inl-text", "dep:inl-vision"]
-cuda = ["inl-core/cuda", "inl-sparse/cuda", "inl-text?/cuda", "inl-vision?/cuda"]
-cudnn = ["inl-core/cudnn", "inl-sparse/cudnn", "inl-text?/cudnn", "inl-vision?/cudnn"]
-accelerate = ["inl-core/accelerate", "inl-sparse/accelerate", "inl-text?/accelerate", "inl-vision?/accelerate"]
-mkl = ["inl-core/mkl", "inl-sparse/mkl", "inl-text?/mkl", "inl-vision?/mkl"]
+cuda = ["inl-core/cuda", "inl-sparse/cuda", "inl-late/cuda", "inl-text?/cuda", "inl-vision?/cuda"]
+cudnn = ["inl-core/cudnn", "inl-sparse/cudnn", "inl-late/cudnn", "inl-text?/cudnn", "inl-vision?/cudnn"]
+accelerate = ["inl-core/accelerate", "inl-sparse/accelerate", "inl-late/accelerate", "inl-text?/accelerate", "inl-vision?/accelerate"]
+mkl = ["inl-core/mkl", "inl-sparse/mkl", "inl-late/mkl", "inl-text?/mkl", "inl-vision?/mkl"]
 
 [dependencies]
 inl-core.workspace = true
 inl-text = { workspace = true, optional = true }
+inl-late.workspace = true
 inl-sparse.workspace = true
 inl-vision = { workspace = true, optional = true }
 async-trait.workspace = true

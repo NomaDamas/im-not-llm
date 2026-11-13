@@ -1,0 +1,9 @@
+{
+ "in_features": 32,
+ "out_features": 12,
+ "bias": false,
+ "activation_function": "torch.nn.modules.linear.Identity",
+ "module_input_name": "token_embeddings",
+ "module_output_name": "token_embeddings",
+ "use_residual": false
+}

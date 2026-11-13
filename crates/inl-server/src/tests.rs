@@ -4,6 +4,7 @@
 
 use super::*;
 use inl_core::{DenseEngine, EngineInfo, InlError, Modality, MultimodalEngine, MultimodalInput};
+use inl_late::{LateEngine, MultiVector, Task};
 use inl_sparse::{SparseEngine, SparseVector};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1287,4 +1288,220 @@ async fn client_from_a_state_dir_alone_reaches_the_server_it_names() {
     client.stop().await.unwrap();
     assert_eq!(daemon.wait().await.unwrap(), StopReason::Signal);
     assert!(DaemonClient::from_state_dir(dir.path()).is_none());
+}
+
+// ---- late-interaction (multi-vector) engine: POST /embed ---------------------
+
+/// Encodes a text as one `[byte, task]` row per byte; `task` is 0 for a
+/// query and 1 for a document.
+#[derive(Default)]
+struct FakeLate {
+    seen: StdMutex<Vec<(Task, Vec<String>)>>,
+    timeout: AtomicBool,
+    loaded: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl LateEngine for FakeLate {
+    async fn load(&self) -> Result<EngineInfo> {
+        Ok(EngineInfo {
+            model_id: "Fake/Late-1".to_string(),
+            dimension: 2,
+            dtype: "f32".to_string(),
+            device: "cpu".to_string(),
+            attention: "eager".to_string(),
+            max_length: 16,
+            modalities: vec![Modality::Text],
+        })
+    }
+
+    async fn token_counts(&self, texts: &[String], _task: Task) -> Result<Vec<usize>> {
+        Ok(texts.iter().map(String::len).collect())
+    }
+
+    async fn encode(&self, texts: Vec<String>, task: Task) -> Result<Vec<MultiVector>> {
+        if self.timeout.load(Ordering::SeqCst) {
+            return Err(InlError::Timeout("native late batch stuck".into()));
+        }
+        self.seen.lock().unwrap().push((task, texts.clone()));
+        let flag = match task {
+            Task::Query => 0.0,
+            Task::Document => 1.0,
+        };
+        Ok(texts
+            .iter()
+            .map(|t| t.bytes().map(|b| vec![f32::from(b), flag]).collect())
+            .collect())
+    }
+
+    async fn unload(&self) -> bool {
+        self.loaded.swap(false, Ordering::SeqCst)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
+    }
+}
+
+struct LateHarness {
+    url: String,
+    engine: Arc<FakeLate>,
+    stop: Arc<tokio::sync::Notify>,
+    stopped: tokio::task::JoinHandle<Result<StopReason>>,
+    _dir: tempfile::TempDir,
+}
+
+async fn spawn_late(engine: FakeLate) -> LateHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(dir.path());
+    let engine = Arc::new(engine);
+    let Started::Serving(server) = start_late(engine.clone(), opts).await.unwrap() else {
+        panic!("expected a fresh server");
+    };
+    let url = server.health().url.clone();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let signal = stop.clone();
+    let stopped = tokio::spawn(async move {
+        server
+            .run_until(async move { signal.notified().await })
+            .await
+    });
+    LateHarness {
+        url,
+        engine,
+        stop,
+        stopped,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn late_embed_returns_token_vectors_per_input_in_order_with_each_role_encoded_as_its_task() {
+    let h = spawn_late(FakeLate::default()).await;
+    // The ClawGallery VDR client's request: queries and documents may mix.
+    let (status, body) = post(
+        &format!("{}/embed", h.url),
+        json!({
+            "model": "Fake/Late-1",
+            "dimensions": 2,
+            "inputs": [
+                {"kind": "caption", "role": "document", "value": "ab"},
+                {"kind": "text", "role": "query", "value": "c"},
+                {"kind": "text", "role": "document", "value": "d"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "model": "Fake/Late-1",
+            "dimensions": 2,
+            "embeddings": [
+                [[97.0, 1.0], [98.0, 1.0]],
+                [[99.0, 0.0]],
+                [[100.0, 1.0]],
+            ],
+        })
+    );
+    // Raw text reaches the engine (it adds the checkpoint's prompts), one
+    // call per task.
+    let mut seen = h.engine.seen.lock().unwrap().clone();
+    seen.sort_by_key(|(task, _)| task.as_str());
+    assert_eq!(
+        seen,
+        vec![
+            (Task::Document, vec!["ab".to_string(), "d".to_string()]),
+            (Task::Query, vec!["c".to_string()]),
+        ]
+    );
+    // `model` and `dimensions` are optional.
+    let (status, body) = post(
+        &format!("{}/embed", h.url),
+        json!({"inputs": [{"kind": "text", "role": "query", "value": "c"}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, &body["embeddings"]),
+        (200, &json!([[[99.0, 0.0]]]))
+    );
+}
+
+#[tokio::test]
+async fn late_embed_rejects_what_it_cannot_serve_and_keeps_serving() {
+    let h = spawn_late(FakeLate::default()).await;
+    let url = format!("{}/embed", h.url);
+    let item = |kind: &str, role: &str| json!({"kind": kind, "role": role, "value": "x"});
+    let cases = [
+        // Another model or width: the caller's index would mix vector spaces.
+        (
+            json!({"model": "vidore/colqwen2-v1.0", "inputs": [item("text", "query")]}),
+            400,
+        ),
+        (
+            json!({"dimensions": 128, "inputs": [item("text", "query")]}),
+            400,
+        ),
+        // A text encoder has no image tower.
+        (json!({"inputs": [item("image", "document")]}), 422),
+        (json!({"inputs": [item("text", "passage")]}), 422),
+        (json!({"inputs": []}), 422),
+        (json!({"inputs": ["x"]}), 422),
+        (json!({"inputs": vec![item("text", "query"); 9]}), 413),
+    ];
+    for (body, expected) in cases {
+        let (status, answer) = post(&url, body.clone()).await;
+        assert_eq!(status, expected, "{body} -> {answer}");
+        assert!(answer["error"].is_string(), "{answer}");
+    }
+    assert!(h.engine.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        post(&url, json!({"inputs": [item("text", "query")]}))
+            .await
+            .0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_late_server_reports_its_kind_and_serves_no_single_vector_routes() {
+    let h = spawn_late(FakeLate::default()).await;
+    let health: Value = reqwest::get(format!("{}/health", h.url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["kind"], "late");
+    assert_eq!(health["model_id"], "Fake/Late-1");
+    for route in ["/embed_sparse", "/embed_multimodal", "/v1/embeddings"] {
+        let response = reqwest::Client::new()
+            .post(format!("{}{route}", h.url))
+            .json(&json!({"inputs": ["a"], "input": ["a"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404, "{route}");
+    }
+}
+
+#[tokio::test]
+async fn a_wedged_late_pass_shuts_the_server_down() {
+    let engine = FakeLate::default();
+    engine.timeout.store(true, Ordering::SeqCst);
+    let h = spawn_late(engine).await;
+    let (status, body) = post(
+        &format!("{}/embed", h.url),
+        json!({"inputs": [{"kind": "text", "role": "query", "value": "x"}]}),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    let reason = tokio::time::timeout(Duration::from_secs(5), h.stopped)
+        .await
+        .expect("server stops")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reason, StopReason::Wedged);
+    drop(h.stop);
 }

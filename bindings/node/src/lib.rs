@@ -31,6 +31,7 @@ use tokio::sync::watch;
 /// `inl serve` CLI).
 const DEFAULT_DENSE_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 const DEFAULT_SPARSE_MODEL: &str = "nlpai-lab/KURE-Sparse-nano";
+const DEFAULT_LATE_MODEL: &str = inl_late::DEFAULT_MODEL_ID;
 
 /// Failure classes a host can tell apart. napi-rs only lets a native error
 /// carry a `Status`, so the class travels as a `<CODE>: ` message prefix that
@@ -87,8 +88,9 @@ fn parse_kind(value: Option<&str>) -> InlResult<EngineKind> {
         None | Some("dense") => Ok(EngineKind::Dense),
         Some("sparse") => Ok(EngineKind::Sparse),
         Some("multimodal") => Ok(EngineKind::Multimodal),
+        Some("late") => Ok(EngineKind::Late),
         Some(other) => Err(InlError::Config(format!(
-            "invalid engine kind '{other}': expected dense, sparse, or multimodal"
+            "invalid engine kind '{other}': expected dense, sparse, multimodal, or late"
         ))),
     }
 }
@@ -97,6 +99,7 @@ fn default_model(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Sparse => DEFAULT_SPARSE_MODEL,
         EngineKind::Dense | EngineKind::Multimodal => DEFAULT_DENSE_MODEL,
+        EngineKind::Late => DEFAULT_LATE_MODEL,
     }
 }
 
@@ -105,7 +108,7 @@ fn default_model(kind: EngineKind) -> &'static str {
 fn default_prefixes(kind: EngineKind) -> (Option<String>, Option<String>) {
     match kind {
         EngineKind::Sparse => (Some("[Q] ".to_string()), Some("[D] ".to_string())),
-        EngineKind::Dense | EngineKind::Multimodal => (None, None),
+        EngineKind::Dense | EngineKind::Multimodal | EngineKind::Late => (None, None),
     }
 }
 
@@ -662,6 +665,17 @@ fn build_engine(options: &EngineOptions, kind: EngineKind) -> InlResult<Engine> 
             Ok(Engine::multimodal(Arc::new(
                 inl_vision::MultimodalEmbedder::new(multimodal),
             )))
+        }
+        EngineKind::Late => {
+            let late = inl_late::LateOptions {
+                id: model,
+                device: options.device.clone(),
+                dtype: options.dtype.clone(),
+                max_length: options.max_length.map(|value| value as usize),
+                cache_dir: options.cache_dir.clone().map(PathBuf::from),
+                ..inl_late::LateOptions::default()
+            };
+            Ok(Engine::late(Arc::new(inl_late::LateEncoder::new(late)?)))
         }
     }
 }
