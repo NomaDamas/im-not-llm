@@ -111,11 +111,11 @@ The model side is device-independent but worth knowing on CUDA:
 
 ### Registry releases and shared daemon state
 
-`inl-core`, `inl-text`, `inl-sparse` 0.1.0 and `inl-vision` 0.1.1 are published
-on crates.io. `inl-late` 0.1.0 and `inl-server` 0.2.0 add the late engine and
-are verified by Cargo's packaged-source build before release. The previously published
-`inl-server` 0.1.1 had no late engine; the public engine enums gained `Late`,
-hence the minor release. Each upload ran Cargo's packaged-source
+`inl-core`, `inl-text` 0.1.0 and `inl-vision` 0.1.1 are published on
+crates.io. `inl-sparse` 0.1.1 exports the ModernBERT `MODEL_TYPE` the CLI uses
+to pick the engine kind; `inl-late` 0.1.0 and `inl-server` 0.2.0 add the late
+engine. The previously published `inl-server` 0.1.1 had no late engine; the
+public engine enums gained `Late`, hence the minor release. Each upload ran Cargo's packaged-source
 verification. A registry-only Rust consumer ran real Qwen3 inference with
 `accelerate` (two finite unit-length 1024-d vectors); `cuda`, `accelerate`
 and `mkl` resolve through all four text/daemon crates to candle. The daemon
