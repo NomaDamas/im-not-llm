@@ -16,9 +16,9 @@ Use it three ways, all backed by the same engines:
 ## Install
 
 ```sh
-cargo install inl-server --version 0.1.1
+cargo install inl-server --version 0.2.0 --locked
 # NVIDIA host with the CUDA toolkit installed:
-cargo install inl-server --version 0.1.1 --features cuda
+cargo install inl-server --version 0.2.0 --locked --features cuda
 ```
 
 For Rust applications:
@@ -27,8 +27,9 @@ For Rust applications:
 [dependencies]
 inl-text = "0.1.0"
 inl-sparse = "0.1.0"
+inl-late = "0.1.0"
 inl-vision = "0.1.1"
-inl-server = { version = "0.1.1", default-features = false }
+inl-server = { version = "0.2.0", default-features = false }
 ```
 
 `inl-server` without default features exposes the daemon library without its
@@ -45,6 +46,7 @@ kernel compatibility patch described in `docs/DEVICES.md`.
 | `google/embeddinggemma-2` (text) | `inl-text` | 768-d dense | f32 or bf16 only (f16 overflows to NaN); Matryoshka 128/256/512/768 |
 | `nlpai-lab/KURE-Sparse-nano` | `inl-sparse` | 36282-term sparse | f32 on every device (f16 changes which terms clear the threshold) |
 | `google/embeddinggemma-2` (image, video, audio, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | f32 or bf16 (bf16 on a GPU only); never f16 |
+| `perplexity-ai/pplx-embed-v2-late-0.6b` | `inl-late` | one 128-d vector per token | f32 by default; bf16 is faster but less exact |
 
 Every model is checked against its Hugging Face reference with golden tests
 (`crates/*/tests`); the tolerances are the ones in the tests.

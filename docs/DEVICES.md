@@ -111,8 +111,11 @@ The model side is device-independent but worth knowing on CUDA:
 
 ### Registry releases and shared daemon state
 
-`inl-core`, `inl-text`, `inl-sparse` 0.1.0 and `inl-vision`, `inl-server`
-0.1.1 are published on crates.io. Each upload ran Cargo's packaged-source
+`inl-core`, `inl-text`, `inl-sparse` 0.1.0 and `inl-vision` 0.1.1 are published
+on crates.io. `inl-late` 0.1.0 and `inl-server` 0.2.0 add the late engine and
+are verified by Cargo's packaged-source build before release. The previously published
+`inl-server` 0.1.1 had no late engine; the public engine enums gained `Late`,
+hence the minor release. Each upload ran Cargo's packaged-source
 verification. A registry-only Rust consumer ran real Qwen3 inference with
 `accelerate` (two finite unit-length 1024-d vectors); `cuda`, `accelerate`
 and `mkl` resolve through all four text/daemon crates to candle. The daemon
@@ -124,7 +127,7 @@ Linux registry-consumer `cargo check --features cuda` and
 MinSync's extraction branch, with git dependencies replaced by registry
 versions and its candle patch removed, passed `cargo publish --dry-run`.
 Manual shared-state QA found that the CLI omitted the default context from
-its instance identity while MinSync included it. `inl-server` 0.1.1 includes
+its instance identity while MinSync included it. `inl-server` 0.2.0 includes
 the actual engine default, so `minsync serve` adopts `inl serve`'s PID, URL
 and default `~/.cache/im-not-llm/serve/<instance>` directory. The adopted
 daemon successfully served a 1024-d embedding request.
