@@ -76,11 +76,16 @@ pub fn default_model(kind: EngineKind) -> &'static str {
 /// ModernBERT engine), a Qwen3.5 checkpoint a late-interaction encoder (the
 /// only Qwen3.5 engine), anything else a dense text encoder. Multimodal stays
 /// opt-in because the same EmbeddingGemma 2 checkpoint also serves dense.
-/// No `--model` is the dense default and reads nothing.
+/// No `--model` is the dense default and reads nothing; neither does
+/// `--device ane`, which serves dense models only from Core ML packages that
+/// carry no `config.json`.
 pub fn detect_kind(args: &EngineArgs) -> Result<EngineKind> {
     let Some(model) = args.model.as_deref().filter(|model| !model.is_empty()) else {
         return Ok(EngineKind::Dense);
     };
+    if args.device.as_deref() == Some(ANE_DEVICE) {
+        return Ok(EngineKind::Dense);
+    }
     let cache = inl_core::device::model_cache_dir(args.cache_dir.as_deref());
     let path = inl_core::hub::ModelSource::resolve(model, cache)?.fetch("config.json")?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
@@ -253,6 +258,17 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("config.json"), "{error}");
+    }
+
+    #[test]
+    fn a_neural_engine_package_directory_is_dense_without_a_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let kind = detect_kind(&EngineArgs {
+            model: Some(dir.path().display().to_string()),
+            device: Some(ANE_DEVICE.into()),
+            ..EngineArgs::default()
+        });
+        assert_eq!(kind.unwrap(), EngineKind::Dense);
     }
 
     fn ane(kind: EngineKind, dtype: Option<&str>) -> Result<Engine> {

@@ -27,6 +27,8 @@ const LONG_POOL: f16 = f16::from_f32_const(0.000_976_562_5);
 pub enum Family {
     /// `google/embeddinggemma-2`: bidirectional, mean pooling.
     Gemma2,
+    /// `Qwen/Qwen3-Embedding-0.6B`: causal, last-token pooling.
+    Qwen3,
 }
 
 /// How a function attends and pools; decides its inputs.
@@ -38,6 +40,8 @@ pub(crate) enum Kind {
     Winp,
     /// `winl{S}_b512`: one long text, `band_bias` + `key_bias`, 2^-10 pool.
     Winl,
+    /// `embed_S`: causal attention, `causal_bias`, last-token pool.
+    Causal,
 }
 
 impl Family {
@@ -45,11 +49,12 @@ impl Family {
     pub(crate) fn package_name(self) -> &'static str {
         match self {
             Self::Gemma2 => "EmbeddingGemma2Text",
+            Self::Qwen3 => "Qwen3EmbeddingText",
         }
     }
 
     pub(crate) fn from_package_name(name: &str) -> Option<Self> {
-        [Self::Gemma2]
+        [Self::Gemma2, Self::Qwen3]
             .into_iter()
             .find(|family| family.package_name() == name)
     }
@@ -58,6 +63,7 @@ impl Family {
     pub(crate) fn packing_lengths(self) -> &'static [usize] {
         match self {
             Self::Gemma2 => &[64, 128, 256, 512, 768, 1024, 1280, 1536, 2048],
+            Self::Qwen3 => &[64, 128, 256, 512, 768, 1024, 1536, 2048],
         }
     }
 
@@ -65,6 +71,7 @@ impl Family {
     pub(crate) fn long_lengths(self) -> &'static [usize] {
         match self {
             Self::Gemma2 => &[3072, 4096, 6144, 8192],
+            Self::Qwen3 => &[],
         }
     }
 
@@ -84,6 +91,17 @@ impl Family {
                 (1536, 114.53),
                 (2048, 170.34),
             ],
+            // `scripts/ane` packages, `MLModel.predict` per function, M4 Max.
+            Self::Qwen3 => &[
+                (64, 8.7),
+                (128, 12.1),
+                (256, 30.1),
+                (512, 83.8),
+                (768, 149.0),
+                (1024, 237.3),
+                (1536, 464.6),
+                (2048, 1659.4),
+            ],
         };
         table
             .iter()
@@ -96,6 +114,7 @@ impl Family {
         match self {
             // Gemma multiplies the embedding by sqrt(hidden) = sqrt(512).
             Self::Gemma2 => (512f32).sqrt(),
+            Self::Qwen3 => 1.0,
         }
     }
 
@@ -104,12 +123,13 @@ impl Family {
             Self::Gemma2 if self.long_lengths().contains(&length) => Kind::Winl,
             Self::Gemma2 if length > 1280 => Kind::Winp,
             Self::Gemma2 => Kind::Bucket,
+            Self::Qwen3 => Kind::Causal,
         }
     }
 
     pub(crate) fn function_name(self, length: usize) -> String {
         match self.kind(length) {
-            Kind::Bucket => format!("embed_{length}"),
+            Kind::Bucket | Kind::Causal => format!("embed_{length}"),
             Kind::Winp => format!("winp{length}_b{WINDOW}"),
             Kind::Winl => format!("winl{length}_b{WINDOW}"),
         }
@@ -121,6 +141,7 @@ impl Family {
             Kind::Bucket => &["inputs_embeds", "global_bias", "local_bias", "pool"],
             Kind::Winp => &["inputs_embeds", "band_bias", "global_bias", "pool"],
             Kind::Winl => &["inputs_embeds", "band_bias", "key_bias", "pool"],
+            Kind::Causal => &["inputs_embeds", "causal_bias", "pool"],
         }
     }
 
@@ -279,6 +300,8 @@ enum Mask {
     Full,
     /// Rows of the same text at most this far away.
     Window(usize),
+    /// Rows of the same text up to the query row itself.
+    Causal,
 }
 
 /// The text a row belongs to, given segments ordered by offset.
@@ -304,6 +327,7 @@ fn square_bias(segments: &[Segment], length: usize, mask: Mask, out: &mut [f16])
                         segment.offset.max(row.saturating_sub(window)),
                         end.min(row + window + 1),
                     ),
+                    Mask::Causal => (segment.offset, row + 1),
                 };
                 target[lower..upper].fill(OPEN);
             }
@@ -344,6 +368,15 @@ fn mean_pool(segments: &[Segment], length: usize, out: &mut [f16]) {
     }
 }
 
+/// `[K, S]` pooling matrix: row k = 1 at text k's last row (last-token
+/// pooling), unused rows 0.
+fn last_pool(segments: &[Segment], length: usize, out: &mut [f16]) {
+    out.fill(f16::ZERO);
+    for (slot, segment) in segments.iter().enumerate() {
+        out[slot * length + segment.offset + segment.len - 1] = f16::ONE;
+    }
+}
+
 /// Fill input `name` of a `length`-row function of `family` for `segments`
 /// (all but `inputs_embeds`, which comes from the token table).
 pub(crate) fn fill_input(
@@ -371,6 +404,8 @@ pub(crate) fn fill_input(
             out[..used].fill(LONG_POOL);
             out[used..].fill(f16::ZERO);
         }
+        (Kind::Causal, "causal_bias") => square_bias(segments, length, Mask::Causal, out),
+        (Kind::Causal, "pool") => last_pool(segments, length, out),
         (kind, name) => unreachable!("{kind:?} function has no input {name}"),
     }
 }
@@ -537,5 +572,88 @@ mod tests {
         assert!(key[2600..].iter().all(|&v| v == BLOCKED));
         assert!(pool[..2600].iter().all(|&v| v == LONG_POOL));
         assert!(pool[2600..].iter().all(|&v| v == f16::ZERO));
+    }
+
+    #[test]
+    fn qwen3_causal_bias_sees_only_earlier_rows_of_the_same_text() {
+        let length = 16;
+        let segments = segs(&[5, 4]);
+        let mut out = vec![f16::ZERO; length * length];
+        fill_input(Family::Qwen3, length, "causal_bias", &segments, &mut out);
+        let text = |row: usize| segment_of(&segments, row).map(|s| s.item);
+        for i in 0..length {
+            for j in 0..length {
+                let expected = match (text(i), text(j)) {
+                    (Some(a), Some(b)) => a == b && j <= i,
+                    _ => i == j,
+                };
+                let value = out[i * length + j];
+                assert_eq!(open(value), expected, "({i}, {j})");
+                assert!(open(value) || value == BLOCKED);
+            }
+        }
+    }
+
+    #[test]
+    fn qwen3_pools_the_last_row_of_each_text() {
+        let length = 64;
+        let segments = segs(&[4, 10]);
+        let mut out = vec![f16::ONE; slots(length) * length];
+        fill_input(Family::Qwen3, length, "pool", &segments, &mut out);
+        let row = |k: usize| &out[k * length..(k + 1) * length];
+        for (k, last) in [(0, 3), (1, 13)] {
+            for (column, &value) in row(k).iter().enumerate() {
+                let expected = if column == last { f16::ONE } else { f16::ZERO };
+                assert_eq!(value, expected, "slot {k} column {column}");
+            }
+        }
+        assert!((2..slots(length)).all(|k| row(k).iter().all(|&v| v == f16::ZERO)));
+    }
+
+    #[test]
+    fn qwen3_packs_up_to_2048_rows_in_causal_buckets() {
+        let family = Family::Qwen3;
+        assert_eq!(
+            Family::from_package_name("Qwen3EmbeddingText"),
+            Some(family)
+        );
+        assert_eq!(
+            family.lengths_for(8192),
+            [64, 128, 256, 512, 768, 1024, 1536, 2048]
+        );
+        assert_eq!(family.function_name(1536), "embed_1536");
+        assert_eq!(
+            family.input_names(2048),
+            ["inputs_embeds", "causal_bias", "pool"]
+        );
+        let counts: Vec<usize> = (0..200).map(|i| 1 + (i * 53 + i * i * 7) % 2048).collect();
+        let calls = plan(family, &family.lengths_for(2048), &counts);
+        let mut seen = vec![0usize; counts.len()];
+        for call in &calls {
+            let used: usize = call.segments.iter().map(|s| s.len).sum();
+            assert!(used <= call.length && call.segments.len() <= slots(call.length));
+            for segment in &call.segments {
+                seen[segment.item] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+        assert_eq!(
+            plan(family, &family.lengths_for(2048), &[3, 9, 11]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn qwen3_keeps_short_texts_out_of_its_slowest_function() {
+        // Per token, 2048 rows run 8.5x slower than 128 on the Neural
+        // Engine, so packing 300-token passages into big calls wastes time.
+        let family = Family::Qwen3;
+        let counts = vec![300; 64];
+        let calls = plan(family, &family.lengths_for(2048), &counts);
+        assert!(
+            calls.iter().all(|call| call.length < 1536),
+            "{:?}",
+            calls.iter().map(|call| call.length).collect::<Vec<_>>()
+        );
     }
 }

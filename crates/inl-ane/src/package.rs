@@ -28,13 +28,22 @@ pub struct KnownPackage {
 }
 
 /// Packages by model; the package repo id resolves too.
-pub const KNOWN_PACKAGES: &[KnownPackage] = &[KnownPackage {
-    model: "google/embeddinggemma-2",
-    // ANEEmbed's package (https://github.com/junmo-kim/ANEEmbed).
-    repo: "junmo-k/embeddinggemma-2-ane",
-    revision: "e97c928a49cbc0cd61974ca628b14a1cd9b03d66",
-    manifest_sha256: "b21e57adf6931e3838d5a1e346befcf2e13adfb43906cb7bad1dff1274912d8a",
-}];
+pub const KNOWN_PACKAGES: &[KnownPackage] = &[
+    KnownPackage {
+        model: "google/embeddinggemma-2",
+        // ANEEmbed's package (https://github.com/junmo-kim/ANEEmbed).
+        repo: "junmo-k/embeddinggemma-2-ane",
+        revision: "e97c928a49cbc0cd61974ca628b14a1cd9b03d66",
+        manifest_sha256: "b21e57adf6931e3838d5a1e346befcf2e13adfb43906cb7bad1dff1274912d8a",
+    },
+    KnownPackage {
+        model: "Qwen/Qwen3-Embedding-0.6B",
+        // Built by `scripts/ane/build_qwen3.py`.
+        repo: "NomaDamas/qwen3-embedding-0.6b-ane",
+        revision: "7011f9648c165a57e0c305346e469461e985d8c1",
+        manifest_sha256: "8e68df2b9d34a13f984a32ed74dbfdbe5788e0c6ee867e790f6a6f2051fd50d9",
+    },
+];
 
 pub(crate) fn known(id: &str) -> Option<&'static KnownPackage> {
     KNOWN_PACKAGES

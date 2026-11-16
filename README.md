@@ -45,6 +45,7 @@ kernel compatibility patch described in `docs/DEVICES.md`.
 | `Qwen/Qwen3-Embedding-0.6B` | `inl-text` | 1024-d dense | f16 on Metal by default, f32 elsewhere |
 | `google/embeddinggemma-2` (text) | `inl-text` | 768-d dense | f32 or bf16 only (f16 overflows to NaN); Matryoshka 128/256/512/768 |
 | `google/embeddinggemma-2` (text, `--device ane`) | `inl-ane` | 768-d dense | Apple Neural Engine, fp16 Core ML package (below) |
+| `Qwen/Qwen3-Embedding-0.6B` (`--device ane`) | `inl-ane` | 1024-d dense | Apple Neural Engine, fp16 Core ML package (below) |
 | `nlpai-lab/KURE-Sparse-nano` | `inl-sparse` | 36282-term sparse | f32 on every device (f16 changes which terms clear the threshold) |
 | `google/embeddinggemma-2` (image, video, audio, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | f32 or bf16 (bf16 on a GPU only); never f16 |
 | `perplexity-ai/pplx-embed-v2-late-0.6b` | `inl-late` | one 128-d vector per token | f32 by default; bf16 is faster but less exact |
@@ -59,7 +60,7 @@ Every model is checked against its Hugging Face reference with golden tests
 | CPU | all models |
 | Metal (Apple Silicon) | all models; fused attention for the vision tower |
 | CUDA (NVIDIA) | `--features cuda`; Qwen3, EmbeddingGemma 2 text and KURE-Sparse-nano verified on a Blackwell GPU (sm_120). Needs CUDA ≥ 12.9 for Blackwell |
-| Apple Neural Engine | `--device ane`, dense text with a Core ML package: EmbeddingGemma 2 |
+| Apple Neural Engine | `--device ane`, dense text with a Core ML package: EmbeddingGemma 2, Qwen3-Embedding-0.6B |
 
 `docs/DEVICES.md` has the exact build commands, environment variables, measured
 throughput and the known problems per machine.
@@ -67,31 +68,40 @@ throughput and the known problems per machine.
 ### Apple Neural Engine
 
 `--device ane` runs a dense model as a Core ML package on the Neural Engine
-(`MLComputeUnits.cpuAndNeuralEngine`; the GPU stays free). The package is
-[ANEEmbed](https://github.com/junmo-kim/ANEEmbed)'s
-[`junmo-k/embeddinggemma-2-ane`](https://huggingface.co/junmo-k/embeddinggemma-2-ane):
-fp16 graphs rewritten so EmbeddingGemma 2 does not overflow, one function per
-length from 64 to 8192 rows. `inl-ane` pins it by commit and manifest sha256,
-checks every file against the manifest, compiles it for the Mac once into
-`<cache>/ane/`, and on every load runs the package's self-test on each
-function it serves; a function that misses its reference embeddings fails the
-load. Short texts are packed into shared calls (attention is masked per text,
-so a packed text gets the same vector as alone); texts above 2048 tokens are
-truncated, as in `inl-text`.
+(`MLComputeUnits.cpuAndNeuralEngine`; the GPU stays free):
+
+| Model | Package | Functions |
+|---|---|---|
+| `google/embeddinggemma-2` | [ANEEmbed](https://github.com/junmo-kim/ANEEmbed)'s [`junmo-k/embeddinggemma-2-ane`](https://huggingface.co/junmo-k/embeddinggemma-2-ane) | 64 to 8192 rows, bidirectional (sliding window above 1280), mean pooling |
+| `Qwen/Qwen3-Embedding-0.6B` | [`NomaDamas/qwen3-embedding-0.6b-ane`](https://huggingface.co/NomaDamas/qwen3-embedding-0.6b-ane), built by `scripts/ane/build_qwen3.py` | 64 to 2048 rows, causal, last-token pooling |
+
+Both are fp16 graphs rewritten so the model does not overflow (RMSNorm divides
+by the row's max-abs first). `inl-ane` pins each package by commit and
+manifest sha256, checks every file against the manifest, compiles it for the
+Mac once into `<cache>/ane/`, and on every load runs the package's self-test
+on each function it serves; a function that misses its reference embeddings
+fails the load. Short texts are packed into shared calls (attention is masked
+per text, so a packed text gets the same vector as alone); texts above 2048
+tokens are truncated, as in `inl-text`.
 
 The first load of an executable compiles every function for the Neural Engine
 (about 5 minutes on an M4 Max); macOS caches that per executable and path, and
-later loads (self-test included) take about 12 s. Measured on an M4 Max over
-`inl serve` `/v1/embeddings`, warm, against `--device metal --dtype f32`:
+later loads (self-test included) take about 8-12 s. Measured on an M4 Max over
+`inl serve` `/v1/embeddings`, warm:
 
-| Request | ANE | Metal f32 |
-|---|---:|---:|
-| one short query | 4.3 ms | 16 ms |
-| 64 texts, 2800 tokens (one of 1.7k tokens) | 0.25 s | 0.56 s |
+| Request | Gemma ANE | Gemma Metal f32 | Qwen3 ANE | Qwen3 Metal f16 |
+|---|---:|---:|---:|---:|
+| one short query | 4.3 ms | 16 ms | 9.3 ms | 14.2 ms |
+| 64 texts, 2800 tokens (one of 1.7k tokens) | 0.25 s | 0.56 s | | |
+| BEIR SciFact corpus, 5183 passages, 1.71M tokens | | | 352 s | 266 s |
 
-Every vector is within cosine 0.99996 of the fp32 Sentence-Transformers
-reference (`crates/inl-ane/tests/gemma2_ane_live.rs`) and of the Metal f32
-server.
+EmbeddingGemma 2 vectors are within cosine 0.99996 of the fp32
+Sentence-Transformers reference and of the Metal f32 server. Qwen3 has 28
+layers whose matmuls the Neural Engine rounds in fp16 (candle accumulates in
+f32): its worst golden row is 0.99965, and 0.9985 over the SciFact passages,
+with unchanged retrieval (SciFact nDCG@10 0.7016 on the ANE, 0.7011 on Metal).
+Bulk Qwen3 embedding is faster on an M4 Max GPU; the ANE wins on latency and
+leaves the GPU free. The tolerances are in `crates/inl-ane/tests/ane_live.rs`.
 
 ## The daemon
 

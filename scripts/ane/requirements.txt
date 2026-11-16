@@ -1,0 +1,8 @@
+# The environment that built NomaDamas/qwen3-embedding-0.6b-ane (Python 3.12, CPU).
+coremltools==9.0
+torch==2.7.1
+transformers==5.23.0
+sentence-transformers==6.3.0
+numpy==2.5.5
+safetensors==0.8.0
+tokenizers==0.23.3
