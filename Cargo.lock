@@ -1664,6 +1664,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "inl-ane"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "half",
+ "hex",
+ "inl-core",
+ "memmap2",
+ "objc2",
+ "objc2-core-ml",
+ "objc2-foundation",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "inl-core"
 version = "0.1.0"
 dependencies = [
@@ -1726,6 +1748,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "fs2",
+ "inl-ane",
  "inl-core",
  "inl-late",
  "inl-sparse",
@@ -2193,6 +2216,17 @@ dependencies = [
  "bitflags",
  "dispatch2",
  "objc2",
+]
+
+[[package]]
+name = "objc2-core-ml"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201b055e6acfa0f9f15568255d3f03ce2b54bc86d1814442dc69138e36813e18"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

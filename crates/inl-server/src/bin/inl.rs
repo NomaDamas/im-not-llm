@@ -73,7 +73,7 @@ struct ServeArgs {
     /// Hub repo id or local directory to serve.
     #[arg(long)]
     model: Option<String>,
-    /// `auto`, `cpu`, `metal` or `cuda`.
+    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, dense models with a package).
     #[arg(long)]
     device: Option<String>,
     /// `auto`, `f32`, `f16` or `bf16`.
@@ -129,7 +129,7 @@ struct DiscoverArgs {
     /// dtype and kind need not be repeated: the server is found by model.
     #[arg(long)]
     model: Option<String>,
-    /// `auto`, `cpu`, `metal` or `cuda`.
+    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, dense models with a package).
     #[arg(long)]
     device: Option<String>,
     /// `auto`, `f32`, `f16` or `bf16`.
@@ -347,6 +347,15 @@ fn devices() {
     println!(
         "cuda: {}",
         availability(cfg!(feature = "cuda"), DeviceSpec::Cuda)
+    );
+    // Every Apple silicon Mac has a Neural Engine.
+    println!(
+        "ane: {}",
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "available"
+        } else {
+            "unavailable"
+        }
     );
 }
 

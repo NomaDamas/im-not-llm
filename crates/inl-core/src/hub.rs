@@ -10,7 +10,7 @@
 
 use crate::error::{InlError, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
-use hf_hub::{Cache, CacheRepo};
+use hf_hub::{Cache, CacheRepo, Repo, RepoType};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,11 @@ pub struct HubRepo {
 }
 
 pub fn hf_repo(repo_id: &str, default_cache_dir: PathBuf) -> Result<HubRepo> {
+    hf_repo_at(repo_id, "main", default_cache_dir)
+}
+
+/// [`hf_repo`] at a branch, tag or commit instead of `main`.
+pub fn hf_repo_at(repo_id: &str, revision: &str, default_cache_dir: PathBuf) -> Result<HubRepo> {
     let cache_dir = std::env::var("HF_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_cache_dir);
@@ -75,12 +80,24 @@ pub fn hf_repo(repo_id: &str, default_cache_dir: PathBuf) -> Result<HubRepo> {
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
         .or_else(default_hf_token);
-    HubRepo::new(repo_id, cache_dir, endpoint, token)
+    HubRepo::at_revision(repo_id, revision, cache_dir, endpoint, token)
 }
 
 impl HubRepo {
     pub fn new(
         repo_id: &str,
+        cache_dir: PathBuf,
+        endpoint: String,
+        token: Option<String>,
+    ) -> Result<Self> {
+        Self::at_revision(repo_id, "main", cache_dir, endpoint, token)
+    }
+
+    /// A repo at a branch, tag or commit. A commit pins the files: the cache
+    /// keeps them under that commit, so they are read offline once downloaded.
+    pub fn at_revision(
+        repo_id: &str,
+        revision: &str,
         cache_dir: PathBuf,
         endpoint: String,
         token: Option<String>,
@@ -94,9 +111,10 @@ impl HubRepo {
             .map_err(|e| {
                 InlError::Inference(format!("native model API initialization failed: {e}"))
             })?;
+        let repo = Repo::with_revision(repo_id.to_string(), RepoType::Model, revision.to_string());
         Ok(Self {
-            api: api.model(repo_id.to_string()),
-            cache: Cache::new(cache_dir.clone()).model(repo_id.to_string()),
+            api: api.repo(repo.clone()),
+            cache: Cache::new(cache_dir.clone()).repo(repo),
             id: repo_id.to_string(),
             endpoint,
             cache_dir,
@@ -601,6 +619,43 @@ mod tests {
         assert!(!error.is_damaged());
         assert!(text.contains("org/model"), "{text}");
         assert!(text.contains("http://127.0.0.1:9"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_revision_downloads_that_revision_and_then_reads_the_cache() {
+        let content = b"pinned".to_vec();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/org/model/resolve/{COMMIT}/manifest.json$"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-repo-commit", COMMIT)
+                    .insert_header("etag", "\"abc\"")
+                    .insert_header("content-range", "bytes 0-5/6")
+                    .set_body_bytes(content.clone()),
+            )
+            .mount(&server)
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let repo = Arc::new(
+            HubRepo::at_revision(
+                "org/model",
+                COMMIT,
+                cache.path().to_path_buf(),
+                server.uri(),
+                None,
+            )
+            .unwrap(),
+        );
+        let path = fetch(&repo, "manifest.json").await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), content);
+        let before = server.received_requests().await.unwrap().len();
+        assert!(before > 0);
+        let path = fetch(&repo, "manifest.json").await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), content);
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
     }
 
     fn blob(dir: &Path, name: &str, content: &[u8]) -> PathBuf {

@@ -52,6 +52,16 @@ pipeline. The golden tests reproduce their output, stage by stage.
 
 - Model: `Qwen/Qwen3-Embedding-0.6B`, Apache License, Version 2.0
 
+## ANEEmbed: Apple Neural Engine package and host contract
+
+`crates/inl-ane` implements the host side of ANEEmbed's Core ML package
+contract (function sizes, packing, attention masks, pooling matrices,
+self-test) in Rust, and downloads its EmbeddingGemma 2 package at runtime.
+
+- Code: [ANEEmbed](https://github.com/junmo-kim/ANEEmbed), MIT License
+- Package: `junmo-k/embeddinggemma-2-ane`, Apache License, Version 2.0 (vision
+  conversion from `FluidInference/embeddinggemma-2-coreml`, not used here)
+
 ## Test fixtures
 
 `crates/inl-text/tests/fixtures/tiny_embeddinggemma2` and
