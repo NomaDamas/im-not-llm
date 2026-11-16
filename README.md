@@ -44,6 +44,7 @@ kernel compatibility patch described in `docs/DEVICES.md`.
 |---|---|---|---|
 | `Qwen/Qwen3-Embedding-0.6B` | `inl-text` | 1024-d dense | f16 on Metal by default, f32 elsewhere |
 | `google/embeddinggemma-2` (text) | `inl-text` | 768-d dense | f32 or bf16 only (f16 overflows to NaN); Matryoshka 128/256/512/768 |
+| `google/embeddinggemma-2` (text, `--device ane`) | `inl-ane` | 768-d dense | Apple Neural Engine, fp16 Core ML package (below) |
 | `nlpai-lab/KURE-Sparse-nano` | `inl-sparse` | 36282-term sparse | f32 on every device (f16 changes which terms clear the threshold) |
 | `google/embeddinggemma-2` (image, video, audio, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | f32 or bf16 (bf16 on a GPU only); never f16 |
 | `perplexity-ai/pplx-embed-v2-late-0.6b` | `inl-late` | one 128-d vector per token | f32 by default; bf16 is faster but less exact |
@@ -58,9 +59,39 @@ Every model is checked against its Hugging Face reference with golden tests
 | CPU | all models |
 | Metal (Apple Silicon) | all models; fused attention for the vision tower |
 | CUDA (NVIDIA) | `--features cuda`; Qwen3, EmbeddingGemma 2 text and KURE-Sparse-nano verified on a Blackwell GPU (sm_120). Needs CUDA ≥ 12.9 for Blackwell |
+| Apple Neural Engine | `--device ane`, dense text with a Core ML package: EmbeddingGemma 2 |
 
 `docs/DEVICES.md` has the exact build commands, environment variables, measured
 throughput and the known problems per machine.
+
+### Apple Neural Engine
+
+`--device ane` runs a dense model as a Core ML package on the Neural Engine
+(`MLComputeUnits.cpuAndNeuralEngine`; the GPU stays free). The package is
+[ANEEmbed](https://github.com/junmo-kim/ANEEmbed)'s
+[`junmo-k/embeddinggemma-2-ane`](https://huggingface.co/junmo-k/embeddinggemma-2-ane):
+fp16 graphs rewritten so EmbeddingGemma 2 does not overflow, one function per
+length from 64 to 8192 rows. `inl-ane` pins it by commit and manifest sha256,
+checks every file against the manifest, compiles it for the Mac once into
+`<cache>/ane/`, and on every load runs the package's self-test on each
+function it serves; a function that misses its reference embeddings fails the
+load. Short texts are packed into shared calls (attention is masked per text,
+so a packed text gets the same vector as alone); texts above 2048 tokens are
+truncated, as in `inl-text`.
+
+The first load of an executable compiles every function for the Neural Engine
+(about 5 minutes on an M4 Max); macOS caches that per executable and path, and
+later loads (self-test included) take about 12 s. Measured on an M4 Max over
+`inl serve` `/v1/embeddings`, warm, against `--device metal --dtype f32`:
+
+| Request | ANE | Metal f32 |
+|---|---:|---:|
+| one short query | 4.3 ms | 16 ms |
+| 64 texts, 2800 tokens (one of 1.7k tokens) | 0.25 s | 0.56 s |
+
+Every vector is within cosine 0.99996 of the fp32 Sentence-Transformers
+reference (`crates/inl-ane/tests/gemma2_ane_live.rs`) and of the Metal f32
+server.
 
 ## The daemon
 
@@ -74,11 +105,12 @@ inl serve --multimodal            # EmbeddingGemma 2: text + image + video + aud
 inl serve --model perplexity-ai/pplx-embed-v2-late-0.6b   # late interaction: one vector per token
 inl serve --multimodal --modalities text,audio   # load only the towers listed
 inl serve --model <repo-or-dir> --device cuda --dtype bf16
+inl serve --model google/embeddinggemma-2 --device ane   # dense on the Apple Neural Engine
 
 inl health --multimodal           # prints /health JSON; exit 0 only when status is "ok"
 inl unload --multimodal           # drop the weights, keep the process
 inl stop   --multimodal           # drain and exit
-inl devices                       # cpu / metal / cuda availability of this build
+inl devices                       # cpu / metal / cuda / ane availability of this build
 ```
 
 Without `--sparse` / `--multimodal` / `--late`, `serve` picks the kind from the
@@ -207,6 +239,7 @@ after a timeout every later call in that process fails fast: restart the process
 ```
 crates/inl-core     device/dtype selection, Hugging Face hub client, attention, deadlines, engine traits
 crates/inl-text     Qwen3-Embedding, EmbeddingGemma 2 text
+crates/inl-ane      dense text on the Apple Neural Engine (Core ML packages: EmbeddingGemma 2)
 crates/inl-sparse   ModernBERT + SPLADE pooling (KURE-Sparse-nano)
 crates/inl-late     Qwen3.5 text tower + multi-vector heads (pplx-embed-v2-late)
 crates/inl-vision   EmbeddingGemma 2 vision + audio towers, image/video/audio preprocessing, multimodal merge
@@ -229,6 +262,7 @@ bindings/node       Node-API addon
 ```sh
 cargo test --workspace                                     # offline
 HF_HOME=… cargo test --release --workspace -- --ignored    # real checkpoints
+cargo test --release -p inl-ane -- --ignored               # Apple Neural Engine (macOS)
 ```
 
 ## License

@@ -1,0 +1,35 @@
+[package]
+name = "inl-ane"
+description = "Dense text embeddings on the Apple Neural Engine (Core ML): EmbeddingGemma 2 and Qwen3-Embedding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+inl-core.workspace = true
+async-trait.workspace = true
+half = "2"
+hex = "0.4"
+memmap2 = "0.9"
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
+objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "block2", "MLModel", "MLModelConfiguration", "MLMultiArray", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLFeatureValue", "MLModel_MLModelCompilation"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

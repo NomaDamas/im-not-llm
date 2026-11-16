@@ -7,7 +7,7 @@
 //! [`InstanceKey`] that names its state directory.
 
 use inl_core::device::{DeviceSpec, DtypeSpec};
-use inl_core::Result;
+use inl_core::{InlError, Result};
 use inl_server::{Engine, EngineKind, InstanceKey};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,8 +108,14 @@ pub fn default_prefixes(kind: EngineKind) -> (Option<String>, Option<String>) {
 
 /// Build the real engine the CLI asked for. Construction is cheap; the model
 /// loads lazily on the server's first request (or its `load`).
+///
+/// `--device ane` runs a dense model's Core ML package on the Apple Neural
+/// Engine (`inl-ane`); its graphs are fp16, so no other dtype is accepted.
 pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
     let model = args.model_or_default(kind);
+    if args.device.as_deref() == Some(ANE_DEVICE) {
+        return build_ane(kind, model, args);
+    }
     match kind {
         EngineKind::Dense => {
             let options = inl_text::TextOptions {
@@ -160,6 +166,39 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
             };
             Ok(Engine::late(Arc::new(inl_late::LateEncoder::new(options)?)))
         }
+    }
+}
+
+/// The `--device` that selects the Apple Neural Engine.
+pub const ANE_DEVICE: &str = "ane";
+
+fn build_ane(kind: EngineKind, model: String, args: &EngineArgs) -> Result<Engine> {
+    if kind != EngineKind::Dense {
+        return Err(InlError::Config(format!(
+            "--device {ANE_DEVICE} serves dense text embeddings only, not {}",
+            kind.as_str()
+        )));
+    }
+    if !matches!(args.dtype.as_deref(), None | Some("auto" | "f16")) {
+        return Err(InlError::Config(format!(
+            "--device {ANE_DEVICE} runs fp16 graphs: --dtype must be auto or f16"
+        )));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let embedder = inl_ane::AneEmbedder::new(inl_ane::AneOptions {
+            id: model,
+            cache_dir: args.cache_dir.clone(),
+            ..inl_ane::AneOptions::default()
+        })?;
+        Ok(Engine::dense(Arc::new(embedder)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = model;
+        Err(InlError::Config(format!(
+            "--device {ANE_DEVICE} needs an Apple silicon Mac"
+        )))
     }
 }
 
@@ -214,5 +253,26 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("config.json"), "{error}");
+    }
+
+    fn ane(kind: EngineKind, dtype: Option<&str>) -> Result<Engine> {
+        build(
+            kind,
+            &EngineArgs {
+                device: Some("ane".into()),
+                dtype: dtype.map(str::to_string),
+                ..EngineArgs::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_neural_engine_runs_its_fp16_graphs_and_nothing_else() {
+        let error = ane(EngineKind::Dense, Some("f32")).err().unwrap();
+        assert!(error.to_string().contains("f16"), "{error}");
+        for kind in [EngineKind::Sparse, EngineKind::Multimodal, EngineKind::Late] {
+            let error = ane(kind, None).err().unwrap();
+            assert!(error.to_string().contains("dense"), "{kind:?}: {error}");
+        }
     }
 }
