@@ -76,15 +76,17 @@ pub fn default_model(kind: EngineKind) -> &'static str {
 /// ModernBERT engine), a Qwen3.5 checkpoint a late-interaction encoder (the
 /// only Qwen3.5 engine), anything else a dense text encoder. Multimodal stays
 /// opt-in because the same EmbeddingGemma 2 checkpoint also serves dense.
-/// No `--model` is the dense default and reads nothing; neither does
-/// `--device ane`, which serves dense models only from Core ML packages that
-/// carry no `config.json`.
+/// No `--model` is the dense default and reads nothing. Under `--device ane`
+/// the package's manifest decides (packages carry no `config.json`).
 pub fn detect_kind(args: &EngineArgs) -> Result<EngineKind> {
     let Some(model) = args.model.as_deref().filter(|model| !model.is_empty()) else {
         return Ok(EngineKind::Dense);
     };
     if args.device.as_deref() == Some(ANE_DEVICE) {
-        return Ok(EngineKind::Dense);
+        return Ok(match inl_ane::package_family(model)? {
+            Some(family) if family.is_sparse() => EngineKind::Sparse,
+            _ => EngineKind::Dense,
+        });
     }
     let cache = inl_core::device::model_cache_dir(args.cache_dir.as_deref());
     let path = inl_core::hub::ModelSource::resolve(model, cache)?.fetch("config.json")?;
@@ -114,11 +116,13 @@ pub fn default_prefixes(kind: EngineKind) -> (Option<String>, Option<String>) {
 /// Build the real engine the CLI asked for. Construction is cheap; the model
 /// loads lazily on the server's first request (or its `load`).
 ///
-/// `--device ane` runs a dense model's Core ML package on the Apple Neural
-/// Engine (`inl-ane`); its graphs are fp16, so no other dtype is accepted.
+/// `--device ane` runs a dense or sparse model's Core ML package on the
+/// Apple Neural Engine (`inl-ane`); its graphs are fp16, so no other dtype is
+/// accepted. On Apple silicon it is also the default for models whose
+/// package says so ([`effective_device`]).
 pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
     let model = args.model_or_default(kind);
-    if args.device.as_deref() == Some(ANE_DEVICE) {
+    if effective_device(kind, args).as_deref() == Some(ANE_DEVICE) {
         return build_ane(kind, model, args);
     }
     match kind {
@@ -177,10 +181,44 @@ pub fn build(kind: EngineKind, args: &EngineArgs) -> Result<Engine> {
 /// The `--device` that selects the Apple Neural Engine.
 pub const ANE_DEVICE: &str = "ane";
 
+/// The Neural Engine serves `model` as `kind` here without being asked: an
+/// Apple silicon Mac, no device named (or `auto`), no dtype other than f16
+/// asked for, and a pinned package marked default for this model
+/// (`KnownPackage::default_on_apple`) of the same kind. `--device metal` /
+/// `cpu` opts out.
+fn ane_by_default(kind: EngineKind, model: &str, args: &EngineArgs) -> bool {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return false;
+    }
+    if !matches!(args.device.as_deref(), None | Some("auto"))
+        || !matches!(args.dtype.as_deref(), None | Some("auto" | "f16"))
+    {
+        return false;
+    }
+    inl_ane::known_package(model).is_some_and(|package| {
+        package.default_on_apple
+            && match kind {
+                EngineKind::Dense => !package.family.is_sparse(),
+                EngineKind::Sparse => package.family.is_sparse(),
+                EngineKind::Multimodal | EngineKind::Late => false,
+            }
+    })
+}
+
+/// The device `build` runs `kind` on: `ane` when the Neural Engine is the
+/// default for the model (see [`ane_by_default`]), else what was asked.
+pub fn effective_device(kind: EngineKind, args: &EngineArgs) -> Option<String> {
+    if ane_by_default(kind, &args.model_or_default(kind), args) {
+        Some(ANE_DEVICE.to_string())
+    } else {
+        args.device.clone()
+    }
+}
+
 fn build_ane(kind: EngineKind, model: String, args: &EngineArgs) -> Result<Engine> {
-    if kind != EngineKind::Dense {
+    if !matches!(kind, EngineKind::Dense | EngineKind::Sparse) {
         return Err(InlError::Config(format!(
-            "--device {ANE_DEVICE} serves dense text embeddings only, not {}",
+            "--device {ANE_DEVICE} serves dense and sparse text embeddings only, not {}",
             kind.as_str()
         )));
     }
@@ -191,12 +229,17 @@ fn build_ane(kind: EngineKind, model: String, args: &EngineArgs) -> Result<Engin
     }
     #[cfg(target_os = "macos")]
     {
-        let embedder = inl_ane::AneEmbedder::new(inl_ane::AneOptions {
+        let options = inl_ane::AneOptions {
             id: model,
             cache_dir: args.cache_dir.clone(),
             ..inl_ane::AneOptions::default()
-        })?;
-        Ok(Engine::dense(Arc::new(embedder)))
+        };
+        Ok(match kind {
+            EngineKind::Sparse => {
+                Engine::sparse(Arc::new(inl_ane::AneSparseEncoder::new(options)?))
+            }
+            _ => Engine::dense(Arc::new(inl_ane::AneEmbedder::new(options)?)),
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -271,6 +314,16 @@ mod tests {
         assert_eq!(kind.unwrap(), EngineKind::Dense);
     }
 
+    #[test]
+    fn a_sparse_neural_engine_package_serves_sparse() {
+        let kind = detect_kind(&EngineArgs {
+            model: Some(DEFAULT_SPARSE_MODEL.into()),
+            device: Some(ANE_DEVICE.into()),
+            ..EngineArgs::default()
+        });
+        assert_eq!(kind.unwrap(), EngineKind::Sparse);
+    }
+
     fn ane(kind: EngineKind, dtype: Option<&str>) -> Result<Engine> {
         build(
             kind,
@@ -283,12 +336,69 @@ mod tests {
     }
 
     #[test]
-    fn the_neural_engine_runs_its_fp16_graphs_and_nothing_else() {
-        let error = ane(EngineKind::Dense, Some("f32")).err().unwrap();
-        assert!(error.to_string().contains("f16"), "{error}");
-        for kind in [EngineKind::Sparse, EngineKind::Multimodal, EngineKind::Late] {
-            let error = ane(kind, None).err().unwrap();
-            assert!(error.to_string().contains("dense"), "{kind:?}: {error}");
+    fn the_neural_engine_runs_its_fp16_text_graphs_and_nothing_else() {
+        for kind in [EngineKind::Dense, EngineKind::Sparse] {
+            let error = ane(kind, Some("f32")).err().unwrap();
+            assert!(error.to_string().contains("f16"), "{kind:?}: {error}");
         }
+        for kind in [EngineKind::Multimodal, EngineKind::Late] {
+            let error = ane(kind, None).err().unwrap();
+            assert!(
+                error.to_string().contains("dense and sparse"),
+                "{kind:?}: {error}"
+            );
+        }
+    }
+
+    fn device(
+        kind: EngineKind,
+        model: Option<&str>,
+        device: Option<&str>,
+        dtype: Option<&str>,
+    ) -> Option<String> {
+        effective_device(
+            kind,
+            &EngineArgs {
+                model: model.map(str::to_string),
+                device: device.map(str::to_string),
+                dtype: dtype.map(str::to_string),
+                ..EngineArgs::default()
+            },
+        )
+    }
+
+    #[test]
+    fn apple_silicon_serves_the_default_models_on_the_neural_engine_unless_told_otherwise() {
+        let on_apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        let ane = on_apple.then(|| ANE_DEVICE.to_string());
+        assert_eq!(device(EngineKind::Dense, None, None, None), ane);
+        assert_eq!(device(EngineKind::Sparse, None, Some("auto"), None), ane);
+        assert_eq!(device(EngineKind::Sparse, None, None, Some("f16")), ane);
+        // An explicit device or a dtype the graphs do not run keeps candle.
+        assert_eq!(
+            device(EngineKind::Dense, None, Some("metal"), None).as_deref(),
+            Some("metal")
+        );
+        assert_eq!(device(EngineKind::Dense, None, None, Some("f32")), None);
+        // EmbeddingGemma 2 stays out of fp16 unless asked for.
+        assert_eq!(
+            device(
+                EngineKind::Dense,
+                Some("google/embeddinggemma-2"),
+                None,
+                None
+            ),
+            None
+        );
+        assert_eq!(device(EngineKind::Multimodal, None, None, None), None);
+        // A sparse package never serves dense, nor the reverse.
+        assert_eq!(
+            device(EngineKind::Dense, Some(DEFAULT_SPARSE_MODEL), None, None),
+            None
+        );
+        assert_eq!(
+            device(EngineKind::Sparse, Some(DEFAULT_DENSE_MODEL), None, None),
+            None
+        );
     }
 }

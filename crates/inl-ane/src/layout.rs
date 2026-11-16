@@ -21,6 +21,12 @@ pub(crate) const BAND_COLUMNS: usize = 3 * WINDOW;
 /// Pool weight of a long (winl) call: 2^-10 on every token row instead of 1/n,
 /// which underflows fp16 inside the graph; the scale cancels in the L2 norm.
 const LONG_POOL: f16 = f16::from_f32_const(0.000_976_562_5);
+/// KURE-Sparse-nano's sliding window reaches this many rows on each side
+/// (`local_attention / 2`).
+const SPLADE_HALF_WINDOW: usize = 64;
+/// Rows per block of a SPLADE function's `block_max` output; texts start on a
+/// block boundary so a block never mixes two texts.
+pub(crate) const SPLADE_BLOCK: usize = 8;
 
 /// The architectures a package can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +35,9 @@ pub enum Family {
     Gemma2,
     /// `Qwen/Qwen3-Embedding-0.6B`: causal, last-token pooling.
     Qwen3,
+    /// `nlpai-lab/KURE-Sparse-nano`: ModernBERT masked LM, SPLADE max pooling
+    /// (learned-sparse, not dense).
+    ModernBertSplade,
 }
 
 /// How a function attends and pools; decides its inputs.
@@ -42,28 +51,54 @@ pub(crate) enum Kind {
     Winl,
     /// `embed_S`: causal attention, `causal_bias`, last-token pool.
     Causal,
+    /// `splade_S`: `global_bias` + `local_bias`, a `keep` row mask, block max
+    /// of the shifted vocabulary logits.
+    Splade,
 }
 
 impl Family {
+    /// True for a learned-sparse (SPLADE) family, false for a dense one.
+    pub fn is_sparse(self) -> bool {
+        self == Self::ModernBertSplade
+    }
+
     /// The Core ML package (`<name>.mlpackage`) holding the text functions.
     pub(crate) fn package_name(self) -> &'static str {
         match self {
             Self::Gemma2 => "EmbeddingGemma2Text",
             Self::Qwen3 => "Qwen3EmbeddingText",
+            Self::ModernBertSplade => "ModernBertSpladeText",
         }
     }
 
     pub(crate) fn from_package_name(name: &str) -> Option<Self> {
-        [Self::Gemma2, Self::Qwen3]
+        [Self::Gemma2, Self::Qwen3, Self::ModernBertSplade]
             .into_iter()
             .find(|family| family.package_name() == name)
+    }
+
+    /// Rows a text's offset in a call is a multiple of.
+    pub(crate) fn alignment(self) -> usize {
+        match self {
+            Self::ModernBertSplade => SPLADE_BLOCK,
+            Self::Gemma2 | Self::Qwen3 => 1,
+        }
+    }
+
+    /// Texts one `length`-row call holds: the pool rows of a dense function;
+    /// a SPLADE function has no pool rows, only its blocks bound it.
+    pub(crate) fn max_texts(self, length: usize) -> usize {
+        match self {
+            Self::ModernBertSplade => length / SPLADE_BLOCK,
+            Self::Gemma2 | Self::Qwen3 => slots(length),
+        }
     }
 
     /// Packing lengths, ascending: every call of up to this many rows.
     pub(crate) fn packing_lengths(self) -> &'static [usize] {
         match self {
             Self::Gemma2 => &[64, 128, 256, 512, 768, 1024, 1280, 1536, 2048],
-            Self::Qwen3 => &[64, 128, 256, 512, 768, 1024, 1536, 2048],
+            Self::Qwen3 | Self::ModernBertSplade => &[64, 128, 256, 512, 768, 1024, 1536, 2048],
         }
     }
 
@@ -71,7 +106,7 @@ impl Family {
     pub(crate) fn long_lengths(self) -> &'static [usize] {
         match self {
             Self::Gemma2 => &[3072, 4096, 6144, 8192],
-            Self::Qwen3 => &[],
+            Self::Qwen3 | Self::ModernBertSplade => &[],
         }
     }
 
@@ -102,6 +137,17 @@ impl Family {
                 (1536, 464.6),
                 (2048, 1659.4),
             ],
+            // `scripts/ane` package, `MLModel.predict` per function, M4 Max.
+            Self::ModernBertSplade => &[
+                (64, 3.9),
+                (128, 5.7),
+                (256, 13.0),
+                (512, 35.5),
+                (768, 75.1),
+                (1024, 129.2),
+                (1536, 297.3),
+                (2048, 723.3),
+            ],
         };
         table
             .iter()
@@ -114,7 +160,7 @@ impl Family {
         match self {
             // Gemma multiplies the embedding by sqrt(hidden) = sqrt(512).
             Self::Gemma2 => (512f32).sqrt(),
-            Self::Qwen3 => 1.0,
+            Self::Qwen3 | Self::ModernBertSplade => 1.0,
         }
     }
 
@@ -124,6 +170,7 @@ impl Family {
             Self::Gemma2 if length > 1280 => Kind::Winp,
             Self::Gemma2 => Kind::Bucket,
             Self::Qwen3 => Kind::Causal,
+            Self::ModernBertSplade => Kind::Splade,
         }
     }
 
@@ -132,6 +179,7 @@ impl Family {
             Kind::Bucket | Kind::Causal => format!("embed_{length}"),
             Kind::Winp => format!("winp{length}_b{WINDOW}"),
             Kind::Winl => format!("winl{length}_b{WINDOW}"),
+            Kind::Splade => format!("splade_{length}"),
         }
     }
 
@@ -142,6 +190,7 @@ impl Family {
             Kind::Winp => &["inputs_embeds", "band_bias", "global_bias", "pool"],
             Kind::Winl => &["inputs_embeds", "band_bias", "key_bias", "pool"],
             Kind::Causal => &["inputs_embeds", "causal_bias", "pool"],
+            Kind::Splade => &["inputs_embeds", "global_bias", "local_bias", "keep"],
         }
     }
 
@@ -193,8 +242,15 @@ pub(crate) struct Call {
 /// that holds it, and the cheapest C (by [`Family::cost`]) wins: small C means
 /// many cheap calls, large C fewer expensive ones.
 ///
+/// A text takes its count rounded up to [`Family::alignment`] rows, so every
+/// offset is a multiple of it; the segment's `len` stays the count.
+///
 /// Every count must be at least 1 and at most the largest available length.
 pub(crate) fn plan(family: Family, lengths: &[usize], counts: &[usize]) -> Vec<Call> {
+    let rows: Vec<usize> = counts
+        .iter()
+        .map(|&count| count.next_multiple_of(family.alignment()))
+        .collect();
     let packing: Vec<usize> = family
         .packing_lengths()
         .iter()
@@ -206,7 +262,7 @@ pub(crate) fn plan(family: Family, lengths: &[usize], counts: &[usize]) -> Vec<C
     let mut order: Vec<usize> = Vec::new();
     for (item, &count) in counts.iter().enumerate() {
         debug_assert!(count >= 1);
-        if count > packed_max {
+        if rows[item] > packed_max {
             let length = lengths
                 .iter()
                 .copied()
@@ -227,10 +283,10 @@ pub(crate) fn plan(family: Family, lengths: &[usize], counts: &[usize]) -> Vec<C
     if order.is_empty() {
         return calls;
     }
-    order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+    order.sort_by(|&a, &b| rows[b].cmp(&rows[a]).then(a.cmp(&b)));
     let mut best: Option<(f64, Vec<Call>)> = None;
     for &capacity in &packing {
-        let packed = pack(&order, counts, capacity, &packing);
+        let packed = pack(family, &order, &rows, counts, capacity, &packing);
         let cost: f64 = packed.iter().map(|call| family.cost(call.length)).sum();
         if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
             best = Some((cost, packed));
@@ -240,12 +296,21 @@ pub(crate) fn plan(family: Family, lengths: &[usize], counts: &[usize]) -> Vec<C
     calls
 }
 
-fn pack(order: &[usize], counts: &[usize], capacity: usize, packing: &[usize]) -> Vec<Call> {
-    let slots_per_bin = slots(capacity);
+/// First-fit-decreasing bins of `capacity` rows; a text takes `rows[item]`
+/// rows and keeps `counts[item]` as its length.
+fn pack(
+    family: Family,
+    order: &[usize],
+    rows: &[usize],
+    counts: &[usize],
+    capacity: usize,
+    packing: &[usize],
+) -> Vec<Call> {
+    let slots_per_bin = family.max_texts(capacity);
     let mut bins: Vec<(Vec<usize>, usize)> = Vec::new();
     let mut open: Vec<usize> = Vec::new();
     for &item in order {
-        let count = counts[item];
+        let count = rows[item];
         if count > capacity {
             bins.push((vec![item], count));
             continue;
@@ -273,7 +338,7 @@ fn pack(order: &[usize], counts: &[usize], capacity: usize, packing: &[usize]) -
             let length = packing
                 .iter()
                 .copied()
-                .find(|&length| length >= used && slots(length) >= items.len())
+                .find(|&length| length >= used && family.max_texts(length) >= items.len())
                 .expect("a bin always fits its capacity's length");
             let mut offset = 0;
             let segments = items
@@ -284,7 +349,7 @@ fn pack(order: &[usize], counts: &[usize], capacity: usize, packing: &[usize]) -
                         offset,
                         len: counts[item],
                     };
-                    offset += counts[item];
+                    offset += rows[item];
                     segment
                 })
                 .collect();
@@ -377,8 +442,29 @@ fn last_pool(segments: &[Segment], length: usize, out: &mut [f16]) {
     }
 }
 
+/// `[S, 1]` row mask of a SPLADE function: 1 on a text's rows whose token is
+/// not a prefix marker (`[Q]` / `[D]` are attended but never pooled), 0 on
+/// prefix, alignment and padding rows. `ids[segment.item]` are the text's
+/// tokens.
+pub(crate) fn fill_keep(segments: &[Segment], ids: &[Vec<u32>], prefix: &[u32], out: &mut [f16]) {
+    out.fill(f16::ZERO);
+    for segment in segments {
+        let tokens = &ids[segment.item];
+        debug_assert_eq!(tokens.len(), segment.len);
+        for (row, id) in out[segment.offset..segment.offset + segment.len]
+            .iter_mut()
+            .zip(tokens)
+        {
+            if !prefix.contains(id) {
+                *row = f16::ONE;
+            }
+        }
+    }
+}
+
 /// Fill input `name` of a `length`-row function of `family` for `segments`
-/// (all but `inputs_embeds`, which comes from the token table).
+/// (all but `inputs_embeds`, which comes from the token table, and `keep`,
+/// which comes from the token ids through [`fill_keep`]).
 pub(crate) fn fill_input(
     family: Family,
     length: usize,
@@ -388,10 +474,13 @@ pub(crate) fn fill_input(
 ) {
     let kind = family.kind(length);
     match (kind, name) {
-        (Kind::Bucket | Kind::Winp, "global_bias") => {
+        (Kind::Bucket | Kind::Winp | Kind::Splade, "global_bias") => {
             square_bias(segments, length, Mask::Full, out)
         }
         (Kind::Bucket, "local_bias") => square_bias(segments, length, Mask::Window(WINDOW), out),
+        (Kind::Splade, "local_bias") => {
+            square_bias(segments, length, Mask::Window(SPLADE_HALF_WINDOW), out)
+        }
         (Kind::Winp | Kind::Winl, "band_bias") => band_bias(segments, length, out),
         (Kind::Bucket | Kind::Winp, "pool") => mean_pool(segments, length, out),
         (Kind::Winl, "key_bias") => {
@@ -655,5 +744,76 @@ mod tests {
             "{:?}",
             calls.iter().map(|call| call.length).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn splade_texts_start_on_block_boundaries_and_never_share_a_block() {
+        // The graph max-reduces 8-row blocks; a block that held the end of one
+        // text and the start of the next would leak terms between them.
+        let family = Family::ModernBertSplade;
+        let lengths = family.lengths_for(2048);
+        let counts: Vec<usize> = (0..200).map(|i| 1 + (i * 37 + i * i * 11) % 2048).collect();
+        let calls = plan(family, &lengths, &counts);
+        let mut seen = vec![0usize; counts.len()];
+        for call in &calls {
+            let mut end = 0;
+            for segment in &call.segments {
+                assert_eq!(segment.offset % SPLADE_BLOCK, 0, "{call:?}");
+                assert!(segment.offset >= end, "{call:?}");
+                assert_eq!(segment.len, counts[segment.item]);
+                end = (segment.offset + segment.len).next_multiple_of(SPLADE_BLOCK);
+                seen[segment.item] += 1;
+            }
+            assert!(end <= call.length, "{call:?}");
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+        // 32 queries of 5 tokens take 8 rows each: two 128-row calls of 16
+        // texts, more than a dense function's 8 pool rows.
+        let calls = plan(family, &lengths, &[5; 32]);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls
+            .iter()
+            .all(|call| call.length == 128 && call.segments.len() == 16));
+    }
+
+    #[test]
+    fn splade_keep_masks_prefix_markers_alignment_and_padding() {
+        let segments = [
+            Segment {
+                item: 0,
+                offset: 0,
+                len: 4,
+            },
+            Segment {
+                item: 1,
+                offset: 8,
+                len: 3,
+            },
+        ];
+        let ids = vec![vec![5, 50001, 7, 3], vec![5, 50000, 3]];
+        let mut out = vec![f16::ONE; 16];
+        fill_keep(&segments, &ids, &[50000, 50001], &mut out);
+        let keep: Vec<f32> = out.iter().map(|v| v.to_f32()).collect();
+        assert_eq!(
+            keep,
+            [1., 0., 1., 1., 0., 0., 0., 0., 1., 0., 1., 0., 0., 0., 0., 0.]
+        );
+    }
+
+    #[test]
+    fn splade_local_bias_opens_64_rows_each_side_within_the_text() {
+        let segments = segs(&[200]);
+        let length = 256;
+        let mut out = vec![f16::ZERO; length * length];
+        fill_input(
+            Family::ModernBertSplade,
+            length,
+            "local_bias",
+            &segments,
+            &mut out,
+        );
+        let row = &out[100 * length..101 * length];
+        let opened: Vec<usize> = (0..length).filter(|&k| open(row[k])).collect();
+        assert_eq!(opened, (36..=164).collect::<Vec<_>>());
     }
 }

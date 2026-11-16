@@ -1,5 +1,5 @@
-//! [`AneEmbedder`]: a [`DenseEngine`] over a model package on the Neural
-//! Engine.
+//! [`AneEmbedder`] (a [`DenseEngine`]) and [`AneSparseEncoder`] (a
+//! [`SparseEngine`]) over a model package on the Neural Engine.
 //!
 //! Load: resolve the package (download and check every byte against the
 //! pinned manifest), compile it for this Mac once, load each function the
@@ -9,16 +9,20 @@
 //!
 //! Embed: tokenize, plan calls that pack short texts together, fill each
 //! call's inputs and run it. Calls run one at a time: the Neural Engine is a
-//! single device, so concurrency would only interleave them.
+//! single device, so concurrency would only interleave them. A SPLADE call
+//! returns the per-block max of every text's shifted logits; the host
+//! finishes each text's term weights from its own blocks.
 
 use crate::coreml::{self, Function};
-use crate::layout::{self, Call, Family, Segment};
+use crate::layout::{self, Call, Family, Segment, SPLADE_BLOCK};
 use crate::package::{self, Package};
 use crate::table::TokenTable;
 use async_trait::async_trait;
 use inl_core::deadline::BatchDeadline;
 use inl_core::device::{model_cache_dir, LoadSlot};
 use inl_core::{DenseEngine, EngineInfo, InlError, Modality, Result};
+use inl_sparse::modernbert::SpladePooling;
+use inl_sparse::{SparseEngine, SparseVector};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -62,8 +66,38 @@ impl Default for AneOptions {
 /// embedder in the process then fails fast.
 static ANE_DEADLINE: BatchDeadline = BatchDeadline::new();
 
+/// A dense text embedder over a Neural Engine package.
 pub struct AneEmbedder {
+    ane: Ane,
+}
+
+impl AneEmbedder {
+    pub fn new(options: AneOptions) -> Result<Self> {
+        Ok(Self {
+            ane: Ane::new(options, false)?,
+        })
+    }
+}
+
+/// A learned-sparse (SPLADE) encoder over a Neural Engine package. Texts
+/// are encoded exactly as given: the caller adds `[Q] ` / `[D] `.
+pub struct AneSparseEncoder {
+    ane: Ane,
+}
+
+impl AneSparseEncoder {
+    pub fn new(options: AneOptions) -> Result<Self> {
+        Ok(Self {
+            ane: Ane::new(options, true)?,
+        })
+    }
+}
+
+/// What both engines share: one package, loaded once, its calls serialized.
+struct Ane {
     options: AneOptions,
+    /// The engine serves a sparse package (else a dense one).
+    sparse: bool,
     slot: LoadSlot<Arc<Loaded>>,
     /// Serializes requests ahead of the per-call deadline.
     gate: tokio::sync::Mutex<()>,
@@ -76,16 +110,101 @@ struct Loaded {
     specials: usize,
     max_length: usize,
     lengths: Vec<usize>,
+    /// Width of a text's vector: the dense dimension, or the sparse term
+    /// space.
     dimension: usize,
     table: TokenTable,
+    head: Head,
     functions: Mutex<BTreeMap<usize, Function>>,
 }
 
-impl AneEmbedder {
-    pub fn new(options: AneOptions) -> Result<Self> {
+/// How a call's output becomes one vector per text.
+enum Head {
+    /// Row k of the output is text k's embedding.
+    Dense,
+    Splade(Splade),
+}
+
+/// The host half of SPLADE pooling: the graph returns, per 8-row block, the
+/// max of `relu(logit - shift) * keep`; a text's weights are the max over
+/// its blocks with the masked vocabulary zeroed, `ln(1 + x)`, max-folded onto
+/// canonical terms (all monotone or per term, so they commute with the max).
+struct Splade {
+    prefix: Vec<u32>,
+    masked: Vec<usize>,
+    canonical: Option<Vec<u32>>,
+    vocab: usize,
+}
+
+impl Splade {
+    fn load(package: &Package) -> Result<Self> {
+        let pooling: SpladePooling =
+            serde_json::from_slice(&std::fs::read(package.path(package::SPLADE_POOLING_FILE))?)?;
+        let [vocab, _] = package.manifest.token_table.shape;
+        pooling.validate(vocab)?;
+        if pooling.dimension(vocab) != package.manifest.embedding.dim {
+            return Err(InlError::Inference(format!(
+                "package {}: the pooling has {} terms, the manifest {}",
+                package.manifest.name,
+                pooling.dimension(vocab),
+                package.manifest.embedding.dim
+            )));
+        }
+        Ok(Self {
+            prefix: pooling.prefix_token_ids,
+            masked: pooling
+                .masked_vocab_ids
+                .iter()
+                .map(|&id| id as usize)
+                .collect(),
+            canonical: pooling.canonical_ids,
+            vocab,
+        })
+    }
+
+    /// Term weights (`dimension` wide) of `segment` from a call's
+    /// `[S / 8, vocab]` block maxima.
+    fn weights(&self, out: &[f32], segment: &Segment, dimension: usize) -> Vec<f32> {
+        let vocab = self.vocab;
+        let first = segment.offset / SPLADE_BLOCK;
+        let end = (segment.offset + segment.len).div_ceil(SPLADE_BLOCK);
+        let mut pooled = out[first * vocab..(first + 1) * vocab].to_vec();
+        for block in out[(first + 1) * vocab..end * vocab].chunks_exact(vocab) {
+            for (max, &value) in pooled.iter_mut().zip(block) {
+                if value > *max {
+                    *max = value;
+                }
+            }
+        }
+        for &id in &self.masked {
+            pooled[id] = 0.0;
+        }
+        let Some(canonical) = &self.canonical else {
+            pooled
+                .iter_mut()
+                .for_each(|weight| *weight = weight.ln_1p());
+            return pooled;
+        };
+        let mut folded = vec![0f32; dimension];
+        for (&max, &term) in pooled.iter().zip(canonical) {
+            let slot = &mut folded[term as usize];
+            // ln_1p is monotone: fold the maxima, take the log once per term.
+            if max > *slot {
+                *slot = max;
+            }
+        }
+        folded
+            .iter_mut()
+            .for_each(|weight| *weight = weight.ln_1p());
+        folded
+    }
+}
+
+impl Ane {
+    fn new(options: AneOptions, sparse: bool) -> Result<Self> {
         if options.id.is_empty() {
             return Err(InlError::Config(
-                "ANE embedder id is missing a model name".into(),
+                "ANE engine id is missing a model name".into(),
             ));
         }
         if options.max_length == 0 {
@@ -93,6 +212,7 @@ impl AneEmbedder {
         }
         Ok(Self {
             options,
+            sparse,
             slot: LoadSlot::new(),
             gate: tokio::sync::Mutex::new(()),
         })
@@ -102,7 +222,8 @@ impl AneEmbedder {
         self.slot
             .get_or_load(|| async {
                 let options = self.options.clone();
-                tokio::task::spawn_blocking(move || Loaded::load(&options).map(Arc::new))
+                let sparse = self.sparse;
+                tokio::task::spawn_blocking(move || Loaded::load(&options, sparse).map(Arc::new))
                     .await
                     .map_err(|error| {
                         InlError::Inference(format!("ANE load join failed: {error}"))
@@ -115,7 +236,30 @@ impl AneEmbedder {
         Duration::from_secs(self.options.timeout_seconds)
     }
 
-    async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    async fn info(&self) -> Result<EngineInfo> {
+        ANE_DEADLINE.ensure_healthy("ANE embedding")?;
+        let loaded = self.loaded().await?;
+        Ok(EngineInfo {
+            model_id: self.options.id.clone(),
+            dimension: loaded.dimension,
+            dtype: "f16".to_string(),
+            device: "ane".to_string(),
+            attention: "packed".to_string(),
+            max_length: loaded.max_length,
+            modalities: vec![Modality::Text],
+        })
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        let loaded = self.loaded().await?;
+        let texts = texts.to_vec();
+        tokio::task::spawn_blocking(move || loaded.token_counts(&texts))
+            .await
+            .map_err(|error| InlError::Inference(format!("ANE tokenizer join failed: {error}")))?
+    }
+
+    /// One vector per text, in order.
+    async fn vectors(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -149,7 +293,7 @@ impl AneEmbedder {
 }
 
 impl Loaded {
-    fn load(options: &AneOptions) -> Result<Self> {
+    fn load(options: &AneOptions, sparse: bool) -> Result<Self> {
         if !cfg!(target_arch = "aarch64") {
             return Err(InlError::Config(
                 "the Apple Neural Engine needs an Apple silicon Mac".into(),
@@ -157,8 +301,19 @@ impl Loaded {
         }
         let cache = model_cache_dir(options.cache_dir.as_deref());
         let package = package::resolve(&options.id, cache.clone())?;
-        let mlmodelc = compiled_model(&package, &cache)?;
         let family = package.family;
+        if family.is_sparse() != sparse {
+            let (is, wanted) = if sparse {
+                ("dense", "sparse")
+            } else {
+                ("sparse", "dense")
+            };
+            return Err(InlError::Config(format!(
+                "{} is a {is} package, not a {wanted} one",
+                options.id
+            )));
+        }
+        let mlmodelc = compiled_model(&package, &cache)?;
         let mut tokenizer = Tokenizer::from_file(package.path("tokenizer.json"))
             .map_err(|error| InlError::Inference(format!("ANE tokenizer parse failed: {error}")))?;
         tokenizer
@@ -204,6 +359,11 @@ impl Loaded {
             functions.insert(length, Function::load(&mlmodelc, &name, spec)?);
             tracing::debug!(function = %name, seconds = started.elapsed().as_secs_f32(), "ANE function loaded");
         }
+        let head = if family.is_sparse() {
+            Head::Splade(Splade::load(&package)?)
+        } else {
+            Head::Dense
+        };
         let loaded = Self {
             family,
             tokenizer,
@@ -212,6 +372,7 @@ impl Loaded {
             lengths,
             dimension: package.manifest.embedding.dim,
             table,
+            head,
             functions: Mutex::new(functions),
         };
         loaded.self_test(&package)?;
@@ -263,21 +424,26 @@ impl Loaded {
             .expect("calls are planned over loaded lengths");
         let hidden = self.table.hidden();
         let embeds = function.input("inputs_embeds");
+        // Alignment gaps between texts are padding rows too.
+        embeds.fill(half::f16::ZERO);
         for segment in &call.segments {
             let rows =
                 &mut embeds[segment.offset * hidden..(segment.offset + segment.len) * hidden];
             self.table.gather(&ids[segment.item], rows)?;
         }
-        let used: usize = call.segments.iter().map(|segment| segment.len).sum();
-        embeds[used * hidden..].fill(half::f16::ZERO);
         for &name in &self.family.input_names(call.length)[1..] {
-            layout::fill_input(
-                self.family,
-                call.length,
-                name,
-                &call.segments,
-                function.input(name),
-            );
+            match (&self.head, name) {
+                (Head::Splade(splade), "keep") => {
+                    layout::fill_keep(&call.segments, ids, &splade.prefix, function.input(name))
+                }
+                _ => layout::fill_input(
+                    self.family,
+                    call.length,
+                    name,
+                    &call.segments,
+                    function.input(name),
+                ),
+            }
         }
         let mut out = Vec::new();
         function.predict(&mut out)?;
@@ -286,15 +452,23 @@ impl Loaded {
 
     fn embed_call(&self, call: &Call, ids: &[Vec<u32>]) -> Result<Vec<(usize, Vec<f32>)>> {
         let out = self.run(call, ids)?;
-        Ok(call
-            .segments
+        Ok(self.rows(call, &out))
+    }
+
+    /// Each text's vector from a call's output: a dense function's row k, or
+    /// a SPLADE function's blocks of text k turned into term weights.
+    fn rows(&self, call: &Call, out: &[f32]) -> Vec<(usize, Vec<f32>)> {
+        call.segments
             .iter()
             .enumerate()
             .map(|(slot, segment)| {
-                let row = out[slot * self.dimension..(slot + 1) * self.dimension].to_vec();
+                let row = match &self.head {
+                    Head::Dense => out[slot * self.dimension..(slot + 1) * self.dimension].to_vec(),
+                    Head::Splade(splade) => splade.weights(out, segment, self.dimension),
+                };
                 (segment.item, row)
             })
-            .collect())
+            .collect()
     }
 
     /// Every loaded function reproduces the package's reference embeddings.
@@ -333,19 +507,20 @@ impl Loaded {
                         offset,
                         len: ids.len(),
                     };
-                    offset += ids.len();
+                    offset += ids.len().next_multiple_of(self.family.alignment());
                     segment
                 })
                 .collect();
             let call = Call { length, segments };
             let out = self.run(&call, &sequences)?;
+            let rows = self.rows(&call, &out);
             let expected = test.expected.read(&blob)?;
             let tolerance = spec.tolerance.get(&test.kind).ok_or_else(|| {
                 InlError::Inference(format!("self-test has no tolerance for {}", test.kind))
             })?;
             let dim = self.dimension;
             for (k, want) in expected.chunks_exact(dim).enumerate() {
-                let cos = cosine(&out[k * dim..(k + 1) * dim], want);
+                let cos = cosine(&rows[k].1, want);
                 worst = worst.min(cos);
                 if cos < tolerance.min_cos {
                     return Err(InlError::Inference(format!(
@@ -354,7 +529,7 @@ impl Loaded {
                     )));
                 }
             }
-            if let Some(limit) = tolerance.zero_rows_max_abs {
+            if let (Some(limit), Head::Dense) = (tolerance.zero_rows_max_abs, &self.head) {
                 let spare = out[sequences.len() * dim..]
                     .iter()
                     .fold(0f32, |max, value| max.max(value.abs()));
@@ -471,36 +646,62 @@ impl BlobRef {
 #[async_trait]
 impl DenseEngine for AneEmbedder {
     async fn load(&self) -> Result<EngineInfo> {
-        ANE_DEADLINE.ensure_healthy("ANE embedding")?;
-        let loaded = self.loaded().await?;
-        Ok(EngineInfo {
-            model_id: self.options.id.clone(),
-            dimension: loaded.dimension,
-            dtype: "f16".to_string(),
-            device: "ane".to_string(),
-            attention: "packed".to_string(),
-            max_length: loaded.max_length,
-            modalities: vec![Modality::Text],
-        })
+        self.ane.info().await
     }
 
     async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
-        let loaded = self.loaded().await?;
-        let texts = texts.to_vec();
-        tokio::task::spawn_blocking(move || loaded.token_counts(&texts))
-            .await
-            .map_err(|error| InlError::Inference(format!("ANE tokenizer join failed: {error}")))?
+        self.ane.token_counts(texts).await
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.embed_texts(texts).await
+        self.ane.vectors(texts).await
     }
 
     async fn unload(&self) -> bool {
-        self.slot.unload().await
+        self.ane.slot.unload().await
     }
 
     fn is_loaded(&self) -> bool {
-        self.slot.is_loaded()
+        self.ane.slot.is_loaded()
+    }
+}
+
+#[async_trait]
+impl SparseEngine for AneSparseEncoder {
+    async fn load(&self) -> Result<EngineInfo> {
+        self.ane.info().await
+    }
+
+    async fn token_counts(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.ane.token_counts(texts).await
+    }
+
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<SparseVector>> {
+        self.ane
+            .vectors(texts)
+            .await?
+            .into_iter()
+            .map(|row| {
+                // `from_pairs` drops non-finite weights silently; fail instead.
+                if row.iter().any(|weight| !weight.is_finite()) {
+                    return Err(InlError::Inference(
+                        "ANE sparse encoder produced non-finite weights".into(),
+                    ));
+                }
+                Ok(SparseVector::from_pairs(
+                    row.into_iter()
+                        .enumerate()
+                        .map(|(term, weight)| (term as u32, weight)),
+                ))
+            })
+            .collect()
+    }
+
+    async fn unload(&self) -> bool {
+        self.ane.slot.unload().await
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.ane.slot.is_loaded()
     }
 }

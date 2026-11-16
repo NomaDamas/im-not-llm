@@ -73,7 +73,7 @@ struct ServeArgs {
     /// Hub repo id or local directory to serve.
     #[arg(long)]
     model: Option<String>,
-    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, dense models with a package).
+    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, text models with a package; the default on Apple silicon for Qwen3 and KURE-Sparse-nano).
     #[arg(long)]
     device: Option<String>,
     /// `auto`, `f32`, `f16` or `bf16`.
@@ -129,7 +129,7 @@ struct DiscoverArgs {
     /// dtype and kind need not be repeated: the server is found by model.
     #[arg(long)]
     model: Option<String>,
-    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, dense models with a package).
+    /// `auto`, `cpu`, `metal`, `cuda`, or `ane` (Apple Neural Engine, text models with a package; the default on Apple silicon for Qwen3 and KURE-Sparse-nano).
     #[arg(long)]
     device: Option<String>,
     /// `auto`, `f32`, `f16` or `bf16`.

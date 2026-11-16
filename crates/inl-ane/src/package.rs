@@ -25,6 +25,11 @@ pub struct KnownPackage {
     pub repo: &'static str,
     pub revision: &'static str,
     pub manifest_sha256: &'static str,
+    pub family: Family,
+    /// Served on the Neural Engine when the caller names no device on Apple
+    /// silicon. EmbeddingGemma 2 is opt-in: this project keeps it out of
+    /// fp16 unless asked for.
+    pub default_on_apple: bool,
 }
 
 /// Packages by model; the package repo id resolves too.
@@ -35,6 +40,8 @@ pub const KNOWN_PACKAGES: &[KnownPackage] = &[
         repo: "junmo-k/embeddinggemma-2-ane",
         revision: "e97c928a49cbc0cd61974ca628b14a1cd9b03d66",
         manifest_sha256: "b21e57adf6931e3838d5a1e346befcf2e13adfb43906cb7bad1dff1274912d8a",
+        family: Family::Gemma2,
+        default_on_apple: false,
     },
     KnownPackage {
         model: "Qwen/Qwen3-Embedding-0.6B",
@@ -42,6 +49,17 @@ pub const KNOWN_PACKAGES: &[KnownPackage] = &[
         repo: "NomaDamas/qwen3-embedding-0.6b-ane",
         revision: "7011f9648c165a57e0c305346e469461e985d8c1",
         manifest_sha256: "8e68df2b9d34a13f984a32ed74dbfdbe5788e0c6ee867e790f6a6f2051fd50d9",
+        family: Family::Qwen3,
+        default_on_apple: true,
+    },
+    KnownPackage {
+        model: "nlpai-lab/KURE-Sparse-nano",
+        // Built by `scripts/ane/build_modernbert_splade.py`.
+        repo: "NomaDamas/kure-sparse-nano-ane",
+        revision: "909661c27dcc84835068185d9aca3e5e7d13d52b",
+        manifest_sha256: "f4182ca49fa5d2e1cac10ec29d7c3ac46663c9f60413f9b1a9449fcbcb2c6069",
+        family: Family::ModernBertSplade,
+        default_on_apple: true,
     },
 ];
 
@@ -49,6 +67,20 @@ pub(crate) fn known(id: &str) -> Option<&'static KnownPackage> {
     KNOWN_PACKAGES
         .iter()
         .find(|package| package.model == id || package.repo == id)
+}
+
+/// The family of the package `id` names (a known model, its package repo, or
+/// a local package directory), without downloading anything; `None` when it
+/// names no package.
+pub(crate) fn family_of(id: &str) -> Result<Option<Family>> {
+    if let Some(known) = known(id) {
+        return Ok(Some(known.family));
+    }
+    let manifest = Path::new(id).join("manifest.json");
+    if manifest.is_file() {
+        return parse_manifest(&manifest).map(|(_, _, family)| Some(family));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,16 +154,20 @@ impl Package {
     }
 
     /// The files the text engine reads: the text `.mlpackage`, token table,
-    /// tokenizer and self-test (not the vision tower or a prebuilt
-    /// `.mlmodelc`, which is compiled for another OS build).
+    /// tokenizer, self-test and a SPLADE package's pooling (not the vision
+    /// tower or a prebuilt `.mlmodelc`, which is compiled for another OS
+    /// build).
     fn needed_files(&self) -> Vec<&FileSpec> {
         let mlpackage = format!("{}/", self.text().mlpackage);
-        let singles = [
+        let mut singles = vec![
             self.manifest.token_table.file.as_str(),
             "tokenizer.json",
             "selftest.json",
             "selftest.bin",
         ];
+        if self.family.is_sparse() {
+            singles.push(SPLADE_POOLING_FILE);
+        }
         self.manifest
             .files
             .iter()
@@ -141,6 +177,10 @@ impl Package {
             .collect()
     }
 }
+
+/// A SPLADE package's pooling: the checkpoint's `ShiftedTopKSpladePooling`
+/// `config.json` (prefix tokens, masked vocabulary, canonical fold).
+pub(crate) const SPLADE_POOLING_FILE: &str = "splade_pooling.json";
 
 fn parse_manifest(path: &Path) -> Result<(Manifest, String, Family)> {
     let bytes = std::fs::read(path)?;
