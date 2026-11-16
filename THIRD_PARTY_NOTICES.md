@@ -51,12 +51,17 @@ pipeline. The golden tests reproduce their output, stage by stage.
 ## Qwen/Qwen3-Embedding-0.6B
 
 - Model: `Qwen/Qwen3-Embedding-0.6B`, Apache License, Version 2.0
+- Core ML package `NomaDamas/qwen3-embedding-0.6b-ane` (built by
+  `scripts/ane/build_qwen3.py`, weights of the model above): Apache License,
+  Version 2.0
 
 ## ANEEmbed: Apple Neural Engine package and host contract
 
 `crates/inl-ane` implements the host side of ANEEmbed's Core ML package
 contract (function sizes, packing, attention masks, pooling matrices,
 self-test) in Rust, and downloads its EmbeddingGemma 2 package at runtime.
+`scripts/ane` applies ANEEmbed's fp16 rewrites (max-abs RMSNorm, folded
+grouped-query attention, packed sequences with a mask input) to Qwen3.
 
 - Code: [ANEEmbed](https://github.com/junmo-kim/ANEEmbed), MIT License
 - Package: `junmo-k/embeddinggemma-2-ane`, Apache License, Version 2.0 (vision
