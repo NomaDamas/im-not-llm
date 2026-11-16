@@ -47,6 +47,9 @@ pipeline. The golden tests reproduce their output, stage by stage.
 
 - Model: `nlpai-lab/KURE-Sparse-nano` (0.1B parameters), Apache License,
   Version 2.0
+- Core ML package `NomaDamas/kure-sparse-nano-ane` (built by
+  `scripts/ane/build_modernbert_splade.py`, weights of the model above):
+  Apache License, Version 2.0
 
 ## Qwen/Qwen3-Embedding-0.6B
 

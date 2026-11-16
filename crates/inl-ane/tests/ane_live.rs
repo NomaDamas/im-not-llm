@@ -7,8 +7,9 @@
 //! `cargo test --release -p inl-ane --test ane_live -- --ignored --nocapture`.
 #![cfg(target_os = "macos")]
 
-use inl_ane::{AneEmbedder, AneOptions};
+use inl_ane::{AneEmbedder, AneOptions, AneSparseEncoder};
 use inl_core::DenseEngine;
+use inl_sparse::{SparseEngine, SparseVector};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -104,4 +105,86 @@ async fn embeddinggemma2_matches_the_reference() {
 #[ignore = "live: downloads and compiles the Qwen3-Embedding ANE package; run with --ignored"]
 async fn qwen3_embedding_matches_the_reference() {
     matches_the_reference("Qwen/Qwen3-Embedding-0.6B", "qwen3embedding", 1024, 0.9995).await;
+}
+
+#[derive(Deserialize)]
+struct SparseGolden {
+    query: String,
+    docs: Vec<String>,
+    q: SparseRaw,
+    d: Vec<SparseRaw>,
+}
+
+#[derive(Deserialize)]
+struct SparseRaw {
+    indices: Vec<u32>,
+    values: Vec<f32>,
+}
+
+impl SparseRaw {
+    fn vector(&self) -> SparseVector {
+        SparseVector::new(self.indices.clone(), self.values.clone()).unwrap()
+    }
+}
+
+fn sparse_cosine(a: &SparseVector, b: &SparseVector) -> f32 {
+    a.dot(b) / (a.dot(a).sqrt() * b.dot(b).sqrt())
+}
+
+/// KURE-Sparse-nano against the fp32 Sentence-Transformers SparseEncoder
+/// (`inl-sparse/tests/fixtures/kure_sparse_nano`): every vector close to the
+/// reference, the model-card ranking kept, a packed text the same as alone.
+/// The fp32 PyTorch port of the package graph reproduces the reference at
+/// cosine 1.000000; the Neural Engine's fp16 run measures 0.99883-0.99904
+/// (the same from coremltools and from this crate, so the host pooling adds
+/// nothing). `INL_ANE_KURE_PACKAGE` points at a local package instead of the
+/// pinned one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: downloads and compiles the KURE-Sparse-nano ANE package; run with --ignored"]
+async fn kure_sparse_nano_matches_the_reference() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../inl-sparse/tests/fixtures/kure_sparse_nano/st_f32_golden.json");
+    let golden: SparseGolden = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let id = std::env::var("INL_ANE_KURE_PACKAGE")
+        .unwrap_or_else(|_| "nlpai-lab/KURE-Sparse-nano".into());
+    let encoder = AneSparseEncoder::new(AneOptions {
+        id,
+        ..AneOptions::default()
+    })
+    .unwrap();
+    let started = std::time::Instant::now();
+    let info = encoder.load().await.unwrap();
+    eprintln!("load + self-test {:.1}s", started.elapsed().as_secs_f32());
+    assert_eq!(info.dimension, 36282);
+    assert_eq!(info.device, "ane");
+
+    let mut texts = vec![format!("[Q] {}", golden.query)];
+    texts.extend(golden.docs.iter().map(|doc| format!("[D] {doc}")));
+    let batched = encoder.encode(texts.clone()).await.unwrap();
+    let expected: Vec<SparseVector> = std::iter::once(&golden.q)
+        .chain(&golden.d)
+        .map(SparseRaw::vector)
+        .collect();
+    let (mut worst, mut worst_packing) = (f32::INFINITY, f32::INFINITY);
+    for (row, (ours, theirs)) in batched.iter().zip(&expected).enumerate() {
+        let similarity = sparse_cosine(ours, theirs);
+        let alone = encoder.encode(vec![texts[row].clone()]).await.unwrap();
+        let packed_vs_alone = sparse_cosine(&alone[0], ours);
+        eprintln!(
+            "row {row}: nnz {} (ref {}), cosine {similarity:.6}, packed vs alone {packed_vs_alone:.6}",
+            ours.len(),
+            theirs.len()
+        );
+        worst = worst.min(similarity);
+        worst_packing = worst_packing.min(packed_vs_alone);
+    }
+    assert!(worst > 0.998, "worst cosine to the reference {worst}");
+    assert!(worst_packing > 0.9999, "packed vs alone {worst_packing}");
+    let scores: Vec<f32> = batched[1..].iter().map(|d| batched[0].dot(d)).collect();
+    let reference: Vec<f32> = expected[1..].iter().map(|d| expected[0].dot(d)).collect();
+    eprintln!("scores {scores:?}\nreference {reference:?}");
+    assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
+
+    assert!(encoder.unload().await);
+    assert!(!encoder.is_loaded());
 }

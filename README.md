@@ -47,6 +47,7 @@ kernel compatibility patch described in `docs/DEVICES.md`.
 | `google/embeddinggemma-2` (text, `--device ane`) | `inl-ane` | 768-d dense | Apple Neural Engine, fp16 Core ML package (below) |
 | `Qwen/Qwen3-Embedding-0.6B` (`--device ane`) | `inl-ane` | 1024-d dense | Apple Neural Engine, fp16 Core ML package (below) |
 | `nlpai-lab/KURE-Sparse-nano` | `inl-sparse` | 36282-term sparse | f32 on every device (f16 changes which terms clear the threshold) |
+| `nlpai-lab/KURE-Sparse-nano` (`--device ane`, the default on Apple silicon) | `inl-ane` | 36282-term sparse | Apple Neural Engine, fp16 Core ML package (below) |
 | `google/embeddinggemma-2` (image, video, audio, interleaved) | `inl-vision` | 768-d dense, same space as the text tower | f32 or bf16 (bf16 on a GPU only); never f16 |
 | `perplexity-ai/pplx-embed-v2-late-0.6b` | `inl-late` | one 128-d vector per token | f32 by default; bf16 is faster but less exact |
 
@@ -60,20 +61,24 @@ Every model is checked against its Hugging Face reference with golden tests
 | CPU | all models |
 | Metal (Apple Silicon) | all models; fused attention for the vision tower |
 | CUDA (NVIDIA) | `--features cuda`; Qwen3, EmbeddingGemma 2 text and KURE-Sparse-nano verified on a Blackwell GPU (sm_120). Needs CUDA ≥ 12.9 for Blackwell |
-| Apple Neural Engine | `--device ane`, dense text with a Core ML package: EmbeddingGemma 2, Qwen3-Embedding-0.6B |
+| Apple Neural Engine | `--device ane`, text with a Core ML package: Qwen3-Embedding-0.6B and KURE-Sparse-nano (the default on Apple silicon), EmbeddingGemma 2 (opt-in) |
 
 `docs/DEVICES.md` has the exact build commands, environment variables, measured
 throughput and the known problems per machine.
 
 ### Apple Neural Engine
 
-`--device ane` runs a dense model as a Core ML package on the Neural Engine
-(`MLComputeUnits.cpuAndNeuralEngine`; the GPU stays free):
+`--device ane` runs a model as a Core ML package on the Neural Engine
+(`MLComputeUnits.cpuAndNeuralEngine`; the GPU stays free). On Apple silicon it is
+the default, with no `--device`, for Qwen3-Embedding-0.6B and KURE-Sparse-nano;
+`--device metal` / `cpu` or a dtype other than f16 opts out. EmbeddingGemma 2
+stays opt-in (this project keeps it out of fp16 unless asked):
 
 | Model | Package | Functions |
 |---|---|---|
 | `google/embeddinggemma-2` | [ANEEmbed](https://github.com/junmo-kim/ANEEmbed)'s [`junmo-k/embeddinggemma-2-ane`](https://huggingface.co/junmo-k/embeddinggemma-2-ane) | 64 to 8192 rows, bidirectional (sliding window above 1280), mean pooling |
 | `Qwen/Qwen3-Embedding-0.6B` | [`NomaDamas/qwen3-embedding-0.6b-ane`](https://huggingface.co/NomaDamas/qwen3-embedding-0.6b-ane), built by `scripts/ane/build_qwen3.py` | 64 to 2048 rows, causal, last-token pooling |
+| `nlpai-lab/KURE-Sparse-nano` | [`NomaDamas/kure-sparse-nano-ane`](https://huggingface.co/NomaDamas/kure-sparse-nano-ane), built by `scripts/ane/build_modernbert_splade.py` | 64 to 2048 rows, global and 128-token sliding-window attention, SPLADE max pooling (per-block maxima on the ANE, the rest on the host) |
 
 Both are fp16 graphs rewritten so the model does not overflow (RMSNorm divides
 by the row's max-abs first). `inl-ane` pins each package by commit and
@@ -103,6 +108,21 @@ with unchanged retrieval (SciFact nDCG@10 0.7016 on the ANE, 0.7011 on Metal).
 Bulk Qwen3 embedding is faster on an M4 Max GPU; the ANE wins on latency and
 leaves the GPU free. The tolerances are in `crates/inl-ane/tests/ane_live.rs`.
 
+KURE-Sparse-nano on Ko-StrategyQA dev (592 queries, 9,251 passages, `inl serve /embed_sparse`,
+`scripts/ane/bench/sparse.py`), M4 Max, warm:
+
+| | ANE fp16 | Metal f32 | CPU f32 |
+|---|---:|---:|---:|
+| one query | 4.3 ms | 6.6 ms | 36.9 ms |
+| 592 queries | 0.66 s | 1.32 s | 8.5 s |
+| 9,251 passages | 137.6 s | 135.5 s | 1642 s |
+| peak memory footprint | 359 MB | 1456 MB | 1164 MB |
+| nDCG@10 / Recall@100 | 0.7905 / 0.9107 | 0.7915 / 0.9099 | 0.7915 / 0.9099 |
+
+The ANE vectors are within cosine 0.9988 of the fp32 Sentence-Transformers
+reference (the fp32 PyTorch port of the same graph: 1.000000). Query latency is
+1.5x better than Metal, bulk throughput equal, memory 4x smaller.
+
 ## The daemon
 
 ```sh
@@ -110,12 +130,12 @@ cargo build --release -p inl-server --bin inl
 
 inl serve                         # Qwen3-Embedding-0.6B, dense
 inl serve --model nlpai-lab/KURE-Sparse-nano   # sparse: the kind follows the model
-inl serve --sparse                # KURE-Sparse-nano, the sparse default
+inl serve --sparse                # KURE-Sparse-nano, the sparse default (on the Neural Engine on Apple silicon)
 inl serve --multimodal            # EmbeddingGemma 2: text + image + video + audio
 inl serve --model perplexity-ai/pplx-embed-v2-late-0.6b   # late interaction: one vector per token
 inl serve --multimodal --modalities text,audio   # load only the towers listed
 inl serve --model <repo-or-dir> --device cuda --dtype bf16
-inl serve --model google/embeddinggemma-2 --device ane   # dense on the Apple Neural Engine
+inl serve --model google/embeddinggemma-2 --device ane   # opt in: EmbeddingGemma 2 on the Apple Neural Engine
 
 inl health --multimodal           # prints /health JSON; exit 0 only when status is "ok"
 inl unload --multimodal           # drop the weights, keep the process
@@ -249,7 +269,7 @@ after a timeout every later call in that process fails fast: restart the process
 ```
 crates/inl-core     device/dtype selection, Hugging Face hub client, attention, deadlines, engine traits
 crates/inl-text     Qwen3-Embedding, EmbeddingGemma 2 text
-crates/inl-ane      dense text on the Apple Neural Engine (Core ML packages: EmbeddingGemma 2)
+crates/inl-ane      dense and sparse text on the Apple Neural Engine (Core ML packages)
 crates/inl-sparse   ModernBERT + SPLADE pooling (KURE-Sparse-nano)
 crates/inl-late     Qwen3.5 text tower + multi-vector heads (pplx-embed-v2-late)
 crates/inl-vision   EmbeddingGemma 2 vision + audio towers, image/video/audio preprocessing, multimodal merge
