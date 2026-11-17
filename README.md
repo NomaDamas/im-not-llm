@@ -26,7 +26,7 @@ For Rust applications:
 ```toml
 [dependencies]
 inl-text = "0.1.0"
-inl-sparse = "0.1.1"
+inl-sparse = "0.1.2"
 inl-late = "0.1.0"
 inl-vision = "0.1.1"
 inl-server = { version = "0.3.0", default-features = false }
