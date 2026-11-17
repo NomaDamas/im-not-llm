@@ -1,7 +1,7 @@
 [package]
 name = "inl-core"
 description = "Shared runtime for im-not-llm engines: device/dtype selection, model hub, attention, deadlines"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
