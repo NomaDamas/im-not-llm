@@ -16,12 +16,12 @@ categories = ["science", "text-processing", "multimedia"]
 
 [workspace.dependencies]
 # Path for the workspace, version for crates.io; publish in this order.
-inl-core = { path = "crates/inl-core", version = "0.1.0" }
+inl-core = { path = "crates/inl-core", version = "0.1.1" }
 inl-text = { path = "crates/inl-text", version = "0.1.0" }
 inl-sparse = { path = "crates/inl-sparse", version = "0.1.1" }
 inl-late = { path = "crates/inl-late", version = "0.1.0" }
 inl-vision = { path = "crates/inl-vision", version = "0.1.1" }
-inl-server = { path = "crates/inl-server", version = "0.2.0", default-features = false }
+inl-server = { path = "crates/inl-server", version = "0.3.0", default-features = false }
 inl-ane = { path = "crates/inl-ane", version = "0.1.0" }
 anyhow = "1"
 async-trait = "0.1"

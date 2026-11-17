@@ -111,8 +111,10 @@ The model side is device-independent but worth knowing on CUDA:
 
 ### Registry releases and shared daemon state
 
-`inl-core`, `inl-text` 0.1.0 and `inl-vision` 0.1.1 are published on
-crates.io. `inl-sparse` 0.1.1 exports the ModernBERT `MODEL_TYPE` the CLI uses
+`inl-text` 0.1.0 and `inl-vision` 0.1.1 are published on
+crates.io; `inl-core` 0.1.1 adds `hf_repo_at` (a Hub repo pinned to a commit),
+and `inl-ane` 0.1.0 and `inl-server` 0.3.0 add the Apple Neural Engine engines,
+the default on Apple silicon for Qwen3-Embedding and KURE-Sparse-nano. `inl-sparse` 0.1.1 exports the ModernBERT `MODEL_TYPE` the CLI uses
 to pick the engine kind; `inl-late` 0.1.0 and `inl-server` 0.2.0 add the late
 engine. The previously published `inl-server` 0.1.1 had no late engine; the
 public engine enums gained `Late`, hence the minor release. Each upload ran Cargo's packaged-source
