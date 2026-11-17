@@ -111,8 +111,9 @@ The model side is device-independent but worth knowing on CUDA:
 
 ### Registry releases and shared daemon state
 
-`inl-text` 0.1.0 and `inl-vision` 0.1.1 are published on
-crates.io; `inl-core` 0.1.1 adds `hf_repo_at` (a Hub repo pinned to a commit),
+`inl-vision` 0.1.1 is published on crates.io; `inl-core` 0.1.2 adds
+`cuda_prefers_bf16` and `inl-text` 0.1.1 / `inl-server` 0.3.2 make Qwen3 bf16 on
+Ampere-or-newer CUDA GPUs (see the 2026-11-17 section); `inl-core` 0.1.1 added `hf_repo_at` (a Hub repo pinned to a commit),
 and `inl-ane` 0.1.0 and `inl-server` 0.3.0 add the Apple Neural Engine engines,
 the default on Apple silicon for Qwen3-Embedding and KURE-Sparse-nano. `inl-sparse` 0.1.1 exports the ModernBERT `MODEL_TYPE` the CLI uses
 to pick the engine kind; `inl-late` 0.1.0 and `inl-server` 0.2.0 add the late
