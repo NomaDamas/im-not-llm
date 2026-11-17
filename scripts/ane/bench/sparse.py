@@ -1,11 +1,12 @@
 """KURE-Sparse-nano: speed, memory and retrieval quality of one `inl serve` engine per process.
 
-    sparse.py <label> <model or package dir> <device>
+    sparse.py <label> <model or package dir> <device> [dtype]
 
 Needs <work>/kostrategyqa.json ({"docs": [[id, text]], "queries": [[id, text]], "qrels": {qid: {cid: rel}}},
 Ko-StrategyQA dev from taeminlee/Ko-StrategyQA) and `inl` built in release. Queries are sent with
-input_type "query" ("[Q] "), passages with "passage" ("[D] "). Appends one JSON line per run to
-results_sparse.jsonl next to this file.
+input_type "query" ("[Q] "), passages with "passage" ("[D] "). Memory is the process footprint on macOS and
+the process's GPU memory (nvidia-smi) on a CUDA host; `device` "default" passes no --device. Appends one
+JSON line per run to results_sparse.jsonl next to this file.
 """
 import json, math, os, re, subprocess, sys, threading, time, urllib.request
 import numpy as np
@@ -14,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 INL = os.environ.get("INL", "/Volumes/SSD1/ios-dev/cargo-target/release/inl")
 WORK = os.environ.get("WORK", "/Volumes/SSD1/ane-work")
 label, model, device = sys.argv[1:4]
+dtype = sys.argv[4] if len(sys.argv) > 4 else None
 data = json.load(open(f"{WORK}/kostrategyqa.json"))
 PROBE = "훈민정음은 언제 만들어졌나요?"
 
@@ -24,6 +26,13 @@ def footprint_mb(pid):
     return float(m.group(1)) * {"KB": 1 / 1024, "MB": 1, "GB": 1024}[m.group(2)] if m else None
 
 
+if sys.platform == "darwin":
+    memory_mb, INTERVAL = footprint_mb, 0.5
+else:
+    sys.path.insert(0, HERE)
+    from gpumem import gpu_mb as memory_mb, INTERVAL
+
+
 class Sampler(threading.Thread):
     def __init__(self, pid):
         super().__init__(daemon=True)
@@ -31,16 +40,18 @@ class Sampler(threading.Thread):
 
     def run(self):
         while not self.halt:
-            f = footprint_mb(self.pid)
+            f = memory_mb(self.pid)
             if f:
                 self.peak = max(self.peak, f)
-            time.sleep(0.5)
+            time.sleep(INTERVAL)
 
 
 port = 18451
 args = [INL, "serve", "--model", model, "--port", str(port), "--idle-timeout", "0", "--sparse"]
 if device != "default":
     args += ["--device", device]
+if dtype:
+    args += ["--dtype", dtype]
 p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 sampler = Sampler(p.pid)
 sampler.start()
@@ -72,6 +83,8 @@ while True:
         time.sleep(0.2)
 encode([PROBE], "query")
 res = {"engine": label, "load_s": time.perf_counter() - t0}
+time.sleep(1)
+res["loaded_mb"] = memory_mb(p.pid)
 health = json.load(urllib.request.urlopen(url + "/health"))
 res["device"], res["dtype"] = health.get("device"), health.get("dtype")
 for _ in range(3):
@@ -82,6 +95,8 @@ for _ in range(30):
 res["single_ms"] = 1000 * float(np.median(ts))
 t = time.perf_counter(); qv = bulk([q[1] for q in data["queries"]], "query"); res["queries_s"] = time.perf_counter() - t
 t = time.perf_counter(); dv = bulk([d[1] for d in data["docs"]], "passage"); res["docs_s"] = time.perf_counter() - t
+time.sleep(2)
+res["idle_after_mb"] = memory_mb(p.pid)
 res["footprint_peak_mb"] = sampler.peak
 p.terminate()
 p.wait()

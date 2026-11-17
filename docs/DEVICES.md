@@ -433,6 +433,61 @@ Sparse (KURE-Sparse-nano, f32, `--max-batch-tokens 4096`, `--n 64 --len 300`):
 The in-crate `sparse_live::throughput_by_device_and_dtype` reports the same
 order of magnitude on CPU (1.4 chunks/s for its longer 900-char chunks).
 
+### gpu01 CUDA memory and default dtype (2026-11-17)
+
+RTX PRO 6000 Blackwell (sm_120) on a Slurm allocation (one card, idle:
+2 MiB used before each run), through a release `inl serve`; 9,251 passages and
+592 queries of Ko-StrategyQA dev (`scripts/ane/bench/{sparse,dense}.py`, raw
+rows in `docs/cuda-vram-20261117.jsonl`). Memory is the process's own GPU
+memory sampled from NVML every 2 ms; a bare CUDA context is 550 MB of it.
+
+Qwen3-Embedding-0.6B, default dtype before and after (`inl serve`, no flags):
+
+| | f32 (before) | bf16 (after) |
+|---|---:|---:|
+| weights resident after load | 3114 MB | 1802 MB |
+| peak during the passage run | 12,396 MB | 2,380 MB |
+| one query | 9.35 ms | 6.84 ms |
+| 592 queries | 1.04 s | 0.61 s |
+| 9,251 passages | 335.2 s | 65.8 s |
+| nDCG@10 / Recall@100 | 0.6501 / 0.8796 | 0.6491 / 0.8785 |
+
+The dtype default is bf16 for Qwen3 on compute capability >= 8 (`cuda_runs_bf16`;
+Pascal has no bf16 kernels and Turing no bf16 tensor cores, so they stay f32).
+The golden texts (1 to 2048 tokens) are within cosine 0.99953 of the fp32
+Sentence-Transformers vectors (`qwen3_live::default_dtype_matches_the_fp32_reference`);
+a 1,500-token text is the worst case against the f32 server, 0.9964.
+EmbeddingGemma 2 stays f32 (only validated there).
+
+The free-memory padded-token cap (`effective_max_batch_tokens`) is now capped
+at 8,192. Before, 90 GB free derived ~180k tokens; throughput was flat from
+~1.2k padded tokens (bf16, 256 passages of 300 words: 51.8-52.2 chunks/s at
+8,192 against 51.4-51.9 at the old cap; 40-word passages 576-596 against
+577-584) and only the peak moved (2.2 GB against 5.6 GB). EmbeddingGemma 2
+(f32, 256 x 300 words, `bench_text`) went from 40.8 chunks/s and 8,106 MB to
+55.2 chunks/s and 2,538 MB with the same cap and no other change.
+
+KURE-Sparse-nano stays f32 on CUDA. Against the Sentence-Transformers vectors
+the golden texts show how half precision changes which terms exist
+(`sparse_live::half_precision_term_sets_against_the_reference`): f32 0 one-sided
+terms, f16 27 (max weight diff 0.054), bf16 116 (0.219). Ko-StrategyQA retrieval
+is unchanged by it (nDCG@10 f32 0.7915, bf16 0.7917, f16 0.7912) and bf16 is 1.4x
+faster (35.2 s against 49.5 s for the passages) with 0.45 GB less peak (1,068 MB
+against 1,516 MB), but a sparse index is decided by its term set, so
+the f32 default is kept and half precision remains an explicit `--dtype`.
+`inl-sparse` 0.1.2 (packed pooling, #16) measured here: peak 1,484 MB against
+1,516 MB, 60.4 / 60.5 s against 59.7 / 60.5 s for the passages, identical nDCG.
+
+Where the rest of the sparse process goes: 1,322 MB resident after load (550
+MB CUDA context, ~600 MB f32 weights, the rest not attributed) and up to 1.5 GB
+at peak. A server stays near its burst peak after the burst (1,634 MB at the
+end of a 64-passage request, 1,570 MB ten seconds later). The cause of that
+retention is not established: the default stream-ordered pool with its default
+release threshold (0) returned a 1 GiB block to the driver at the next stream
+sync in a standalone probe, so it is not simply that pool's cache, and a
+`cuMemPoolTrimTo` hook added on that theory was dropped because its test
+measured nothing to release. Lowering the peak today means a smaller batch.
+
 ## Known issues
 
 * `qwen3_live` compares CPU against `INL_TEST_DEVICE` (default `auto`); on a

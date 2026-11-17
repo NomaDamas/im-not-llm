@@ -169,6 +169,29 @@ pub fn device_memory_bytes(device: &Device) -> Option<(usize, usize)> {
     None
 }
 
+/// `(major, minor)` compute capability of a CUDA device; `None` for any other
+/// device or a build without `cuda`.
+pub fn cuda_compute_capability(device: &Device) -> Option<(i32, i32)> {
+    #[cfg(feature = "cuda")]
+    if let Ok(cuda) = device.as_cuda_device() {
+        return cuda.cuda_stream().context().compute_capability().ok();
+    }
+    let _ = device;
+    None
+}
+
+/// Whether a device of this compute capability runs bf16 kernels: Ampere
+/// (8.x) and newer. Pascal lacks the kernels (`CUDA_ERROR_NOT_FOUND`) and
+/// Turing has no bf16 tensor cores.
+pub fn cuda_runs_bf16(capability: (i32, i32)) -> bool {
+    capability.0 >= 8
+}
+
+/// True on a CUDA device whose bf16 kernels exist and are fast.
+pub fn cuda_prefers_bf16(device: &Device) -> bool {
+    cuda_compute_capability(device).is_some_and(cuda_runs_bf16)
+}
+
 fn auto_device() -> Device {
     #[cfg(target_os = "macos")]
     if let Ok(device) = Device::new_metal(0) {
@@ -329,6 +352,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn bf16_kernels_run_on_ampere_and_newer_only() {
+        assert!(!cuda_runs_bf16((6, 1))); // Pascal: bf16 kernels missing (docs/DEVICES.md)
+        assert!(!cuda_runs_bf16((7, 5))); // Turing: no bf16 tensor cores
+        assert!(cuda_runs_bf16((8, 0)));
+        assert!(cuda_runs_bf16((8, 9)));
+        assert!(cuda_runs_bf16((12, 0))); // Blackwell
+    }
+
+    #[test]
+    fn a_device_without_cuda_has_no_compute_capability() {
+        assert_eq!(cuda_compute_capability(&Device::Cpu), None);
+        assert!(!cuda_prefers_bf16(&Device::Cpu));
+    }
 
     #[test]
     fn device_parses_each_name_and_defaults_to_auto() {

@@ -372,7 +372,13 @@ mod tests {
         let on_apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         let ane = on_apple.then(|| ANE_DEVICE.to_string());
         assert_eq!(device(EngineKind::Dense, None, None, None), ane);
-        assert_eq!(device(EngineKind::Sparse, None, Some("auto"), None), ane);
+        // Off Apple silicon the requested device passes through untouched.
+        let passed_through =
+            |device: Option<&str>| (!on_apple).then(|| device.map(str::to_string)).flatten();
+        assert_eq!(
+            device(EngineKind::Sparse, None, Some("auto"), None),
+            ane.clone().or_else(|| passed_through(Some("auto")))
+        );
         assert_eq!(device(EngineKind::Sparse, None, None, Some("f16")), ane);
         // An explicit device or a dtype the graphs do not run keeps candle.
         assert_eq!(
