@@ -570,7 +570,7 @@ pub async fn find_instances(
 /// without the platform root-certificate store skips what would otherwise be
 /// the dominant cost of every CLI start (reading the system keychain took
 /// ~90 ms on macOS). Proxies are bypassed because the peer is local.
-pub(crate) fn loopback_client(timeout: Duration) -> Option<reqwest::Client> {
+pub fn loopback_client(timeout: Duration) -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
         .no_proxy()
