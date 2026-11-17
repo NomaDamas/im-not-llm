@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use candle_core::{DType, Device};
 use inl_core::deadline::BatchDeadline;
 use inl_core::device::{
-    device_kind, device_label, device_memory_bytes, dtype_name, effective_batch_timeout,
-    model_cache_dir, resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
+    cuda_prefers_bf16, device_kind, device_label, device_memory_bytes, dtype_name,
+    effective_batch_timeout, model_cache_dir, resolve_device, DeviceSpec, DtypeSpec, LoadSlot,
 };
 use inl_core::engine::{DenseEngine, EngineInfo, Modality};
 use inl_core::hub::ModelSource;
@@ -748,31 +748,41 @@ fn batch_timeout(options: &TextOptions) -> Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// Largest padded-token cap the free-memory derivation may pick on CUDA.
+///
+/// Measured on an RTX PRO 6000 Blackwell, Qwen3-Embedding bf16, 256-1024
+/// passages (docs/DEVICES.md): throughput is flat from ~1.2k padded tokens
+/// (51.8-52.2 chunks/s at 8192, 51.4-51.9 at the ~180k tokens the derivation
+/// chose before this cap; 576-596 vs 577-584 on 40-word passages) while the
+/// peak grows with the cap (2.2 GB at 8192, 5.6 GB at the old derived cap).
+pub(crate) const CUDA_MAX_BATCH_TOKENS: usize = 8192;
+
+/// The cap the device's free memory allows: one padded token is budgeted at
+/// 64 KiB of activations (the residual stream plus the MLP intermediates of a
+/// few-thousand-wide model), a pass never claims more than an eighth of what
+/// is free, never fewer than [`DEFAULT_MAX_BATCH_TOKENS`] and never more than
+/// [`CUDA_MAX_BATCH_TOKENS`].
+pub(crate) fn batch_tokens_for_free_memory(free_bytes: usize) -> usize {
+    const BYTES_PER_PADDED_TOKEN: usize = 64 * 1024;
+    (free_bytes / 8 / BYTES_PER_PADDED_TOKEN).clamp(DEFAULT_MAX_BATCH_TOKENS, CUDA_MAX_BATCH_TOKENS)
+}
+
 /// The padded-token cap a forward pass runs under: the caller's, unless the
 /// caller left it at [`DEFAULT_MAX_BATCH_TOKENS`], in which case the device's
-/// own memory decides.
+/// own memory decides ([`batch_tokens_for_free_memory`]).
 ///
 /// 4096 was sized for a unified-memory GPU, where activations compete with the
-/// weights for the same RAM. A discrete GPU with tens of GB free can hold far
-/// more, and a pass that holds more tokens amortizes the fixed cost of each
-/// kernel launch and each host-side op over more work instead of paying it once
-/// per small batch. One padded token is budgeted at 64 KiB of activations (the
-/// residual stream plus the MLP intermediates of a few-thousand-wide model),
-/// and a single pass never claims more than an eighth of what is free at load
-/// time. CPU and Metal (unified memory, no free-memory reading) keep the crate
-/// default.
+/// weights for the same RAM. A discrete GPU with tens of GB free can hold more,
+/// and a pass that holds more tokens amortizes the fixed cost of each kernel
+/// launch over more work, but only up to a point
+/// ([`CUDA_MAX_BATCH_TOKENS`]). CPU and Metal (unified memory, no free-memory
+/// reading) keep the crate default.
 pub(crate) fn effective_max_batch_tokens(configured: usize, device: &Device) -> usize {
-    const BYTES_PER_PADDED_TOKEN: usize = 64 * 1024;
-    /// Upper bound on the derived cap, so a very large free pool still yields a
-    /// finite plan (256 Ki padded tokens is far beyond any batch that fits).
-    const CEILING: usize = 1 << 18;
     if configured != DEFAULT_MAX_BATCH_TOKENS {
         return configured;
     }
     match device_memory_bytes(device) {
-        Some((free, _)) => {
-            (free / 8 / BYTES_PER_PADDED_TOKEN).clamp(DEFAULT_MAX_BATCH_TOKENS, CEILING)
-        }
+        Some((free, _)) => batch_tokens_for_free_memory(free),
         None => DEFAULT_MAX_BATCH_TOKENS,
     }
 }
@@ -850,13 +860,21 @@ fn test_tokenizer() -> Tokenizer {
 }
 
 /// Weight/activation precision when the options do not name one: half
-/// precision on Metal for Qwen3, where it cuts the model's footprint by a
-/// third at no measurable retrieval cost; f32 elsewhere, where half-precision
-/// kernels are either slow (CPU, pre-Volta CUDA) or not worth the precision.
-/// EmbeddingGemma 2 overflows float16, so it runs in f32 everywhere.
+/// precision for Qwen3 where it is a measured win: f16 on Metal (a third less
+/// footprint at no measurable retrieval cost) and bf16 on an Ampere-or-newer
+/// CUDA GPU (RTX PRO 6000, Ko-StrategyQA, 9251 passages through `inl serve`:
+/// 5.1x the throughput of f32, 1.3 GB less weights and 5.2x lower peak VRAM
+/// for nDCG@10 0.6491 against 0.6501). f32 elsewhere, where half-precision
+/// kernels are either slow (CPU, Turing) or missing (Pascal). EmbeddingGemma 2
+/// overflows float16 and is only validated in f32, so it runs in f32
+/// everywhere.
 fn default_dtype(device: &Device, architecture: Architecture) -> DType {
-    if device.is_metal() && architecture == Architecture::Qwen3 {
+    if architecture != Architecture::Qwen3 {
+        DType::F32
+    } else if device.is_metal() {
         DType::F16
+    } else if cuda_prefers_bf16(device) {
+        DType::BF16
     } else {
         DType::F32
     }
@@ -1103,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn default_dtype_is_f32_unless_a_qwen3_runs_on_metal() {
+    fn default_dtype_is_f32_on_the_cpu_for_every_architecture() {
         for architecture in [Architecture::Qwen3, Architecture::Gemma2] {
             assert_eq!(default_dtype(&Device::Cpu, architecture), DType::F32);
         }
@@ -1111,6 +1129,50 @@ mod tests {
         if let Ok(metal) = Device::new_metal(0) {
             assert_eq!(default_dtype(&metal, Architecture::Qwen3), DType::F16);
             assert_eq!(default_dtype(&metal, Architecture::Gemma2), DType::F32);
+        }
+    }
+
+    #[test]
+    fn a_pass_never_claims_more_than_eight_thousand_padded_tokens_on_a_big_gpu() {
+        // 90 GB free used to derive a 176k-token cap: 5.6-12.9 GB peaks for no
+        // throughput past ~1.2k padded tokens (docs/DEVICES.md).
+        assert_eq!(
+            batch_tokens_for_free_memory(90 << 30),
+            CUDA_MAX_BATCH_TOKENS
+        );
+        assert_eq!(
+            batch_tokens_for_free_memory(24 << 30),
+            CUDA_MAX_BATCH_TOKENS
+        );
+    }
+
+    #[test]
+    fn a_small_gpu_keeps_the_crate_default_cap() {
+        // 1 GB free would derive 2048 tokens: never below the unified-memory default.
+        assert_eq!(
+            batch_tokens_for_free_memory(1 << 30),
+            DEFAULT_MAX_BATCH_TOKENS
+        );
+        assert_eq!(batch_tokens_for_free_memory(0), DEFAULT_MAX_BATCH_TOKENS);
+    }
+
+    #[test]
+    fn an_explicit_cap_is_left_alone() {
+        assert_eq!(effective_max_batch_tokens(65_536, &Device::Cpu), 65_536);
+        assert_eq!(effective_max_batch_tokens(1, &Device::Cpu), 1);
+    }
+
+    #[test]
+    fn qwen3_runs_bf16_on_a_cuda_device_that_has_it_and_gemma_stays_f32() {
+        #[cfg(feature = "cuda")]
+        if let Ok(cuda) = Device::new_cuda(0) {
+            let bf16 = inl_core::device::cuda_prefers_bf16(&cuda);
+            assert_eq!(
+                default_dtype(&cuda, Architecture::Qwen3),
+                if bf16 { DType::BF16 } else { DType::F32 }
+            );
+            // EmbeddingGemma 2 is checked in f32 only: no half precision by default.
+            assert_eq!(default_dtype(&cuda, Architecture::Gemma2), DType::F32);
         }
     }
 

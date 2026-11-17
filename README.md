@@ -42,7 +42,7 @@ kernel compatibility patch described in `docs/DEVICES.md`.
 
 | Model | Crate | Output | Notes |
 |---|---|---|---|
-| `Qwen/Qwen3-Embedding-0.6B` | `inl-text` | 1024-d dense | f16 on Metal by default, f32 elsewhere |
+| `Qwen/Qwen3-Embedding-0.6B` | `inl-text` | 1024-d dense | f16 on Metal and bf16 on CUDA (compute capability 8 or newer) by default, f32 elsewhere |
 | `google/embeddinggemma-2` (text) | `inl-text` | 768-d dense | f32 or bf16 only (f16 overflows to NaN); Matryoshka 128/256/512/768 |
 | `google/embeddinggemma-2` (text, `--device ane`) | `inl-ane` | 768-d dense | Apple Neural Engine, fp16 Core ML package (below) |
 | `Qwen/Qwen3-Embedding-0.6B` (`--device ane`) | `inl-ane` | 1024-d dense | Apple Neural Engine, fp16 Core ML package (below) |

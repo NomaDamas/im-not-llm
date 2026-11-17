@@ -241,3 +241,43 @@ async fn throughput_by_device_and_dtype() {
         );
     }
 }
+
+/// Half precision on the accelerator against the fp32 Sentence-Transformers
+/// vectors, term by term: how many terms the dtype adds or drops, and the
+/// largest weight difference. A sparse index is decided by which terms exist,
+/// so this is what the f32 default of the encoder protects.
+#[tokio::test]
+#[ignore = "live: loads the real checkpoint on INL_TEST_DEVICE (default cpu)"]
+async fn half_precision_term_sets_against_the_reference() {
+    let golden = golden();
+    let device = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "cpu".into());
+    for dtype in ["f32", "bf16", "f16"] {
+        let encoder = SparseEncoder::new(SparseOptions {
+            device: Some(device.clone()),
+            dtype: Some(dtype.to_string()),
+            ..SparseOptions::default()
+        })
+        .unwrap();
+        let query = encoder.encode_query(&golden.query).await.unwrap();
+        let docs = encoder.encode(&golden.docs).await.unwrap();
+        let (qdiff, qmismatch) = compare(&query, &golden.q);
+        let mut worst = qdiff;
+        let mut mismatched = qmismatch;
+        for (ours, theirs) in docs.iter().zip(&golden.d) {
+            let (diff, miss) = compare(ours, theirs);
+            worst = worst.max(diff);
+            mismatched += miss;
+        }
+        let scores: Vec<f32> = docs.iter().map(|d| query.dot(d)).collect();
+        let reference: Vec<f32> = golden
+            .d
+            .iter()
+            .map(|d| to_vector(&golden.q).dot(&to_vector(d)))
+            .collect();
+        println!(
+            "{device}/{dtype}: max weight diff {worst:.4}, {mismatched} one-sided terms, \
+             scores {scores:?} vs {reference:?}"
+        );
+        assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
+    }
+}

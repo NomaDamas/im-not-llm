@@ -59,3 +59,53 @@ async fn cpu_and_accelerator_agree() {
         assert!(similarity > 0.999, "row {row}: cosine {similarity}");
     }
 }
+
+#[derive(serde::Deserialize)]
+struct Golden {
+    texts: Vec<String>,
+    emb: Vec<Vec<f32>>,
+}
+
+fn golden() -> Golden {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen3embedding/golden_real.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// The default dtype of the device (bf16 on an Ampere-or-newer CUDA GPU, f16 on
+/// Metal, f32 elsewhere) against the fp32 Sentence-Transformers vectors of the
+/// golden texts (1 to 2048 tokens), batched and one text at a time. A text must
+/// not move because other texts share its padded batch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: loads Qwen/Qwen3-Embedding-0.6B on INL_TEST_DEVICE; run with --ignored"]
+async fn default_dtype_matches_the_fp32_reference() {
+    let golden = golden();
+    let spec = std::env::var("INL_TEST_DEVICE").unwrap_or_else(|_| "auto".to_string());
+    let model = embedder(DeviceSpec::from_str(&spec).unwrap());
+    let identity = model.identity().await.unwrap();
+    println!(
+        "{spec}: dtype {} device {}",
+        identity.dtype, identity.device
+    );
+    let floor = if identity.dtype == "f32" {
+        0.9999
+    } else {
+        0.999
+    };
+
+    let batched = model.embed(&golden.texts).await.unwrap();
+    let mut worst = 1f32;
+    for (row, expected) in golden.emb.iter().enumerate() {
+        let similarity = cosine(&batched[row], expected);
+        let alone = model
+            .embed(std::slice::from_ref(&golden.texts[row]))
+            .await
+            .unwrap();
+        let packed = cosine(&alone[0], &batched[row]);
+        println!("row {row}: cosine to reference {similarity:.6}, alone vs batched {packed:.6}");
+        assert!(similarity > floor, "row {row}: cosine {similarity}");
+        assert!(packed > floor, "row {row}: alone vs batched {packed}");
+        worst = worst.min(similarity);
+    }
+    println!("worst cosine to the fp32 reference: {worst:.6}");
+}
