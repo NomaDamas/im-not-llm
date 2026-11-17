@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "inl-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "inl-sparse"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "candle-core",
