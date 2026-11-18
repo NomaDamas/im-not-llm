@@ -2,9 +2,8 @@
 
 On-device inference engine for models that are **not** LLMs: dense text
 embeddings, learned-sparse (SPLADE) encoders, and multimodal (image / video)
-embeddings. Rust, candle, CPU / Metal / CUDA. Usable as in-process crates
-(Rust, TypeScript via Node-API) or as a loopback daemon with a `/health`
-endpoint and a programmatic lifecycle API.
+embeddings. Rust, candle, CPU / Metal / CUDA. Usable as in-process Rust crates or as a loopback daemon with a `/health`
+endpoint and a programmatic lifecycle API (the daemon is how non-Rust hosts use it).
 
 ## Rules
 
