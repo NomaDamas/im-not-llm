@@ -5,12 +5,11 @@ learned-sparse (SPLADE) encoders, late-interaction (multi-vector) text
 encoders, and multimodal (image / video / audio) embeddings.
 Rust on [candle](https://github.com/huggingface/candle), CPU / Metal / CUDA.
 
-Use it three ways, all backed by the same engines:
+Use it two ways, both backed by the same engines:
 
 | | How |
 |---|---|
 | **In-process Rust** | depend on `inl-text`, `inl-sparse`, `inl-late`, `inl-vision` |
-| **In-process TypeScript** | the Node-API addon in `bindings/node` |
 | **Daemon** | `inl serve` — loopback HTTP with `/health`, plus a programmatic lifecycle API |
 
 ## Install
@@ -209,7 +208,7 @@ processor joins them). Video is decoded with `ffmpeg` + `ffprobe` (on `PATH`, or
 uniformly), fewer if the frames would not fit the 8192-token context. Audio (WAV, MP3, FLAC, ... anything
 `ffmpeg` reads) is resampled to 16 kHz mono and cut at 30 s (750 soft tokens,
 one per 40 ms). Image token budget (70 / 140 / 280 / 560 / 1120) trades speed
-for detail. `--modalities` (Node: `modalities`) skips loading the vision tower
+for detail. `--modalities` skips loading the vision tower
 (no `image`, no `video`) or the audio tower (no `audio`) and their memory.
 
 The vision tower keeps position lookup, padding masks and pooled hidden states
@@ -235,21 +234,8 @@ client.stop().await?;
 let live = find_instances(&serve_root, "google/embeddinggemma-2", EngineKind::Multimodal).await;
 ```
 
-TypeScript (`bindings/node`, `npm run build` first):
-
-```js
-const { TextEmbedder, SparseEncoder, Daemon, DaemonClient } = require('@nomadamas/im-not-llm')
-
-const embedder = new TextEmbedder({ id: 'Qwen/Qwen3-Embedding-0.6B' })
-const vectors = await embedder.embed(['hello'])   // Float32Array[]
-
-const daemon = await Daemon.spawn({ kind: 'multimodal', model: 'google/embeddinggemma-2' }, {})
-await fetch(`${daemon.url()}/health`)
-await daemon.stop()
-```
-
-See `bindings/node/README.md` for every class, `AbortSignal` support and the
-`ERR_INL_*` error codes.
+From any other language, talk to `inl serve` over loopback HTTP (`/health`,
+`/embed`, `/embed_sparse`, `/v1/embeddings`, `/admin/unload`, `/admin/shutdown`).
 
 ## Rust API
 
@@ -274,7 +260,6 @@ crates/inl-sparse   ModernBERT + SPLADE pooling (KURE-Sparse-nano)
 crates/inl-late     Qwen3.5 text tower + multi-vector heads (pplx-embed-v2-late)
 crates/inl-vision   EmbeddingGemma 2 vision + audio towers, image/video/audio preprocessing, multimodal merge
 crates/inl-server   daemon library, `inl` CLI, lifecycle client
-bindings/node       Node-API addon
 ```
 
 ## Environment

@@ -1,5 +1,5 @@
 //! Long-lived handle on the native embedder for hosts that keep the model
-//! resident inside their own process (the Node-API binding).
+//! resident inside their own process.
 //!
 //! It adds the lifecycle a one-shot CLI run never needs: explicit unload,
 //! idle unload, and a disposed state. Inference itself is
