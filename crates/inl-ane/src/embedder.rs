@@ -15,7 +15,7 @@
 
 use crate::coreml::{self, Function};
 use crate::layout::{self, Call, Family, Segment, SPLADE_BLOCK};
-use crate::package::{self, Package};
+use crate::package::{self, FunctionSpec, Package};
 use crate::table::TokenTable;
 use async_trait::async_trait;
 use inl_core::deadline::BatchDeadline;
@@ -115,7 +115,20 @@ struct Loaded {
     dimension: usize,
     table: TokenTable,
     head: Head,
+    /// Functions loaded so far, by length. A function is created on the first
+    /// call that needs it: loading all of them (eight for SPLADE) costs about
+    /// 2 s of a cold start, and a query only ever touches the smallest.
     functions: Mutex<BTreeMap<usize, Function>>,
+    /// What loading and checking any one function needs.
+    source: FunctionSource,
+}
+
+/// Everything needed to load one function after `Loaded::load` returned.
+struct FunctionSource {
+    mlmodelc: PathBuf,
+    specs: BTreeMap<usize, FunctionSpec>,
+    /// The package's self-test, kept to check each function as it loads.
+    selftest: SelfTestData,
 }
 
 /// How a call's output becomes one vector per text.
@@ -276,7 +289,13 @@ impl Ane {
         );
         let counts: Vec<usize> = ids.iter().map(Vec::len).collect();
         let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); ids.len()];
-        for call in layout::plan(loaded.family, &loaded.lengths, &counts) {
+        let calls = layout::plan(loaded.family, &loaded.lengths, &counts);
+        tracing::debug!(
+            functions = ?layout::used_lengths(&calls),
+            of = loaded.lengths.len(),
+            "ANE request uses these functions; the others stay unloaded"
+        );
+        for call in calls {
             let running = Arc::clone(&loaded);
             let call_ids = Arc::clone(&ids);
             let rows = ANE_DEADLINE
@@ -335,7 +354,9 @@ impl Loaded {
             hidden,
             family.row_scale(),
         )?;
-        let mut functions = BTreeMap::new();
+        // Validate every function's declared inputs now (cheap, no Core ML), but
+        // create none: each is loaded by the first call that needs it.
+        let mut specs = BTreeMap::new();
         for &length in &lengths {
             let name = family.function_name(length);
             let spec = package.text().functions.get(&name).ok_or_else(|| {
@@ -355,9 +376,7 @@ impl Loaded {
                     family.input_names(length)
                 )));
             }
-            let started = std::time::Instant::now();
-            functions.insert(length, Function::load(&mlmodelc, &name, spec)?);
-            tracing::debug!(function = %name, seconds = started.elapsed().as_secs_f32(), "ANE function loaded");
+            specs.insert(length, spec.clone());
         }
         let head = if family.is_sparse() {
             Head::Splade(Splade::load(&package)?)
@@ -373,9 +392,13 @@ impl Loaded {
             dimension: package.manifest.embedding.dim,
             table,
             head,
-            functions: Mutex::new(functions),
+            functions: Mutex::new(BTreeMap::new()),
+            source: FunctionSource {
+                mlmodelc,
+                specs,
+                selftest: SelfTestData::read(&package)?,
+            },
         };
-        loaded.self_test(&package)?;
         Ok(loaded)
     }
 
@@ -418,10 +441,16 @@ impl Loaded {
 
     /// Run one call; returns the whole `[K, dim]` output, row k = segment k.
     fn run(&self, call: &Call, ids: &[Vec<u32>]) -> Result<Vec<f32>> {
+        self.ensure_function(call.length)?;
+        self.run_loaded(call, ids)
+    }
+
+    /// [`Self::run`] for a function that is already in `functions`.
+    fn run_loaded(&self, call: &Call, ids: &[Vec<u32>]) -> Result<Vec<f32>> {
         let mut functions = self.functions.lock();
         let function = functions
             .get_mut(&call.length)
-            .expect("calls are planned over loaded lengths");
+            .expect("the function is loaded");
         let hidden = self.table.hidden();
         let embeds = function.input("inputs_embeds");
         // Alignment gaps between texts are padding rows too.
@@ -450,6 +479,28 @@ impl Loaded {
         Ok(out)
     }
 
+    /// Load function `length` if no call has used it yet, then check it against
+    /// the package's reference embeddings before it serves anything. A function
+    /// that fails its check is not kept: the next call retries, and fails again.
+    fn ensure_function(&self, length: usize) -> Result<()> {
+        if self.functions.lock().contains_key(&length) {
+            return Ok(());
+        }
+        let name = self.family.function_name(length);
+        let spec = self.source.specs.get(&length).ok_or_else(|| {
+            InlError::Inference(format!("function {name} is not part of this load"))
+        })?;
+        let started = std::time::Instant::now();
+        let function = Function::load(&self.source.mlmodelc, &name, spec)?;
+        tracing::debug!(function = %name, seconds = started.elapsed().as_secs_f32(), "ANE function loaded");
+        self.functions.lock().insert(length, function);
+        if let Err(error) = self.self_test_function(length) {
+            self.functions.lock().remove(&length);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn embed_call(&self, call: &Call, ids: &[Vec<u32>]) -> Result<Vec<(usize, Vec<f32>)>> {
         let out = self.run(call, ids)?;
         Ok(self.rows(call, &out))
@@ -472,25 +523,24 @@ impl Loaded {
     }
 
     /// Every loaded function reproduces the package's reference embeddings.
-    fn self_test(&self, package: &Package) -> Result<()> {
-        let raw = std::fs::read(package.path("selftest.json"))?;
-        let spec: SelfTest = serde_json::from_slice(&raw)?;
-        let blob = std::fs::read(package.path(&spec.bin))?;
-        let names: BTreeMap<String, usize> = self
-            .lengths
-            .iter()
-            .map(|&length| (self.family.function_name(length), length))
-            .collect();
+    /// Check function `length` against the package's reference embeddings. The
+    /// run goes through [`Self::run`] without its lazy load, so the function is
+    /// exercised exactly as a request will use it.
+    fn self_test_function(&self, length: usize) -> Result<()> {
+        let data = &self.source.selftest;
+        let function_name = self.family.function_name(length);
         let mut tested = 0;
         let mut worst = f64::INFINITY;
-        for test in &spec.tests {
-            let Some(&length) = names.get(&test.function) else {
-                continue;
-            };
+        for test in data
+            .spec
+            .tests
+            .iter()
+            .filter(|t| t.function == function_name)
+        {
             let sequences: Vec<Vec<u32>> = match (&test.sequences, test.doc_rows) {
                 (Some(sequences), _) => sequences.clone(),
                 (None, Some(rows)) => {
-                    let doc = spec.doc_ids.as_ref().ok_or_else(|| {
+                    let doc = data.spec.doc_ids.as_ref().ok_or_else(|| {
                         InlError::Inference("self-test has doc_rows but no doc_ids".into())
                     })?;
                     vec![doc[..rows].to_vec()]
@@ -512,10 +562,10 @@ impl Loaded {
                 })
                 .collect();
             let call = Call { length, segments };
-            let out = self.run(&call, &sequences)?;
+            let out = self.run_loaded(&call, &sequences)?;
             let rows = self.rows(&call, &out);
-            let expected = test.expected.read(&blob)?;
-            let tolerance = spec.tolerance.get(&test.kind).ok_or_else(|| {
+            let expected = test.expected.read(&data.blob)?;
+            let tolerance = data.spec.tolerance.get(&test.kind).ok_or_else(|| {
                 InlError::Inference(format!("self-test has no tolerance for {}", test.kind))
             })?;
             let dim = self.dimension;
@@ -542,18 +592,29 @@ impl Loaded {
             }
             tested += 1;
         }
-        if tested != self.lengths.len() {
+        if tested == 0 {
             return Err(InlError::Inference(format!(
-                "ANE self-test covers {tested} of {} loaded functions",
-                self.lengths.len()
+                "ANE self-test has no case for {function_name}"
             )));
         }
-        tracing::info!(
-            functions = tested,
-            worst_cosine = worst,
-            "ANE self-test passed"
-        );
+        tracing::info!(function = %function_name, worst_cosine = worst, "ANE self-test passed");
         Ok(())
+    }
+}
+
+/// The package's self-test, read once at load; each function is checked against
+/// it when it first loads.
+struct SelfTestData {
+    spec: SelfTest,
+    blob: Vec<u8>,
+}
+
+impl SelfTestData {
+    fn read(package: &Package) -> Result<Self> {
+        let raw = std::fs::read(package.path("selftest.json"))?;
+        let spec: SelfTest = serde_json::from_slice(&raw)?;
+        let blob = std::fs::read(package.path(&spec.bin))?;
+        Ok(Self { spec, blob })
     }
 }
 

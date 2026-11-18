@@ -4,8 +4,10 @@
 //! The model runs as a precompiled Core ML package (fp16 graphs, one function
 //! per sequence length; texts shorter than a function are packed together
 //! into one call). Known models resolve to a Hub package pinned by revision
-//! and manifest sha256 ([`KNOWN_PACKAGES`]); every load self-tests each
-//! function against reference embeddings before serving.
+//! and manifest sha256 ([`KNOWN_PACKAGES`]); each function is loaded by the
+//! first request that needs it and self-tested against reference embeddings
+//! before it serves anything, so a cold start pays for the one or two
+//! functions it uses, not for all of them.
 //!
 //! The package contract and packing rules (`layout`), the package files
 //! (`package`) and the token table (`table`) are plain Rust; Core ML itself

@@ -211,6 +211,15 @@ impl Family {
     }
 }
 
+/// The distinct function lengths `calls` use, ascending. A function that no call
+/// of a request uses never has to be loaded for it.
+pub(crate) fn used_lengths(calls: &[Call]) -> Vec<usize> {
+    let mut lengths: Vec<usize> = calls.iter().map(|call| call.length).collect();
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
+}
+
 /// Texts one call of an `S`-row packing function holds.
 pub(crate) fn slots(length: usize) -> usize {
     (length / 32).max(8)
@@ -815,5 +824,38 @@ mod tests {
         let row = &out[100 * length..101 * length];
         let opened: Vec<usize> = (0..length).filter(|&k| open(row[k])).collect();
         assert_eq!(opened, (36..=164).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use super::*;
+
+    /// The functions a request touches are exactly the call lengths of its plan,
+    /// so a loader that creates a function on first use needs no others.
+    #[test]
+    fn lengths_used_are_the_distinct_call_lengths_of_the_plan() {
+        let family = Family::ModernBertSplade;
+        let lengths = family.lengths_for(2048);
+        // One short query is one call of the smallest function: the other seven
+        // of SPLADE's eight are never needed for it.
+        let calls = plan(family, &lengths, &[9]);
+        assert_eq!(used_lengths(&calls), vec![lengths[0]]);
+        // Every used length is a loaded length, ascending and distinct, and
+        // every call's length is among them.
+        let counts = [9, 40, 200, 700, 1500, 9, 40];
+        let calls = plan(family, &lengths, &counts);
+        let used = used_lengths(&calls);
+        assert!(used.windows(2).all(|pair| pair[0] < pair[1]), "{used:?}");
+        assert!(
+            used.iter().all(|length| lengths.contains(length)),
+            "{used:?}"
+        );
+        assert!(calls.iter().all(|call| used.contains(&call.length)));
+        // The planner may pack a short text into a long call, so what matters is
+        // that the set is the plan's, not the whole table.
+        let tiny = used_lengths(&plan(family, &lengths, &[3, 5, 7]));
+        assert_eq!(tiny.len(), 1, "{tiny:?}");
+        assert!(tiny.len() < lengths.len());
     }
 }

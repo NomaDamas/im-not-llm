@@ -188,3 +188,58 @@ async fn kure_sparse_nano_matches_the_reference() {
     assert!(encoder.unload().await);
     assert!(!encoder.is_loaded());
 }
+
+/// Functions load on first use: a cold encoder answers a short query without
+/// loading the long functions, and a long text that arrives later loads (and
+/// self-tests) its own function and is still right.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: downloads and compiles the KURE-Sparse-nano ANE package; run with --ignored"]
+async fn functions_load_on_first_use_and_a_late_long_text_is_still_correct() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../inl-sparse/tests/fixtures/kure_sparse_nano/st_f32_golden.json");
+    let golden: SparseGolden = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let encoder = AneSparseEncoder::new(AneOptions {
+        id: "nlpai-lab/KURE-Sparse-nano".into(),
+        ..AneOptions::default()
+    })
+    .unwrap();
+
+    // `load` must not touch Core ML functions: it is the cold-start cost a
+    // `minsync query` pays before its first (short) query.
+    let started = std::time::Instant::now();
+    encoder.load().await.unwrap();
+    let load = started.elapsed().as_secs_f32();
+    eprintln!("load {load:.2}s");
+    assert!(
+        load < 1.5,
+        "load took {load:.2}s: functions are loaded eagerly again"
+    );
+
+    let query = format!("[Q] {}", golden.query);
+    let started = std::time::Instant::now();
+    let first = encoder.encode(vec![query.clone()]).await.unwrap();
+    let first_query = started.elapsed().as_secs_f32();
+    eprintln!("first short query {first_query:.2}s");
+    assert!(
+        first_query < 1.5,
+        "the first short query took {first_query:.2}s: it loaded more than its function"
+    );
+    assert!(sparse_cosine(&first[0], &SparseRaw::vector(&golden.q)) > 0.998);
+
+    // The longest golden document goes through a larger function, loaded now.
+    let longest = golden.docs.iter().max_by_key(|doc| doc.len()).unwrap();
+    let index = golden.docs.iter().position(|doc| doc == longest).unwrap();
+    let late = encoder
+        .encode(vec![format!("[D] {longest}")])
+        .await
+        .unwrap();
+    let similarity = sparse_cosine(&late[0], &SparseRaw::vector(&golden.d[index]));
+    eprintln!("late long text cosine {similarity:.6}");
+    assert!(
+        similarity > 0.998,
+        "late-loaded function cosine {similarity}"
+    );
+    // The first function still answers the same after the others loaded.
+    let again = encoder.encode(vec![query]).await.unwrap();
+    assert!(sparse_cosine(&first[0], &again[0]) > 0.99999);
+}
