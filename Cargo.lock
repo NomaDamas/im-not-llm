@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "inl-ane"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "half",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "inl-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "axum",
