@@ -7,7 +7,7 @@ use inl_core::{DenseEngine, EngineInfo, InlError, Modality, MultimodalEngine, Mu
 use inl_late::{LateEngine, MultiVector, Task};
 use inl_sparse::{SparseEngine, SparseVector};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,9 @@ struct FakeEngine {
     delay: Option<Duration>,
     timeout: AtomicBool,
     loaded: AtomicBool,
+    /// Requests inside `embed` now, and the most there have been at once.
+    active: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 impl FakeEngine {
@@ -51,9 +54,12 @@ impl DenseEngine for FakeEngine {
         if self.timeout.load(Ordering::SeqCst) {
             return Err(InlError::Timeout("native embedding batch stuck".into()));
         }
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
+        self.active.fetch_sub(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push(texts.clone());
         Ok(texts
             .iter()
@@ -399,6 +405,45 @@ async fn admin_unload_releases_the_model_and_admin_shutdown_stops_the_server() {
         .unwrap()
         .unwrap();
     assert_eq!(reason, StopReason::Signal);
+}
+
+/// Request bodies waiting on the model each hold a few times their size in
+/// memory; the server admits only a bounded number of bytes of them at once
+/// and leaves the rest unread on their sockets.
+#[tokio::test]
+async fn concurrent_large_requests_are_admitted_within_the_body_budget() {
+    let engine = FakeEngine {
+        delay: Some(Duration::from_millis(150)),
+        ..FakeEngine::default()
+    };
+    // 64 KiB bodies, a budget of four of them.
+    let h = spawn_with(engine, |_| {}).await;
+    let client = reqwest::Client::new();
+    let text = "x".repeat(60 * 1024);
+    let url = format!("{}/embed", h.url);
+    let requests: Vec<_> = (0..16)
+        .map(|_| {
+            let (client, url, text) = (client.clone(), url.clone(), text.clone());
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .json(&json!({ "inputs": [text], "truncate": true }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    for request in requests {
+        assert_eq!(request.await.unwrap(), 200);
+    }
+    let peak = h.engine.peak.load(Ordering::SeqCst);
+    assert!(
+        (1..=4).contains(&peak),
+        "{peak} large requests were inside the engine at once; the budget admits 4"
+    );
 }
 
 #[tokio::test]

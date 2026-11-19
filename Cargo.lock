@@ -1718,6 +1718,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "fs2",
+ "http-body-util",
  "inl-ane",
  "inl-core",
  "inl-late",
