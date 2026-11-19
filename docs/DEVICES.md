@@ -497,3 +497,14 @@ measured nothing to release. Lowering the peak today means a smaller batch.
   windows above).
 * gpu01's `/data` is NFS: put cargo state, build dirs and the CUDA toolkit on
   local disk or everything takes an order of magnitude longer.
+* `inl serve` bounds the memory held by request bodies at 4x
+  `--max-request-bytes` (128 MiB by default); a body larger than 1/128 of the
+  limit waits for its share before it is read, and a body that stalls for 30 s
+  is dropped with 408. A burst of several maximum-size bodies (6 x 28 MB on
+  Metal, Qwen3-Embedding-0.6B) still finishes slowly, because every body then
+  waits for the model one after another; lower `--max-request-bytes` if a host
+  sends such bursts.
+* One request of many long inputs occupies the model for as long as its
+  forward passes take (512 x 2000-word inputs: minutes on Metal). Other
+  requests interleave between its passes (ANE: between its calls) but there is
+  no per-request time limit; keep batches to what one request should cost.

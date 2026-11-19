@@ -278,7 +278,9 @@ impl Ane {
         }
         ANE_DEADLINE.ensure_healthy("ANE embedding")?;
         let loaded = self.loaded().await?;
-        let _gate = self.gate.lock().await;
+        // Tokenizing needs no device, so it runs outside the gate, and each
+        // call takes the gate on its own: a request of many calls would
+        // otherwise starve every short one behind it.
         let tokenizing = Arc::clone(&loaded);
         let ids = Arc::new(
             ANE_DEADLINE
@@ -296,6 +298,7 @@ impl Ane {
             "ANE request uses these functions; the others stay unloaded"
         );
         for call in calls {
+            let _gate = self.gate.lock().await;
             let running = Arc::clone(&loaded);
             let call_ids = Arc::clone(&ids);
             let rows = ANE_DEADLINE

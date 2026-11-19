@@ -32,14 +32,16 @@
 //! `POST /admin/shutdown` routes back the out-of-process lifecycle API in
 //! [`DaemonClient`].
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use http_body_util::BodyExt;
 use inl_core::device::cache_root;
 use inl_core::{
     DenseEngine, EngineInfo, InlError, MediaBytes, Modality, MultimodalEngine, MultimodalInput,
@@ -68,6 +70,26 @@ pub const DEFAULT_MAX_INPUTS: usize = 512;
 
 /// Default for `--max-request-bytes` (32 MiB).
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
+/// Request bodies in flight (being read, parsed or embedded) may hold at most
+/// this many times `--max-request-bytes` between them. A body costs several
+/// times its size while it is parsed, so without a bound a burst of large
+/// requests grows memory with the number of connections; with it the surplus
+/// requests wait unread on their sockets.
+const BODY_BUDGET_FACTOR: usize = 4;
+
+/// The body budget is counted in units of this many bytes (a semaphore counts
+/// in `u32`).
+const BODY_BUDGET_UNIT: usize = 1024;
+
+/// A request body that sends nothing for this long is dropped, so a stalled
+/// upload cannot hold body budget for ever.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bodies declared at most `--max-request-bytes` / this many bytes skip the
+/// body budget: parsing them amplifies little, and a short query should not
+/// wait behind large uploads.
+const BODY_BUDGET_EXEMPT_DIVISOR: usize = 128;
 
 /// Default for `--idle-timeout` in seconds.
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
@@ -398,6 +420,9 @@ struct AppState {
     requests_total: AtomicU64,
     in_flight: AtomicUsize,
     last_activity: Mutex<Instant>,
+    /// One token count at a time: tokenizing a very long input allocates
+    /// hundreds of bytes per token, so concurrent counts multiply that.
+    count_lane: tokio::sync::Mutex<()>,
     wedged: tokio::sync::Notify,
     shutdown: tokio::sync::Notify,
 }
@@ -656,6 +681,7 @@ async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> 
         requests_total: AtomicU64::new(0),
         in_flight: AtomicUsize::new(0),
         last_activity: Mutex::new(Instant::now()),
+        count_lane: tokio::sync::Mutex::new(()),
         wedged: tokio::sync::Notify::new(),
         shutdown: tokio::sync::Notify::new(),
     });
@@ -860,29 +886,122 @@ impl Drop for Busy<'_> {
 }
 
 fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
-    let routes = Router::new()
+    let admin = Router::new()
         .route("/health", get(health))
         .route("/admin/unload", post(admin_unload))
         .route("/admin/shutdown", post(admin_shutdown));
-    let routes = match state.engine.kind() {
-        EngineKind::Dense => routes
+    let embeddings = match state.engine.kind() {
+        EngineKind::Dense => Router::new()
             .route("/embed", post(tei_embed))
             .route("/v1/embeddings", post(openai_embeddings)),
-        EngineKind::Sparse => routes
+        EngineKind::Sparse => Router::new()
             .route("/embed_sparse", post(tei_embed_sparse))
             .route("/v1/embeddings", post(openai_embeddings)),
-        EngineKind::Multimodal => routes
+        EngineKind::Multimodal => Router::new()
             .route("/embed", post(tei_embed))
             .route("/embed_multimodal", post(embed_multimodal))
             .route("/v1/embeddings", post(openai_embeddings)),
-        EngineKind::Late => routes.route("/embed", post(late_embed)),
+        EngineKind::Late => Router::new().route("/embed", post(late_embed)),
     };
-    routes
+    let budget = Arc::new(BodyBudget::new(max_request_bytes));
+    let embeddings = embeddings.route_layer(middleware::from_fn_with_state(budget, admit_body));
+    admin
+        .merge(embeddings)
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(BodyLimited {
             state,
             max_request_bytes,
         })
+}
+
+/// Bounds the memory held by request bodies; see [`BODY_BUDGET_FACTOR`].
+struct BodyBudget {
+    units: tokio::sync::Semaphore,
+    max_request_bytes: usize,
+}
+
+impl BodyBudget {
+    fn new(max_request_bytes: usize) -> Self {
+        let total = max_request_bytes
+            .div_ceil(BODY_BUDGET_UNIT)
+            .max(1)
+            .saturating_mul(BODY_BUDGET_FACTOR)
+            .min(tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            units: tokio::sync::Semaphore::new(total),
+            max_request_bytes,
+        }
+    }
+}
+
+/// Admit an embedding request's body: a body of more than
+/// `--max-request-bytes` / [`BODY_BUDGET_EXEMPT_DIVISOR`] bytes (its declared
+/// length; the whole limit when undeclared) waits for its share of the budget
+/// before being read and holds it until the response is built. Smaller bodies
+/// skip the budget, so a short query never queues behind large uploads, even
+/// stalled ones. The read has an idle timeout, so a stalled upload gives its
+/// share back. A declared length over the limit is passed on untouched: the
+/// handler's body extractor refuses it (413) without reading it.
+async fn admit_body(
+    State(budget): State<Arc<BodyBudget>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(|bytes| bytes > budget.max_request_bytes) {
+        return next.run(request).await;
+    }
+    let claim = declared.unwrap_or(budget.max_request_bytes);
+    let _held = if claim > budget.max_request_bytes / BODY_BUDGET_EXEMPT_DIVISOR {
+        let units = claim.div_ceil(BODY_BUDGET_UNIT).max(1);
+        // The semaphore is never closed, so this cannot fail.
+        budget.units.acquire_many(units as u32).await.ok()
+    } else {
+        None
+    };
+    let protocol = if request.uri().path() == "/v1/embeddings" {
+        Protocol::OpenAi
+    } else {
+        Protocol::Tei
+    };
+    let (parts, body) = request.into_parts();
+    let mut body = http_body_util::Limited::new(body, budget.max_request_bytes);
+    let mut bytes = Vec::with_capacity(declared.unwrap_or(0).min(budget.max_request_bytes));
+    loop {
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.frame()).await {
+            Err(_) => {
+                return ApiError::new(StatusCode::REQUEST_TIMEOUT, "request body stalled")
+                    .render(protocol)
+            }
+            Ok(None) => break,
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    bytes.extend_from_slice(&data);
+                }
+            }
+            Ok(Some(Err(error))) => {
+                let oversized = error.is::<http_body_util::LengthLimitError>();
+                let (status, message) = if oversized {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "request body exceeds the {}-byte limit (--max-request-bytes)",
+                            budget.max_request_bytes
+                        ),
+                    )
+                } else {
+                    (StatusCode::BAD_REQUEST, format!("request body: {error}"))
+                };
+                return ApiError::new(status, message).render(protocol);
+            }
+        }
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 #[derive(Clone)]
@@ -1144,15 +1263,19 @@ async fn checked_inputs_counting(
         None => texts,
     };
     let max_length = state.info.max_length;
+    // With `truncate` the context check is off, so only a caller that wants the
+    // usage figure (`count_all`) needs the exact counts.
+    let needs_counts = count_all || !truncate;
     let (indices, candidates): (Vec<usize>, Vec<String>) = texts
         .iter()
         .enumerate()
-        .filter(|(_, text)| count_all || text.len() + TOKEN_SLACK > max_length)
+        .filter(|(_, text)| needs_counts && (count_all || text.len() + TOKEN_SLACK > max_length))
         .map(|(index, text)| (index, text.clone()))
         .unzip();
     let counts = if candidates.is_empty() {
         Vec::new()
     } else {
+        let _lane = state.count_lane.lock().await;
         state
             .engine
             .token_counts(&candidates)

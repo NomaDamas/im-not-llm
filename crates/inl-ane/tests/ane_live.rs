@@ -243,3 +243,40 @@ async fn functions_load_on_first_use_and_a_late_long_text_is_still_correct() {
     let again = encoder.encode(vec![query]).await.unwrap();
     assert!(sparse_cosine(&first[0], &again[0]) > 0.99999);
 }
+
+/// A short query that arrives while a many-call request runs must not wait for
+/// the whole request: the Neural Engine gate is taken per call, not per request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: downloads and compiles the Qwen3-Embedding ANE package; run with --ignored"]
+async fn a_short_query_does_not_wait_for_a_whole_long_request() {
+    let model = std::sync::Arc::new(
+        AneEmbedder::new(AneOptions {
+            id: "NomaDamas/qwen3-embedding-0.6b-ane".into(),
+            ..AneOptions::default()
+        })
+        .unwrap(),
+    );
+    model.load().await.unwrap();
+    model.embed(vec!["warm".into()]).await.unwrap();
+
+    // Many long texts: the planner turns them into many calls.
+    let long: Vec<String> = (0..24)
+        .map(|i| format!("{i} {}", "retrieval embedding vector ".repeat(300)))
+        .collect();
+    let started = std::time::Instant::now();
+    let big = {
+        let model = model.clone();
+        tokio::spawn(async move { model.embed(long).await.unwrap().len() })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let short = std::time::Instant::now();
+    model.embed(vec!["a short query".into()]).await.unwrap();
+    let short = short.elapsed();
+    assert_eq!(big.await.unwrap(), 24);
+    let big = started.elapsed();
+    eprintln!("short query {short:?} while the long request took {big:?}");
+    assert!(
+        short < big / 4,
+        "the short query took {short:?} of the long request's {big:?}: it queued behind the whole request"
+    );
+}
