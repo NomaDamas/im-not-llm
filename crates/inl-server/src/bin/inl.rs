@@ -12,6 +12,24 @@
 #[path = "../engines.rs"]
 mod engines;
 
+/// macOS's system allocator keeps the pages of a large request resident after
+/// they are freed and takes more for the next one: the tokenizer allocates
+/// hundreds of bytes per token, so a 14 MB text adds about 1.2 GB, and four of
+/// them one after another took Qwen3-Embedding-0.6B on Metal from 1.8 GB to
+/// 6.3 GB with only 75 MB live (`malloc_zone_pressure_relief` released none of
+/// it). mimalloc reuses freed pages and, with the purge delay set in `main`,
+/// returns them to the OS.
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `mi_option_purge_delay`: how long mimalloc keeps freed pages before
+/// returning them to the OS. `libmimalloc-sys` does not export the constant;
+/// 15 is its place in both bundled mimalloc versions (checked by running with
+/// `MIMALLOC_PURGE_DELAY` set), and the default is 1000 ms.
+#[cfg(target_os = "macos")]
+const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
+
 use clap::{Args, Parser, Subcommand};
 use engines::EngineArgs;
 use inl_core::{device::DeviceSpec, InlError, Result};
@@ -217,10 +235,20 @@ fn kind_flag(sparse: bool, multimodal: bool, late: bool) -> Result<Option<Engine
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Before the runtime starts a thread: `mi_option_set` is not thread safe.
+    #[cfg(target_os = "macos")]
+    // SAFETY: called once, single-threaded, with a documented option.
+    unsafe {
+        // Return freed pages to the OS at once instead of after a second.
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+    }
     let cli = Cli::parse();
-    match run(cli).await {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("inl: {error}");

@@ -16,7 +16,7 @@ default = ["cli"]
 # The `inl` binary: it names the concrete engine crates. The library alone
 # (`default-features = false`) only needs the engine traits, so a host that
 # brings its own engines (a text-only indexer) does not link the vision stack.
-cli = ["dep:clap", "dep:inl-text", "dep:inl-vision", "dep:inl-ane"]
+cli = ["dep:clap", "dep:inl-text", "dep:inl-vision", "dep:inl-ane", "dep:mimalloc", "dep:libmimalloc-sys"]
 cuda = ["inl-core/cuda", "inl-sparse/cuda", "inl-late/cuda", "inl-text?/cuda", "inl-vision?/cuda"]
 cudnn = ["inl-core/cudnn", "inl-sparse/cudnn", "inl-late/cudnn", "inl-text?/cudnn", "inl-vision?/cudnn"]
 accelerate = ["inl-core/accelerate", "inl-sparse/accelerate", "inl-late/accelerate", "inl-text?/accelerate", "inl-vision?/accelerate"]
@@ -41,6 +41,12 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# The `inl` binary allocates with mimalloc on macOS, where the system allocator
+# keeps the memory of a large request resident (see `src/bin/inl.rs`).
+[target.'cfg(target_os = "macos")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"], optional = true }
 
 [[bin]]
 name = "inl"
