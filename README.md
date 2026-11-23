@@ -15,9 +15,9 @@ Use it two ways, both backed by the same engines:
 ## Install
 
 ```sh
-cargo install inl-server --version 0.3.3 --locked
+cargo install inl-server --version 0.3.4 --locked
 # NVIDIA host with the CUDA toolkit installed:
-cargo install inl-server --version 0.3.3 --locked --features cuda
+cargo install inl-server --version 0.3.4 --locked --features cuda
 ```
 
 For Rust applications:
@@ -28,7 +28,7 @@ inl-text = "0.1.1"
 inl-sparse = "0.1.2"
 inl-late = "0.1.0"
 inl-vision = "0.1.1"
-inl-server = { version = "0.3.3", default-features = false }
+inl-server = { version = "0.3.4", default-features = false }
 ```
 
 `inl-server` without default features exposes the daemon library without its
@@ -167,6 +167,14 @@ One model instance is served once: a second `inl serve` for the same instance
 adopts the running server instead of loading another copy. State lives in
 `~/.cache/im-not-llm/serve/<instance>` (`%LOCALAPPDATA%\im-not-llm\serve` on
 Windows). The server binds loopback only: it has no authentication.
+
+A server stays up until `inl stop` or a signal: `--idle-timeout` defaults to 0.
+Pass a number of seconds to have it exit and free the model after that long
+without an embedding request. With `--port 0` (the default) an instance
+returns to the port it served on last time (kept in `preferred_port` in its
+state directory, so it survives a stop or a crash) and takes a free port only
+if that one is gone, so a URL another tool wrote into its configuration keeps
+working across restarts. A `--port` you give must be free.
 
 ### Routes
 

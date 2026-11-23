@@ -1550,3 +1550,82 @@ async fn a_wedged_late_pass_shuts_the_server_down() {
     assert_eq!(reason, StopReason::Wedged);
     drop(h.stop);
 }
+
+#[test]
+fn a_server_has_no_idle_timeout_unless_one_is_asked_for() {
+    assert_eq!(DEFAULT_IDLE_TIMEOUT_SECONDS, 0);
+    assert_eq!(
+        idle_timeout_from_seconds(DEFAULT_IDLE_TIMEOUT_SECONDS),
+        None
+    );
+    assert_eq!(idle_timeout_from_seconds(30), Some(Duration::from_secs(30)));
+}
+
+async fn start_in(dir: &std::path::Path, port: u16) -> Server {
+    let mut opts = options(dir);
+    opts.port = port;
+    let Started::Serving(server) = start(Arc::new(FakeEngine::default()), opts).await.unwrap()
+    else {
+        panic!("expected a fresh server");
+    };
+    server
+}
+
+#[tokio::test]
+async fn a_restarted_instance_comes_back_on_the_port_it_used_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = start_in(dir.path(), 0).await;
+    let port = first.health().port;
+    first.run_until(async {}).await.unwrap();
+    // The discovery files are gone after a clean stop, the remembered port is not.
+    assert!(!dir.path().join("port").exists());
+    let second = start_in(dir.path(), 0).await;
+    assert_eq!(second.health().port, port);
+    second.run_until(async {}).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_explicit_port_wins_over_the_remembered_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = start_in(dir.path(), 0).await;
+    let remembered = first.health().port;
+    first.run_until(async {}).await.unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let wanted = probe.local_addr().unwrap().port();
+    drop(probe);
+    assert_ne!(wanted, remembered);
+    let second = start_in(dir.path(), wanted).await;
+    assert_eq!(second.health().port, wanted);
+    second.run_until(async {}).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_remembered_port_that_is_taken_falls_back_to_a_free_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = start_in(dir.path(), 0).await;
+    let remembered = first.health().port;
+    first.run_until(async {}).await.unwrap();
+    // Someone else now holds the remembered port.
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", remembered)).unwrap();
+    let second = start_in(dir.path(), 0).await;
+    let port = second.health().port;
+    assert_ne!(port, remembered);
+    assert_ne!(port, 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("port"))
+            .unwrap()
+            .trim(),
+        port.to_string()
+    );
+    second.run_until(async {}).await.unwrap();
+    drop(squatter);
+}
+
+#[tokio::test]
+async fn a_garbled_remembered_port_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("preferred_port"), "not a port\n").unwrap();
+    let server = start_in(dir.path(), 0).await;
+    assert_ne!(server.health().port, 0);
+    server.run_until(async {}).await.unwrap();
+}

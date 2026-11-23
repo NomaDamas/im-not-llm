@@ -91,8 +91,19 @@ const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// wait behind large uploads.
 const BODY_BUDGET_EXEMPT_DIVISOR: usize = 128;
 
-/// Default for `--idle-timeout` in seconds.
-pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
+/// Default for `--idle-timeout` in seconds: 0, serve until stopped. A daemon that models are managed through
+/// has to stay up for the tools that find it by its discovery files; one that exits after five quiet minutes
+/// leaves their configuration pointing at nothing. Pass a number of seconds to free the model when idle.
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 0;
+
+/// The idle timeout a number of seconds stands for: `0` is no timeout.
+pub fn idle_timeout_from_seconds(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// File in the state directory that remembers the port the instance served on. Unlike `port` it survives a stop
+/// (and a crash), so the instance comes back on the same port and anything that recorded the URL stays valid.
+const PREFERRED_PORT_FILE: &str = "preferred_port";
 
 /// How long a second `start` waits for a server that holds the lock (and
 /// may still be loading or downloading the model) to answer `/health`.
@@ -655,14 +666,7 @@ async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> 
 
     let kind = engine.kind();
     let info = engine.load().await?;
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(options.host, options.port))
-        .await
-        .map_err(|error| {
-            InlError::Other(format!(
-                "cannot bind {}:{}: {error}",
-                options.host, options.port
-            ))
-        })?;
+    let listener = bind_listener(&options).await?;
     let addr = listener.local_addr()?;
     let state = Arc::new(AppState {
         engine,
@@ -685,6 +689,11 @@ async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> 
         wedged: tokio::sync::Notify::new(),
         shutdown: tokio::sync::Notify::new(),
     });
+    // Remember the port: the next start of this instance prefers it (see `bind_listener`).
+    let _ = write_atomic(
+        &options.state_dir.join(PREFERRED_PORT_FILE),
+        &addr.port().to_string(),
+    );
     files.publish(&state.snapshot())?;
     state.set_status(STATUS_OK);
     Ok(Started::Serving(Server {
@@ -694,6 +703,31 @@ async fn start_engine(engine: Engine, options: ServeOptions) -> Result<Started> 
         idle_timeout: options.idle_timeout,
         max_request_bytes: options.max_request_bytes.max(1),
     }))
+}
+
+/// The listener for `options`. An explicit `--port` is bound as asked, and fails if it is taken. With port 0
+/// the instance first tries the port it served on last time (its `preferred_port` file), so a restart does not
+/// move it and the URLs other tools recorded stay valid; if that port is gone, or the file is unreadable, any
+/// free port is used.
+async fn bind_listener(options: &ServeOptions) -> Result<tokio::net::TcpListener> {
+    let bind = |port: u16| tokio::net::TcpListener::bind(SocketAddr::new(options.host, port));
+    if options.port == 0 {
+        let remembered = std::fs::read_to_string(options.state_dir.join(PREFERRED_PORT_FILE))
+            .ok()
+            .and_then(|text| text.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0);
+        if let Some(port) = remembered {
+            if let Ok(listener) = bind(port).await {
+                return Ok(listener);
+            }
+        }
+    }
+    bind(options.port).await.map_err(|error| {
+        InlError::Other(format!(
+            "cannot bind {}:{}: {error}",
+            options.host, options.port
+        ))
+    })
 }
 
 /// `Ok(lock)` when this process should serve, `Err(health)` to adopt.

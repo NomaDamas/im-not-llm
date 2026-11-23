@@ -34,8 +34,8 @@ use clap::{Args, Parser, Subcommand};
 use engines::EngineArgs;
 use inl_core::{device::DeviceSpec, InlError, Result};
 use inl_server::{
-    parse_loopback_host, Daemon, DaemonClient, EngineKind, ServeOptions, StopReason,
-    DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
+    idle_timeout_from_seconds, parse_loopback_host, Daemon, DaemonClient, EngineKind, ServeOptions,
+    StopReason, DEFAULT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_INPUTS, DEFAULT_MAX_REQUEST_BYTES,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,11 +71,13 @@ struct ServeArgs {
     /// Loopback address to bind (127.0.0.1, ::1 or localhost).
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    /// TCP port; 0 picks a free one (written to the `port` file).
+    /// TCP port. 0 (the default) reuses the port this instance served on last
+    /// time and otherwise picks a free one; the port in use is written to the
+    /// `port` file. A port that is given must be free.
     #[arg(long, default_value_t = 0)]
     port: u16,
-    /// Seconds without an embedding request before the server exits; 0 serves
-    /// until stopped.
+    /// Seconds without an embedding request before the server exits and frees
+    /// the model. The default, 0, serves until `inl stop` or a signal.
     #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECONDS)]
     idle_timeout: u64,
     /// Most inputs accepted in one request (larger requests get 413).
@@ -279,7 +281,7 @@ async fn serve(args: ServeArgs) -> Result<ExitCode> {
     let options = ServeOptions {
         host,
         port: args.port,
-        idle_timeout: (args.idle_timeout > 0).then(|| Duration::from_secs(args.idle_timeout)),
+        idle_timeout: idle_timeout_from_seconds(args.idle_timeout),
         max_inputs: args.max_inputs.max(1),
         max_request_bytes: args.max_request_bytes.max(1),
         state_dir: args
